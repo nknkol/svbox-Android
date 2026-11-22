@@ -11,6 +11,12 @@
     "installationFree": false,
     "extractNativeLibs": true,
     "pages": "$profile:main_pages",
+    "hnpPackages": [
+      {
+        "package": "svbox.hnp",
+        "type": "private"
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET",

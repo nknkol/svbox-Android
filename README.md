@@ -18,9 +18,10 @@ Run stock, unmodified **Android 11 (API 30, ARM64)** containers on **HarmonyOS P
 make SVBOX_DIR=/storage/Users/currentUser/Workspace/svbox
 ```
 
-## Quick Build (HarmonyOS PC HAP)
+## Quick Build (HarmonyOS PC HAP with HNP)
 
 ```bash
+make stage-hnp SVBOX_DIR=/storage/Users/currentUser/Workspace/svbox
 cd hap
 export CLT=/data/service/hnp/hmos-clt.org/hmos-clt_1.0.0
 export DEVECO_SDK_HOME=$CLT/sdk
@@ -28,7 +29,14 @@ export NODE_HOME=$CLT/node/bin
 export PATH=$CLT/hvigor/bin:$CLT/ohpm/bin:$CLT/node/bin:$PATH
 ohpm install --all
 hvigorw assembleHap --no-daemon
-# Output: hap/entry/build/default/outputs/default/entry-default-unsigned.hap
+cd ..
+python3 scripts/pack_hnp.py /storage/Users/currentUser/Workspace/svbox/build/svbox \
+  hap/entry/build/default/outputs/default/entry-default-unsigned.hap
+
+# Sign and install to local HarmonyOS PC via hda:
+PORT=$(/system/bin/param get persist.hdc.port | tr -d ' \r\n')
+/data/service/hnp/bin/hda install \
+  hap/entry/build/default/outputs/default/entry-default-unsigned.hap --target "$PORT"
 ```
 
 ## Verified Milestones on HarmonyOS PC (HAD-W32, API 26)

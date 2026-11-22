@@ -32,6 +32,7 @@ private:
     void SetStatus(const std::string& s);
     pid_t Spawn(const std::vector<std::string>& argv,
                 bool nullStdio,
+                const std::string& logPath = "",
                 const std::vector<int>& keepFds = {});
     std::vector<std::string> BaseSvboxArgs() const;
 

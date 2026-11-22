@@ -15,6 +15,14 @@ struct Index {
   private readonly displayH: number = 854;
 
   aboutToAppear(): void {
+    const autoMode: string | undefined = AppStorage.get<string>('autoStart');
+    if (autoMode && (autoMode === 'bootanim' || autoMode === 'full')) {
+      setTimeout(() => {
+        if (!this.running) {
+          this.launchMode(autoMode);
+        }
+      }, 400);
+    }
     this.pollTimer = setInterval(() => {
       try {
         const st: RuntimeStatus = native.getStatus();

@@ -10,7 +10,11 @@ binderd/svbox-binderd: binderd/svbox_binderd.c $(SVBOX_DIR)/src/payload/include/
 propd/svbox-propd: propd/svbox_propd.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-clean:
-	rm -f binderd/svbox-binderd propd/svbox-propd
+stage-hnp: all
+	rm -rf hap/entry/libs/arm64-v8a/libsvbox*.so
+	python3 scripts/pack_hnp.py $(SVBOX_DIR)/build/svbox
 
-.PHONY: all clean
+clean:
+	rm -f binderd/svbox-binderd propd/svbox-propd hap/entry/hnp/arm64-v8a/svbox.hnp
+
+.PHONY: all stage-hnp clean

@@ -9,6 +9,8 @@ export default class EntryAbility extends UIAbility {
     hilog.info(0x0000, TAG, 'EntryAbility onCreate');
     AppStorage.setOrCreate<string>('sandboxTempDir', this.context.tempDir);
     AppStorage.setOrCreate<string>('sandboxFilesDir', this.context.filesDir);
+    const rawAuto: Object | undefined = want.parameters ? want.parameters['autoStart'] : undefined;
+    AppStorage.setOrCreate<string>('autoStart', typeof rawAuto === 'string' ? rawAuto : '');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

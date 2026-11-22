@@ -1,5 +1,6 @@
 # Android rootfs & images (downloaded externally, never committed)
 rootfs/
+*.tar
 *.tar.gz
 *.img
 
@@ -8,6 +9,7 @@ binderd/svbox-binderd
 propd/svbox-propd
 first_frame.png
 *.log
+hap_logs/
 __pycache__/
 *.pyc
 
@@ -18,6 +20,7 @@ hap/entry/.cxx/
 hap/entry/build/
 hap/entry/oh_modules/
 hap/entry/libs/
+hap/hnp/
 hap/build/
 hap/*.hap
 hap/local.properties
