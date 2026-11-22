@@ -849,8 +849,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     // 1. Start propd
     std::vector<std::string> propArgs = { propd, "--dir", propDir, "--sock", sockDir + "/property_service" };
-    for (const std::string& pf : { rootfs_ + "/system/build.prop", rootfs_ + "/vendor/build.prop",
-                                   rootfs_ + "/vendor/default.prop", overrideProp }) {
+    for (const std::string& pf : { rootfs_ + "/system/etc/prop.default",
+                                   rootfs_ + "/default.prop",
+                                   rootfs_ + "/system/build.prop",
+                                   rootfs_ + "/vendor/build.prop",
+                                   rootfs_ + "/vendor/default.prop",
+                                   overrideProp }) {
         if (FileExists(pf)) propArgs.push_back(pf);
     }
     pid_t pidPropd = Spawn(propArgs, false, logDir + "/propd.log");
