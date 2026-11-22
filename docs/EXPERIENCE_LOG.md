@@ -86,4 +86,122 @@
 * **Step 4**（下一阶段，切 `xhigh`）：开源 GPU 硬件加速引擎（`gfxstream` / `Mesa Venus + ANGLE`）裁剪移植与 GL/VK 双驱动切换。
 
 ---
-*(后续每个 Step 完成后，将在下方按章节持续追加实测与踩坑记录。)*
+
+## 第 1 章（Step 1）：`svbox` 通用容器底座升级（commit `a2eba39` on `feat/vdev-binder`）
+
+### 1.1 本步目标与设计约束
+保持 `svbox` 100% 通用、零 Android 硬编码，一次性补齐后续交互、资源控制与沙箱容错所需的 5 项通用 Linux 容器原语：
+1. **`--trap-sigsys`（通用 Seccomp `SIGSYS -> -ENOSYS` 兜底）**：
+   * 吸收 [`gpui-ohos/seccomp_guard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/seccomp_guard.rs) 与 [`harmonybrew-cask/patches/elf-patch-loader`](file:///storage/Users/currentUser/Workspace/harmonybrew-cask/patches/elf-patch-loader/README.md) 的双保险思路：
+   * 在 loader（含每次 child execve 重装）安装零栈 AArch64 `SIGSYS` 汇编处理函数与 `rt_sigreturn` restorer，将 `si_code == SYS_SECCOMP` 的内核陷阱直接改写 `uc_mcontext.regs[0] = -38` (`-ENOSYS`)；
+   * 在 payload `integrity.c` 同时拦截 `rt_sigaction(SIGSYS)`（虚拟化记录，不覆盖内核 handler）与 `rt_sigprocmask`（从 guest 的 `SIG_BLOCK`/`SIG_SETMASK` 掩码中清除 `SIGSYS` 位），防止 ART / Bionic 意外覆盖或屏蔽陷阱守卫。
+2. **`--cpuset LIST` + `--mem-mb N` + `--nice N` + `--sched other|batch|idle`**：
+   * 启动时直接调用原生内核 `sched_setaffinity` / `setpriority` / `sched_setscheduler`（经 `fork/exec` 自动继承全进程树）；
+   * 在 `dispatch.c` 拦截 `sched_setaffinity` 对 guest 掩码与 `cpu_mask` 取交集钳位（若交集为空则回退到 `cpu_mask`，兼容 `12-19` 这类非 0 起始的大核掩码）；
+   * 在 `vfs_procfs.c` + `vfs_bridge.c` **早于宿主 `pb_resolve` 拦截** `/proc/cpuinfo`、`/sys/devices/system/cpu/{online,present,possible}` 和 `/proc/meminfo`（即使 HAP 沙箱禁止访问宿主 `/sys` 也能稳定返回容器内虚拟核数与虚拟内存上限，防止 ART/Skia 盲目开 20 线程）。
+3. **通用 `symlinkat` 沙箱兜底**：
+   * 针对鸿蒙 HAP `files/` / `temp/` 禁止 `symlink()`（`EACCES`）导致 `webview_zygote` 在私有 `tmpfs` 中执行 `symlink("/data/data", "/data/user/0")` 崩溃的问题（P13）；
+   * 在 `vfs_bridge.c` `mutate()` 中：仅当宿主 `symlinkat` 返回 `-EACCES`/`-EPERM` 且启用了 `--emulate-mounts`、且目标解析到容器内已存在目录/常规文件时，在 `b->first_host` 创建占位节点并在本进程挂载表中调用 `mounts_add()` 建立绑定挂载。零栈分配（复用 `Bridge` 现有缓冲区），完全通用。
+4. **通用字符设备代理 `--vdev ...:chr` 完善（为 `evdev` 铺路）**：
+   * 修复两个实测隐藏坑：① `openat` 握手完成后，若 guest 传了 `O_NONBLOCK` 必须补调 `fcntl(F_SETFL, O_NONBLOCK)`，否则 Android `EventHub` 的非阻塞 `read()` 循环会永久卡死；② `generic_chr_ioctl` 拷贝返回长度改为 `min(rep.payload_len, req->out_len)`，兼容 Linux `EVIOCGNAME(len)` / `EVIOCGBIT(ev, len)` 等变长返回 ioctl；③ `CONFIG_MAX_VDEVS` 从 8 扩到 16。
+
+### 1.2 真机验证数据
+* **`--cpuset 0-3 --mem-mb 4096 --nice 10 --sched batch --trap-sigsys`**：
+  * `sched_getaffinity` = `[0, 1, 2, 3]`，guest 主动请求扩至全 20 核后仍被钳位在 `[0, 1, 2, 3]`；
+  * `/proc/cpuinfo` 精准呈现 4 核，`/sys/devices/system/cpu/online` = `0-3`，`/proc/meminfo` `MemTotal` = `4194304 kB`，`nice=10`，`sched=SCHED_BATCH(3)`；
+* **`--cpuset 12-19`（非连续大核集群）**：guest 试图绑逻辑核 `{0}` 自动回落至 `[12..19]`，`/sys/devices/system/cpu/online` = `0-7`，`/proc/cpuinfo` = 8 核；
+* **`svbox` 核心回归全通过**：`check_dispatch.py`（166 slow syscalls）、`check_payload_abi.py`、`test_mounts.py`、`fake_ids.py`、`guest_signals.py`、`test_modify.py` 全部 PASS。
+
+---
+
+## 第 2 章（Step 2）：交互闭环、64 位真声音与 4 秒级启动
+
+### 2.1 虚拟 `evdev` 输入子系统（`InputBridge` + `svbox --vdev`）
+* **设计**：在 HAP Native C++ 内部直接起两个 Unix Socket 服务端（`input_touch.sock` 对应 `/dev/input/event0` 多点触控屏 Type B MT 协议，`input_kbd.sock` 对应 `/dev/input/event1` 物理键盘与导航键），实现 `svbox` 通用 `vdev_proto.h` 协议（`VDEV_OP_OPEN` / `VDEV_OP_ATTACH_THREAD` / `VDEV_OP_IOCTL`）。
+* **优势**：`XComponent` 的 Touch / Mouse / Key 回调直接在宿主进程内写 24 字节标准 Linux `struct input_event`（`CLOCK_MONOTONIC` 时间戳）到 Android `EventHub` 打开的实时 socket FD，**零中间进程转发延迟**；同时给 `svbox-touchscreen` 挂载了 `/system/usr/idc/svbox-touchscreen.idc`（`touch.deviceType = touchScreen`、`device.internal = 1`）。
+* **关键实坑与根因（超适合写进博客！）**：
+  1. **坑 2-1：`Touch device 'svbox-touchscreen' did not report support for X or Y axis!`**
+     * **现象**：`EventHub` 成功识别了 `event0`（`classes=0x14`），但 `InputReader` 判定 X/Y 轴不支持。
+     * **根因**：`svbox/src/payload/logic/vdev.c` 的 `generic_chr_ioctl` 中，`req` 指针与 `recv_msg` 接收缓冲区共用了同一个栈数组 `buf[]`！收到 24 字节的 `struct input_absinfo` 时，偏移 20 处的 `ai.resolution = 0` **正好覆写了 `req->out_len`**，导致随后的 `if (req->out_len > 0)` 判定为假、从未把 `input_absinfo` 拷回 guest 内存！
+     * **修复**：调用 `recv_msg` 前先用局部变量 `uint32_t out_len = req->out_len;` 保存长度；`EVIOCGABS` 立刻生效，日志输出：`Device reconfigured: id=3, name='svbox-touchscreen', size 720x1280, orientation 0, mode 1, display id 0`。
+  2. **坑 2-2：键盘 `EVIOCSREP` 警告**
+     * **现象**：`EventHub` 报 `Unable to disable kernel key repeat for /dev/input/event1: Inappropriate ioctl`。
+     * **修复**：在 `input_bridge.cpp` 中处理 `nr == 0x03`（`EVIOCGREP/EVIOCSREP`）返回 `0`，日志清零。
+
+### 2.2 消灭 10.2 秒启动卡顿 + 64 位真声音（`OHAudio`）
+* **根因定位**：回看 `hap_logs/logcat.txt` 发现 `StartAudioService` 耗时 **10,224ms** 的真正元凶是 `ServiceManager: Waiting for service 'media.metrics'`（两次 5 秒同步超时）+ 缺少合规 Audio HAL / AudioFlinger。
+* **关键实坑与根因**：
+  1. **坑 2-3：Redroid 11 的 `/vendor/bin/hw/android.hardware.audio.service` 是 32 位 ARM ELF！**
+     * **现象**：64 位 `svbox` 启动它时直接报 `error: bogus ELF header`，但反查 `/vendor/lib64/hw/android.hardware.audio@6.0-impl.so`、`/vendor/lib64/hw/android.hardware.audio.effect@6.0-impl.so` 和 `/system/bin/audioserver` **全都是 64 位 ARM64**！
+     * **解法**：自写 75 行 64 位 `audio_hal/svbox_audio_service.cpp`，直接调用 `libhidlbase.so` 导出的 `configureRpcThreadpool` + `registerPassthroughServiceImplementation` + `joinRpcThreadpool`，以 64 位宿主进程托管原版 `IDevicesFactory@6.0` 与 `IEffectsFactory@6.0`！
+  2. **坑 2-4：只链 `libdl.so` 动态 `dlopen(libhidlbase.so)` 触发 Bionic IE-TLS 报错**
+     * **现象**：`dlopen failed: TLS symbol "(null)" in dlopened "/system/lib64/libc.so" referenced from "/system/lib64/libc.so" using IE access model`。
+     * **根因**：Android Bionic `libc.so` 使用 Initial-Exec（IE）TLS 模型，必须在进程启动阶段作为 `DT_NEEDED` 静态声明加载，不能在运行时被 `dlopen` 延迟拉起。
+     * **解法**：编译 `svbox-audio-service` 时直接带 `-Wl,--no-as-needed` 链接 Android 11 的 `libc.so` + `libdl.so` + `libhidlbase.so`，启动后 `register IDevicesFactory@6.0 -> 0`、`register IEffectsFactory@6.0 -> 0` 一次通过！
+  3. **坑 2-5：零依赖 `audio.primary.svbox.so` → 鸿蒙 PC `libohaudio.so`**
+     * 反汇编验证了 Android 11 `audio_hw_device_t`（320B）与 `audio_stream_out_t`（280B）精确字段偏移，用纯 `-nostdlib -shared` + 原生 AArch64 `svc #0`（零 libc 依赖、零 ABI 冲突）编写 `audio_hal/audio_primary_svbox.c`，通过 `/ipc/audio.sock` 把 `AudioFlinger` 混音后的 `44100Hz / Stereo / S16LE` PCM 流送入 HAP 的 `AudioBridge`（256 KiB 环形缓冲 + `OH_AudioStreamBuilder_SetRendererWriteDataCallback` + 600ms 静音自动 `OH_AudioRenderer_Pause` 符合鸿蒙低功耗规范）。
+
+### 2.3 `webview_zygote` 彻底复活 + DNS 代理 + 事件就绪启动
+* **坑 2-6：`webview_zygote` 过了 `symlink` 又卡在 `setfilecon /data/user/0 Permission denied`**
+  * **现象**：Step 1 的 `symlinkat` 兜底成功让 `webview_zygote` 越过 `Zygote.cpp:1365`，紧接着在 `1253` 行因 `setxattr("security.selinux")` 返回 `EACCES` 再次中止。
+  * **通用修复**：在 `svbox/src/payload/logic/vfs_bridge.c` 中，容器 fake-root 模式下若对 `security.*` 命名空间调用 `setxattr`/`lsetxattr` 遭遇 `EACCES`/`EPERM`/`EOPNOTSUPP`，返回 `0`（已通过 `test/fs_policy/xattrs.py --normal` 回归）。修复后 `webview_zygote` **零报错存活**！
+* **坑 2-7：`AudioFlinger` 的 `totalMemory` 仍读到宿主机 32 GB**
+  * **根因**：除了 `/proc/meminfo`，Android 还通过 `sysinfo(2)` 读取 `totalram`。
+  * **通用修复**：在 `svbox/src/payload/logic/dispatch.c` 补上 `__NR_sysinfo` 内存上限钳位，修复后 `AudioFlinger` 精准报告 `totalMemory: 4294967296`（精确 4096 MiB）！
+* **真实 DNS 代理**：在 HAP 中实现 `DnsProxyLoop` 响应 Android Bionic `/dev/socket/dnsproxyd`（直接调鸿蒙宿主 `getaddrinfo()`），同时配置 `ANDROID_DNS_MODE=local` + `/etc/resolv.conf` + `net.dns1/net.dns2`。
+* **干净进程树回收与后台 0% CPU 挂起**：`Spawn()` 为每个容器根进程建独立进程组（`setpgid(0, 0)`），`Stop()` 对整个 `-pgid` 发送 `SIGCONT -> SIGTERM -> SIGKILL` 杜绝孤儿进程；`SetPaused(true)` 发送 `SIGSTOP` 冻结整棵容器进程树实现 0% CPU 挂起。
+
+---
+
+## 第 3 章（Step 3）：异步 VSync 显示、大小核探针与实时监控 + Step 4 GPU 选型实测
+
+### 3.1 异步双缓冲 `HwcRenderer` + `OH_NativeVSync` 按需帧调度
+* **架构改造**（[`hwc_renderer.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/hwc_renderer.cpp)）：
+  * 接收线程（`QOS_USER_INTERACTIVE`）收到 `hwcomposer.redroid.so` 的 ashmem FD 后，拷贝至双缓冲后台槽并翻转 `frontIdx_`，**立刻回发 `"ok"` ACK**，彻底解除 `SurfaceFlinger` 对 `OHNativeWindow` 交换链的锁步阻塞；
+  * 接入 `libnative_vsync.so`（`OH_NativeVSync_Create` + `OH_NativeVSync_RequestFrame`，实测 `OH_NativeVSync=1`），仅在有新帧或窗口回到前台时按需请求 VSync 回调；`EntryAbility::onBackground()` 自动停帧。
+
+### 3.2 大小核集群发现 + `OH_QoS` + `HiDebug` 实时遥测
+* **实现**（[`sched_qos.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/sched_qos.cpp)）：
+  * 优先尝试读取 `/sys/devices/system/cpu/cpu*/cpu_capacity`，若被 HAP 沙箱拒绝则自动回退到 ~2ms/核单核 ALU 微测探针（吸收 `gpui-ohos/sched_qos.rs` 方案）；本机真机探得 **`20c (L=4 [0-3], M=8 [4-11], B=8 [12-19])`**；
+  * 4 档可切换性能策略：`eco`（小核 `0-3` + `nice 10` + `SCHED_BATCH`）、`balanced`（中核 `4-9`）、`perf`（大核 `12-19`）、`all`（不限核）；
+  * 宿主关键线程按级设定 QoS：`hwc-recv` / `input-touch` / `input-kbd` = `QOS_USER_INTERACTIVE(5)`，`audio-bridge` = `QOS_USER_INITIATED(3)`，`dns-proxy` = `QOS_UTILITY(1)`，`lmkd` / `logdw` = `QOS_BACKGROUND(0)`；
+  * 接入 `libohhidebug.so`（`OH_HiDebug_GetSystemCpuUsage` / `GetAppNativeMemInfoWithCache` / `GetGraphicsMemory`）与容器进程树 RSS 汇总，实时展示在 HAP 顶部状态栏。
+
+### 3.3 Step 0 → Step 3 真机前后实测对比
+
+| 指标 | v0.1 基线（Step 0 前） | Step 1–3 完成后（真机实测） | 提升 / 变化 |
+| --- | --- | --- | --- |
+| **`StartAudioService` 耗时** | 10,224 ms | **97 ms** | **快 105 倍** |
+| **`TotalBootTime`（进桌面）** | 15,534 ms | **4,457 ms** | **快 3.5 倍** |
+| **触控 & 键盘输入** | 无 | **原生 `evdev` 多点触控 + 物理键盘 + 导航键** | Display 0 `720×1280` 完整上线 |
+| **声音子系统** | 空桩（无声音） | **64 位 `IDevicesFactory@6.0` + `audio.primary.svbox.so` → `OHAudio`** | 真混音通路打通 |
+| **`webview_zygote`** | 崩溃（`symlink` 权限拒） | **零报错存活** | 解锁 WebView 系 App 基础 |
+| **内存上限虚拟化** | 暴露宿主机 32 GB | **`/proc/meminfo` + `sysinfo(2)` 精确 `4096 MiB`** | `AudioFlinger` 实测 `4294967296` |
+| **CPU 核心控制** | 不受限（全 20 核） | **内核硬绑核 `--cpuset 12-19` + 4 档策略 + `SIGSTOP` 0% 暂停** | 完整大小核治理 |
+| **显示同步** | 同步锁步阻塞 | **异步双缓冲 + `OH_NativeVSync=1` 按需停帧** | 解除 `SurfaceFlinger` 阻塞 |
+
+---
+
+### 3.4 Step 4 前置实测：鸿蒙 PC（Maleoon 916, API 26）GPU 能力探测与开源引擎选型
+
+在进入 Step 4（建议切换 `xhigh` + `/compact` 后推进）前，在本机直接编译运行了原生 EGL/GLES3/Vulkan 能力探针，测得 **Maleoon 916** 的真实驱动支持矩阵：
+
+| 维度 | 本机真机实测结果（`HAD-W32`, API 26） |
+| --- | --- |
+| **EGL / GLES** | **EGL 1.4 (OpenHarmony)** · **HUAWEI Maleoon 916** · **OpenGL ES 3.2 B312** (GLSL ES 3.20)<br>关键扩展：`EGL_KHR_image_base`, `EGL_KHR_fence_sync`, `EGL_ANDROID_native_fence_sync`, `EGL_KHR_surfaceless_context` |
+| **Vulkan** | **Instance API 1.3.275** · **Device `Maleoon 916` API 1.2.309** (69 项设备扩展)<br>关键扩展：`VK_OHOS_surface`, `VK_OHOS_external_memory`, `VK_KHR_external_memory`, `VK_KHR_external_memory_fd`, `VK_KHR_external_semaphore_fd`, `VK_KHR_external_fence_fd`, `VK_KHR_timeline_semaphore`, `VK_KHR_synchronization2`, `VK_KHR_sampler_ycbcr_conversion`, `VK_EXT_queue_family_foreign`, `VK_KHR_swapchain` |
+| **关键缺失项** | **不支持** `VK_EXT_external_memory_dma_buf`、`VK_EXT_image_drm_format_modifier`、`EGL_EXT_image_dma_buf_import`（标准 Linux DRM/GBM dma-buf 修饰符扩展） |
+
+#### 开源 GPU 引擎对比与选型结论
+
+| 对比项 | 方案 1：Google **`gfxstream`**（推荐 ★） | 方案 2：**Mesa `Venus` (`virtio-gpu`) + ANGLE** |
+| --- | --- | --- |
+| **Maleoon 916 驱动契合度** | **极高**：宿主侧直接走标准 **EGL/GLES 3.2 + Vulkan 1.2** + `VK_OHOS_surface` / `EGL_KHR_surfaceless_context`，**完全不依赖 Linux DRM/GBM dma-buf modifier** | **中低**：`virglrenderer` / `venus` 默认强依赖 Linux `dma-buf` + `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`（Maleoon 916 缺失，需大幅改造内存导入层） |
+| **GL / VK 双驱动支持** | **原生一体支持**：Guest 侧自带 `libEGL_emulation` + `libGLESv2_emulation` + `vulkan.ranchu.so`，Host 侧支持 GLES 与 Vulkan 双后端切换 | 需同时维护 `venus`（VK）+ `ANGLE`（GLES-on-VK）两套大型工程 |
+| **传输层改造难度** | **低**：原生抽象 `IOStream`（本就支持 TCP/Unix socket + shared memory ringbuffer），可直接嫁接到我们的 `/ipc/gfxstream.sock` + `/dev/ashmem` | 需模拟 `virtio-gpu` DRM ioctl / blob resource 协议，改动面更大 |
+| **Android 11 契合度** | **100% 原生**：AOSP Android 11 Cuttlefish / Emulator 官方标配图形栈（含 `gralloc.ranchu` / `hwcomposer.ranchu` 协议参考） | Android 11 上 `venus` 仍偏早期实验，ANGLE 需额外裁剪 |
+
+**结论（供 Step 4 拍板）**：**首选裁剪 Google `gfxstream`**（Socket + Ashmem 传输层 + 鸿蒙 `OHNativeWindow` / `EGL 1.4 + GLES 3.2` / `Vulkan 1.2 + VK_OHOS_surface` 宿主渲染器），保留现有 SwiftShader 作为兜底模式，实现 **`SwiftShader / OpenGL ES / Vulkan` 三选一渲染器切换**！
+
+---
+*(Step 4 开始后将在此继续追加 `gfxstream` 交叉编译、传输层嫁接与真机帧率/CPU 对比实测。)*

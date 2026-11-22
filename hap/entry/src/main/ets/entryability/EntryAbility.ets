@@ -1,6 +1,7 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import native from 'libentry.so';
 
 const TAG = 'SvboxAndroid';
 
@@ -11,6 +12,20 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate<string>('sandboxFilesDir', this.context.filesDir);
     const rawAuto: Object | undefined = want.parameters ? want.parameters['autoStart'] : undefined;
     AppStorage.setOrCreate<string>('autoStart', typeof rawAuto === 'string' ? rawAuto : '');
+  }
+
+  onForeground(): void {
+    try {
+      native.setVisible(true);
+    } catch (_e) {
+    }
+  }
+
+  onBackground(): void {
+    try {
+      native.setVisible(false);
+    } catch (_e) {
+    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

@@ -4,16 +4,22 @@
  * graphics HALs, SurfaceFlinger, and either BootAnimation demo or full
  * Android 11 (Zygote64 -> system_server) using svbox. */
 #include "android_runtime.h"
+#include "audio_bridge.h"
 #include "hwc_renderer.h"
+#include "input_bridge.h"
+#include "sched_qos.h"
 
+#include <arpa/inet.h>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <functional>
 #include <hilog/log.h>
+#include <netdb.h>
 #include <poll.h>
 #include <signal.h>
+#include <sstream>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -423,19 +429,113 @@ std::string AndroidRuntime::StatusText() const {
     return status_;
 }
 
+std::string AndroidRuntime::Profile() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return profile_;
+}
+
+std::string AndroidRuntime::ActiveCpuset() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return activeCpuset_;
+}
+
+void AndroidRuntime::SetResourceConfig(const std::string& profile,
+                                       const std::string& customCpuset,
+                                       uint32_t memLimitMb) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!profile.empty()) profile_ = profile;
+    customCpuset_ = customCpuset;
+    if (memLimitMb >= 512 && memLimitMb <= 32768) {
+        memLimitMb_.store(memLimitMb);
+    }
+}
+
+std::string AndroidRuntime::SetPaused(bool paused) {
+    if (!running_.load()) return "Not running";
+    paused_.store(paused);
+    std::vector<pid_t> pidsCopy;
+    {
+        std::lock_guard<std::mutex> lk(procMu_);
+        pidsCopy = pids_;
+    }
+    const int sig = paused ? SIGSTOP : SIGCONT;
+    for (pid_t p : pidsCopy) {
+        if (p > 0) {
+            kill(-p, sig);
+            kill(p, sig);
+        }
+    }
+    HwcRenderer::Instance().SetVisible(!paused);
+    SetStatus(paused ? "Paused (SIGSTOP · 0% CPU)" : "Running Android 11");
+    return StatusText();
+}
+
+void AndroidRuntime::SetVisible(bool visible) {
+    HwcRenderer::Instance().SetVisible(visible && !paused_.load());
+}
+
+SchedQos::Telemetry AndroidRuntime::GetTelemetry() {
+    std::vector<pid_t> pidsCopy;
+    {
+        std::lock_guard<std::mutex> lk(procMu_);
+        pidsCopy = pids_;
+    }
+    return SchedQos::SampleTelemetry(pidsCopy);
+}
+
+bool AndroidRuntime::WaitForConditionMs(int maxMs, const std::function<bool()>& pred) const {
+    for (int elapsed = 0; elapsed < maxMs; elapsed += 20) {
+        if (!running_.load()) return false;
+        if (pred()) return true;
+        usleep(20000);
+    }
+    return running_.load() && pred();
+}
+
 std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
     const std::string sockDir = runBase_ + "/sockets";
-    return {
+    std::string cpuset;
+    int32_t niceVal = 0x7fffffff;
+    std::string schedPol;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cpuset = activeCpuset_;
+        niceVal = activeNice_;
+        schedPol = activeSched_;
+    }
+    uint32_t memMb = memLimitMb_.load();
+
+    std::vector<std::string> args = {
         svboxPath_,
         "--root", rootfs_,
         "-u", "0:0",
         "--cap-add", "ALL",
+        "--trap-sigsys",
         "--kernel-sysname", "Linux",
         "--kernel-release", "5.10.0-android11",
         "--hostname", "localhost",
         "--emulate-mounts",
         "--mount-scratch", runBase_ + "/tmpfs",
         "--owner-db", runBase_ + "/owner.db",
+    };
+    if (!cpuset.empty()) {
+        args.push_back("--cpuset");
+        args.push_back(cpuset);
+    }
+    if (memMb > 0) {
+        args.push_back("--mem-mb");
+        args.push_back(std::to_string(memMb));
+    }
+    if (niceVal != 0x7fffffff) {
+        args.push_back("--nice");
+        args.push_back(std::to_string(niceVal));
+    }
+    if (!schedPol.empty()) {
+        args.push_back("--sched");
+        args.push_back(schedPol);
+    }
+
+    std::vector<std::string> mounts = {
         "-v", "/proc:/proc",
         "-v", "/dev/null:/dev/null",
         "-v", "/dev/zero:/dev/zero",
@@ -446,6 +546,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-v", rootfs_ + "/system/apex/com.android.art.debug:/apex/com.android.art",
         "-v", rootfs_ + "/system/apex/com.android.vndk.current:/apex/com.android.vndk.v30",
         "-v", rootfs_ + "/system/etc:/etc",
+        "-v", runBase_ + "/resolv.conf:/etc/resolv.conf",
         "-v", rootfs_ + "/system/product:/product",
         "-v", rootfs_ + "/system/system_ext:/system_ext",
         "-v", runBase_ + "/__properties__:/dev/__properties__",
@@ -467,9 +568,26 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-v", runBase_ + "/stune:/dev/stune",
         "-v", runBase_ + "/mnt:/mnt",
         "-v", runBase_ + "/storage:/storage",
+    };
+    if (!audioHalPath_.empty() && FileExists(audioHalPath_)) {
+        mounts.push_back("-v");
+        mounts.push_back(audioHalPath_ + ":/vendor/lib64/hw/audio.primary.default.so");
+    }
+    if (!audioSvcPath_.empty() && FileExists(audioSvcPath_)) {
+        mounts.push_back("-v");
+        mounts.push_back(audioSvcPath_ + ":/vendor/bin/hw/android.hardware.audio.service");
+    }
+    mounts.push_back("-v");
+    mounts.push_back(runBase_ + "/svbox-touchscreen.idc:/system/usr/idc/svbox-touchscreen.idc");
+    args.insert(args.end(), mounts.begin(), mounts.end());
+
+    std::vector<std::string> vdevsAndEnv = {
         "--vdev", "/dev/binder:" + sockDir + "/binder.sock:binder",
         "--vdev", "/dev/hwbinder:" + sockDir + "/hwbinder.sock:binder",
         "--vdev", "/dev/vndbinder:" + sockDir + "/vndbinder.sock:binder",
+        "--vdev", "/dev/input/event0:" + sockDir + "/input_touch.sock:chr",
+        "--vdev", "/dev/input/event1:" + sockDir + "/input_kbd.sock:chr",
+        "-e", "ANDROID_DNS_MODE=local",
         "-e", "ANDROID_BOOTLOGO=1",
         "-e", "ANDROID_ROOT=/system",
         "-e", "ANDROID_ASSETS=/system/app",
@@ -486,6 +604,8 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-e", std::string("SYSTEMSERVERCLASSPATH=") + kSystemServerClassPath,
         "-e", "PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/vendor/bin",
     };
+    args.insert(args.end(), vdevsAndEnv.begin(), vdevsAndEnv.end());
+    return args;
 }
 
 pid_t AndroidRuntime::Spawn(const std::vector<std::string>& argv,
@@ -508,6 +628,9 @@ pid_t AndroidRuntime::Spawn(const std::vector<std::string>& argv,
         usleep(100000);
     }
     if (pid == 0) {
+        // Place each container daemon / zygote in its own process group so Stop()
+        // and Pause()/Resume() cleanly signal the entire descendant tree.
+        setpgid(0, 0);
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) {
             dup2(dn, 0);
@@ -578,6 +701,9 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     if (logdwThread_.joinable()) {
         logdwThread_.join();
     }
+    if (dnsThread_.joinable()) {
+        dnsThread_.join();
+    }
 
     const std::string hnpBin = "/data/app/svbox.org/svbox_0.1.0/bin";
     const std::string resolvedSvbox =
@@ -588,6 +714,14 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     const std::string propd =
         FileExists(hnpBin + "/svbox-propd") ? (hnpBin + "/svbox-propd")
                                             : (androidDir + "/propd/svbox-propd");
+    const std::string audioHal =
+        FileExists(hnpBin + "/audio.primary.svbox.so")
+            ? (hnpBin + "/audio.primary.svbox.so")
+            : (androidDir + "/audio_hal/audio.primary.svbox.so");
+    const std::string audioSvc =
+        FileExists(hnpBin + "/svbox-audio-service")
+            ? (hnpBin + "/svbox-audio-service")
+            : (androidDir + "/audio_hal/svbox-audio-service");
     const std::string rootfsTar = androidDir + "/rootfs.tar";
     std::string sandboxFiles = sandboxTempDir;
     if (sandboxFiles.size() >= 5 && sandboxFiles.compare(sandboxFiles.size() - 5, 5, "/temp") == 0) {
@@ -609,16 +743,108 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
 
     runBase_ = sandboxTempDir + "/svbox-android-hap";
     svboxPath_ = resolvedSvbox;
+    audioHalPath_ = FileExists(audioHal) ? audioHal : "";
+    audioSvcPath_ = FileExists(audioSvc) ? audioSvc : "";
     androidDir_ = androidDir;
     rootfs_ = rootfs;
 
+    // Resolve active cpuset/nice/sched from current profile & probed topology
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        activeCpuset_ = SchedQos::ResolveCpuset(profile_, customCpuset_, &activeNice_, &activeSched_);
+    }
+
+    paused_.store(false);
     running_.store(true);
     SetStatus("Booting Android 11 (" + mode + ")...");
     bootThread_ = std::thread(&AndroidRuntime::BootWorker, this, mode, width, height);
     return StatusText();
 }
 
+void AndroidRuntime::DnsProxyLoop(int listenFd) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::Utility, "dns-proxy");
+    if (listenFd < 0) return;
+
+    auto sendAll = [](int fd, const void* p, size_t n) -> bool {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        while (n > 0) {
+            ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR) continue;
+                return false;
+            }
+            b += w;
+            n -= static_cast<size_t>(w);
+        }
+        return true;
+    };
+
+    while (running_.load()) {
+        struct pollfd pfd = { listenFd, POLLIN, 0 };
+        if (poll(&pfd, 1, 150) <= 0) continue;
+        int cfd = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) continue;
+
+        char reqBuf[1024] = {};
+        ssize_t rn = recv(cfd, reqBuf, sizeof(reqBuf) - 1, 0);
+        if (rn > 0) {
+            reqBuf[rn] = '\0';
+            std::istringstream iss(reqBuf);
+            std::string cmd;
+            iss >> cmd;
+            if (cmd == "getaddrinfo") {
+                std::string host, serv;
+                int hFlags = 0, hFam = 0, hSock = 0, hProto = 0;
+                iss >> host >> serv >> hFlags >> hFam >> hSock >> hProto;
+                const char* node = (host.empty() || host == "^") ? nullptr : host.c_str();
+                const char* service = (serv.empty() || serv == "^") ? nullptr : serv.c_str();
+                struct addrinfo hints = {};
+                hints.ai_flags = hFlags;
+                hints.ai_family = hFam;
+                hints.ai_socktype = hSock;
+                hints.ai_protocol = hProto;
+                struct addrinfo* res = nullptr;
+                int gai = getaddrinfo(node, service, &hints, &res);
+                if (gai == 0 && res) {
+                    const char okHdr[] = "222 0 ok";
+                    sendAll(cfd, okHdr, sizeof(okHdr)); // includes NUL
+                    for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+                        uint32_t rec[5] = {
+                            htonl(static_cast<uint32_t>(ai->ai_flags)),
+                            htonl(static_cast<uint32_t>(ai->ai_family)),
+                            htonl(static_cast<uint32_t>(ai->ai_socktype)),
+                            htonl(static_cast<uint32_t>(ai->ai_protocol)),
+                            htonl(static_cast<uint32_t>(ai->ai_addrlen)),
+                        };
+                        uint32_t mark = htonl(1);
+                        sendAll(cfd, &mark, 4);
+                        sendAll(cfd, rec, sizeof(rec));
+                        if (ai->ai_addrlen > 0 && ai->ai_addr) {
+                            sendAll(cfd, ai->ai_addr, ai->ai_addrlen);
+                        }
+                        uint32_t clen = ai->ai_canonname ? static_cast<uint32_t>(std::strlen(ai->ai_canonname) + 1) : 0u;
+                        uint32_t nclen = htonl(clen);
+                        sendAll(cfd, &nclen, 4);
+                        if (clen > 0) sendAll(cfd, ai->ai_canonname, clen);
+                    }
+                    uint32_t endMark = 0;
+                    sendAll(cfd, &endMark, 4);
+                    freeaddrinfo(res);
+                } else {
+                    const char errHdr[] = "401 0 fail";
+                    sendAll(cfd, errHdr, sizeof(errHdr));
+                }
+            } else {
+                const char errHdr[] = "401 0 unsupported";
+                sendAll(cfd, errHdr, sizeof(errHdr));
+            }
+        }
+        close(cfd);
+    }
+}
+
 void AndroidRuntime::LmkdLoop(std::string sockPath) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::Background, "lmkd");
     unlink(sockPath.c_str());
     int srv = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (srv < 0) return;
@@ -660,6 +886,7 @@ void AndroidRuntime::LmkdLoop(std::string sockPath) {
 }
 
 void AndroidRuntime::LogdwLoop(std::string sockPath, std::string outPath) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::Background, "logdw");
     unlink(sockPath.c_str());
     int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return;
@@ -758,6 +985,14 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         WriteFile(base + "/mems", "0\n");
     }
 
+    WriteFile(runBase_ + "/dev_input/event0", "");
+    WriteFile(runBase_ + "/dev_input/event1", "");
+    WriteFile(runBase_ + "/svbox-touchscreen.idc",
+        "touch.deviceType = touchScreen\n"
+        "touch.orientationAware = 1\n"
+        "device.internal = 1\n");
+    WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
+
     const std::string overrideProp = runBase_ + "/override.prop";
     WriteFile(overrideProp,
         "ro.hardware.egl=swiftshader\n"
@@ -770,8 +1005,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "debug.stagefright.ccodec=0\n"
         "ro.boot.redroid_width=" + std::to_string(width) + "\n"
         "ro.boot.redroid_height=" + std::to_string(height) + "\n"
-        "ro.boot.redroid_fps=30\n"
+        "ro.boot.redroid_fps=60\n"
         "ro.boot.use_redroid_stream=1\n"
+        "net.dns1=223.5.5.5\n"
+        "net.dns2=8.8.8.8\n"
         "bpf.progs_loaded=1\n"
         "log.tag.libprocessgroup=F\n"
         "sys.use_memfd=false\n"
@@ -779,10 +1016,13 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "persist.sys.vold_app_data_isolation_enabled=false\n");
 
     unlink((ipcDir + "/hwcomposer.sock").c_str());
+    unlink((ipcDir + "/audio.sock").c_str());
     unlink((sockDir + "/binder.sock").c_str());
     unlink((sockDir + "/hwbinder.sock").c_str());
     unlink((sockDir + "/vndbinder.sock").c_str());
     unlink((sockDir + "/property_service").c_str());
+    unlink((sockDir + "/input_touch.sock").c_str());
+    unlink((sockDir + "/input_kbd.sock").c_str());
 
     const std::string logDir = androidDir_ + "/hap_logs";
     MkdirP(logDir);
@@ -886,9 +1126,13 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         return;
     }
 
-    // Start XComponent HWC frame consumer right away so it connects immediately
+    // Start XComponent HWC consumer, virtual evdev InputBridge, and OHAudio AudioBridge
     logdwThread_ = std::thread(&AndroidRuntime::LogdwLoop, this, sockDir + "/logdw", logDir + "/logcat.txt");
+    InputBridge::Instance().Start(sockDir + "/input_touch.sock", sockDir + "/input_kbd.sock", width, height);
+    AudioBridge::Instance().Start(ipcDir + "/audio.sock");
     HwcRenderer::Instance().Start(ipcDir + "/hwcomposer.sock", width, height);
+    WaitForFile(sockDir + "/input_touch.sock", 500);
+    WaitForFile(sockDir + "/input_kbd.sock", 500);
 
     // 3. Start servicemanager & hwservicemanager
     auto runSvbox = [&](const std::string& tag,
@@ -902,9 +1146,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     SetStatus("Starting servicemanager & graphics HALs...");
     runSvbox("servicemanager", { "system/bin/servicemanager" });
-    if (!SleepCancelableMs(150)) return;
+    if (!SleepCancelableMs(80)) return;
     runSvbox("hwservicemanager", { "system/bin/hwservicemanager" });
-    if (!SleepCancelableMs(350)) return;
+    if (!SleepCancelableMs(150)) return;
 
     const std::string sfLdPath =
         "LD_LIBRARY_PATH=/system/lib64:/system_ext/lib64:/product/lib64:"
@@ -917,41 +1161,61 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/apex/com.android.media.swcodec/lib64:/apex/com.android.neuralnetworks/lib64:"
         "/apex/com.android.resolv/lib64";
 
-    // 4. Graphics HALs
+    // 4. Graphics HALs (event-driven wait on hwcomposer.sock)
     runSvbox("hidl_alloc", { "-e", sfLdPath, "system/bin/hw/android.hidl.allocator@1.0-service" });
-    if (!SleepCancelableMs(100)) return;
+    if (!SleepCancelableMs(40)) return;
     runSvbox("gralloc", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.allocator@2.0-service" });
-    if (!SleepCancelableMs(100)) return;
+    if (!SleepCancelableMs(40)) return;
     runSvbox("hwcomposer", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.composer@2.1-service" });
-    if (!SleepCancelableMs(500)) return;
+    WaitForFile(ipcDir + "/hwcomposer.sock", 1500);
+    if (!running_.load()) return;
 
-    // 5. SurfaceFlinger
-    SetStatus("Starting SurfaceFlinger (SwiftShader GLES 3.0)...");
+    // 5. SurfaceFlinger (event-driven wait on HwcRenderer connection)
+    SetStatus("Starting SurfaceFlinger...");
     runSvbox("surfaceflinger", { "-e", sfLdPath, "system/bin/surfaceflinger" });
-    if (!SleepCancelableMs(1500)) return;
+    WaitForConditionMs(1500, []() { return HwcRenderer::Instance().IsConnected(); });
+    if (!running_.load()) return;
 
     if (mode == "bootanim") {
-        SetStatus("Running Android 11 BootAnimation -> XComponent (Scheme 1 HWC stream)");
+        SetStatus("Running Android 11 BootAnimation -> XComponent (Async VSync)");
         runSvbox("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
     } else {
-        SetStatus("Starting Android 11 daemons + Zygote64 -> system_server...");
+        SetStatus("Starting Android 11 services + Zygote64...");
         lmkdThread_ = std::thread(&AndroidRuntime::LmkdLoop, this, sockDir + "/lmkd");
         int dnsFd = MakeListenUnix(sockDir + "/dnsproxyd");
         int mdnsFd = MakeListenUnix(sockDir + "/mdns");
         int fwFd = MakeListenUnix(sockDir + "/fwmarkd");
         {
             std::lock_guard<std::mutex> lk(procMu_);
-            if (dnsFd >= 0) ownedFds_.push_back(dnsFd);
+            if (dnsFd >= 0) {
+                ownedFds_.push_back(dnsFd);
+                dnsListenFd_ = dnsFd;
+            }
             if (mdnsFd >= 0) ownedFds_.push_back(mdnsFd);
             if (fwFd >= 0) ownedFds_.push_back(fwFd);
         }
+        if (dnsFd >= 0) {
+            dnsThread_ = std::thread(&AndroidRuntime::DnsProxyLoop, this, dnsFd);
+        }
+        const bool useRealAudio = !audioHalPath_.empty() && FileExists(audioHalPath_) &&
+                                  !audioSvcPath_.empty() && FileExists(audioSvcPath_);
         if (FileExists(netd)) {
-            Spawn({ netd, sockDir + "/binder.sock" }, false, logDir + "/netd.log");
+            std::vector<std::string> netdArgs = { netd, sockDir + "/binder.sock" };
+            if (useRealAudio) netdArgs.push_back("--no-audio-stubs");
+            Spawn(netdArgs, false, logDir + "/netd.log");
         }
         auto launchPaced = [&](const std::string& tag, const std::vector<std::string>& cmd) {
             runSvbox(tag, cmd);
-            SleepCancelableMs(60);
+            SleepCancelableMs(25);
         };
+        if (useRealAudio) {
+            const std::string targetAudioSvc = rootfs_ + "/vendor/bin/hw/svbox-audio-service";
+            CopyRegularFile(audioSvcPath_, targetAudioSvc);
+            chmod(targetAudioSvc.c_str(), 0755);
+            launchPaced("audio_hal", { "-e", sfLdPath, "vendor/bin/hw/svbox-audio-service" });
+            SleepCancelableMs(150);
+            launchPaced("audioserver", { "-e", sfLdPath, "system/bin/audioserver" });
+        }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
@@ -973,7 +1237,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         launchPaced("wifi", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.wifi@1.0-service" });
         launchPaced("bt", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim" });
         launchPaced("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
-        if (!SleepCancelableMs(500)) return;
+        if (!SleepCancelableMs(100)) return;
 
         int zfd = MakeListenUnix(sockDir + "/zygote");
         int ufd = MakeListenUnix(sockDir + "/usap_pool_primary");
@@ -1004,7 +1268,14 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
 std::string AndroidRuntime::Stop() {
     running_.store(false);
+    paused_.store(false);
     HwcRenderer::Instance().Stop();
+    InputBridge::Instance().Stop();
+    AudioBridge::Instance().Stop();
+    if (dnsListenFd_ >= 0) {
+        shutdown(dnsListenFd_, SHUT_RDWR);
+        dnsListenFd_ = -1;
+    }
     if (bootThread_.joinable()) {
         bootThread_.join();
     }
@@ -1013,6 +1284,9 @@ std::string AndroidRuntime::Stop() {
     }
     if (logdwThread_.joinable()) {
         logdwThread_.join();
+    }
+    if (dnsThread_.joinable()) {
+        dnsThread_.join();
     }
 
     std::vector<pid_t> pidsCopy;
@@ -1023,14 +1297,21 @@ std::string AndroidRuntime::Stop() {
         fdsCopy.swap(ownedFds_);
     }
 
+    // Wake any SIGSTOP-paused process groups first, then SIGTERM -> SIGKILL the entire tree
     for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
-        if (*it > 0) kill(*it, SIGTERM);
+        if (*it > 0) {
+            kill(-(*it), SIGCONT);
+            kill(*it, SIGCONT);
+            kill(-(*it), SIGTERM);
+            kill(*it, SIGTERM);
+        }
     }
     if (!pidsCopy.empty()) {
-        usleep(150000);
+        usleep(120000);
     }
     for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
         if (*it > 0) {
+            kill(-(*it), SIGKILL);
             kill(*it, SIGKILL);
             int st = 0;
             waitpid(*it, &st, WNOHANG);

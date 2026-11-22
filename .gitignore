@@ -8,6 +8,8 @@ rootfs/
 binderd/svbox-binderd
 propd/svbox-propd
 netd/svbox-netd
+audio_hal/audio.primary.svbox.so
+audio_hal/svbox-audio-service
 *.png
 *.log
 hap_logs/

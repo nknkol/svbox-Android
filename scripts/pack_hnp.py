@@ -31,6 +31,8 @@ def main() -> None:
         (os.path.join(repo, "binderd", "svbox-binderd"), "svbox_0.1.0/bin/svbox-binderd"),
         (os.path.join(repo, "propd", "svbox-propd"), "svbox_0.1.0/bin/svbox-propd"),
         (os.path.join(repo, "netd", "svbox-netd"), "svbox_0.1.0/bin/svbox-netd"),
+        (os.path.join(repo, "audio_hal", "audio.primary.svbox.so"), "svbox_0.1.0/bin/audio.primary.svbox.so"),
+        (os.path.join(repo, "audio_hal", "svbox-audio-service"), "svbox_0.1.0/bin/svbox-audio-service"),
     ]
 
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -34,6 +34,7 @@
 #define NODE_OEMNETD            0x1003ull
 #define NODE_AUDIO_POLICY       0x1004ull
 #define NODE_AUDIO_FLINGER      0x1005ull
+#define NODE_MEDIA_METRICS      0x1006ull
 
 static int g_ctrl_sock = -1;
 static int g_rpc_sock = -1;
@@ -429,6 +430,7 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr) {
         else if (node == NODE_OEMNETD) p_str16(&reply, "com.android.internal.net.IOemNetd");
         else if (node == NODE_AUDIO_POLICY) p_str16(&reply, "android.media.IAudioPolicyService");
         else if (node == NODE_AUDIO_FLINGER) p_str16(&reply, "android.media.IAudioFlinger");
+        else if (node == NODE_MEDIA_METRICS) p_str16(&reply, "android.media.IMediaMetricsService");
         else p_str16(&reply, "android.net.INetd");
     } else if (code == GET_INTERFACE_VERSION) {
         p_i32(&reply, 0);
@@ -436,11 +438,13 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr) {
     } else if (code == GET_INTERFACE_HASH) {
         p_i32(&reply, 0);
         p_str16(&reply, "");
-    } else if (node == NODE_AUDIO_POLICY || node == NODE_AUDIO_FLINGER) {
-        fprintf(stderr, "[svbox-netd] %s code=%u flags=0x%x data=%llu\n",
-                node == NODE_AUDIO_POLICY ? "AudioPolicy" : "AudioFlinger",
-                code, tr->flags, (unsigned long long)tr->data_size);
-        fflush(stderr);
+    } else if (node == NODE_AUDIO_POLICY || node == NODE_AUDIO_FLINGER || node == NODE_MEDIA_METRICS) {
+        if (node != NODE_MEDIA_METRICS) {
+            fprintf(stderr, "[svbox-netd] %s code=%u flags=0x%x data=%llu\n",
+                    node == NODE_AUDIO_POLICY ? "AudioPolicy" : "AudioFlinger",
+                    code, tr->flags, (unsigned long long)tr->data_size);
+            fflush(stderr);
+        }
         /* Return NO_ERROR (0) + safe zeros */
         p_i32(&reply, 0);
         p_i32(&reply, 0);
@@ -535,17 +539,28 @@ int main(int argc, char **argv) {
     uint32_t enter = SV_BC_ENTER_LOOPER;
     binder_wr((const uint8_t *)&enter, sizeof(enter), sizeof(enter), NULL, 0, NULL);
 
+    int register_audio_stubs = 1;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--no-audio-stubs") == 0)
+            register_audio_stubs = 0;
+    }
+
     if (add_service("netd", NODE_NETD) == 0) {
         fprintf(stderr, "[svbox-netd] registered 'netd'\n");
     }
     if (add_service("dnsresolver", NODE_DNSRESOLVER) == 0) {
         fprintf(stderr, "[svbox-netd] registered 'dnsresolver'\n");
     }
-    if (add_service("media.audio_policy", NODE_AUDIO_POLICY) == 0) {
-        fprintf(stderr, "[svbox-netd] registered 'media.audio_policy'\n");
+    if (add_service("media.metrics", NODE_MEDIA_METRICS) == 0) {
+        fprintf(stderr, "[svbox-netd] registered 'media.metrics'\n");
     }
-    if (add_service("media.audio_flinger", NODE_AUDIO_FLINGER) == 0) {
-        fprintf(stderr, "[svbox-netd] registered 'media.audio_flinger'\n");
+    if (register_audio_stubs) {
+        if (add_service("media.audio_policy", NODE_AUDIO_POLICY) == 0) {
+            fprintf(stderr, "[svbox-netd] registered 'media.audio_policy'\n");
+        }
+        if (add_service("media.audio_flinger", NODE_AUDIO_FLINGER) == 0) {
+            fprintf(stderr, "[svbox-netd] registered 'media.audio_flinger'\n");
+        }
     }
     fflush(stderr);
 

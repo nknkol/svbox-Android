@@ -1,15 +1,13 @@
 /* SPDX-License-Identifier: MIT */
-/* Scheme 1 XComponent Renderer:
- * Connects to Redroid hwcomposer.redroid.so (/ipc/hwcomposer.sock),
- * receives zero-copy /dev/ashmem framebuffer FDs via SCM_RIGHTS,
- * mmaps RGBA_8888 pixels, and flushes them directly to OHNativeWindow. */
 #include "hwc_renderer.h"
+#include "sched_qos.h"
 
 #include <chrono>
 #include <cstring>
 #include <errno.h>
 #include <hilog/log.h>
 #include <native_buffer/native_buffer.h>
+#include <native_vsync/native_vsync.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -77,16 +75,63 @@ HwcRenderer& HwcRenderer::Instance() {
 }
 
 void HwcRenderer::SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH) {
-    std::lock_guard<std::mutex> lk(winMu_);
-    window_ = window;
-    configured_ = false;
-    OH_LOG_INFO(LOG_APP, "XComponent surface ready: %dx%d win=%p", surfaceW, surfaceH, window);
+    {
+        std::lock_guard<std::mutex> lk(winMu_);
+        window_ = window;
+        configured_ = false;
+    }
+    OH_LOG_INFO(LOG_APP, "XComponent surface ready: %{public}dx%{public}d win=%{public}p",
+                surfaceW, surfaceH, window);
+    RequestVsyncFrame();
 }
 
 void HwcRenderer::ClearWindow() {
     std::lock_guard<std::mutex> lk(winMu_);
     window_ = nullptr;
     configured_ = false;
+}
+
+void HwcRenderer::SetVisible(bool visible) {
+    visible_.store(visible);
+    if (visible) {
+        RequestVsyncFrame();
+    }
+}
+
+void HwcRenderer::OnVsyncFrame(long long /*timestamp*/, void* data) {
+    auto* self = static_cast<HwcRenderer*>(data);
+    if (!self) return;
+    {
+        std::lock_guard<std::mutex> lk(self->vsyncMu_);
+        self->vsyncArmed_ = false;
+    }
+    if (self->stop_.load() || !self->visible_.load()) {
+        return;
+    }
+    self->PresentLatest();
+    // If another frame arrived during presentation, arm the next VSync on demand
+    bool more = false;
+    {
+        std::lock_guard<std::mutex> lk(self->bufMu_);
+        more = self->hasPendingFrame_;
+    }
+    if (more) {
+        self->RequestVsyncFrame();
+    }
+}
+
+void HwcRenderer::RequestVsyncFrame() {
+    if (stop_.load() || !visible_.load()) return;
+    if (usingVsync_.load()) {
+        std::lock_guard<std::mutex> lk(vsyncMu_);
+        if (vsync_ && !vsyncArmed_) {
+            if (OH_NativeVSync_RequestFrame(vsync_, &HwcRenderer::OnVsyncFrame, this) == 0) {
+                vsyncArmed_ = true;
+            }
+        }
+    } else {
+        presentCv_.notify_one();
+    }
 }
 
 void HwcRenderer::Start(const std::string& hwcSockPath, int32_t frameW, int32_t frameH) {
@@ -97,16 +142,83 @@ void HwcRenderer::Start(const std::string& hwcSockPath, int32_t frameW, int32_t 
     fps_.store(0);
     frameW_.store(frameW);
     frameH_.store(frameH);
-    worker_ = std::thread(&HwcRenderer::RenderLoop, this, hwcSockPath, frameW, frameH);
+    {
+        std::lock_guard<std::mutex> lk(bufMu_);
+        size_t bytes = static_cast<size_t>(frameW) * static_cast<size_t>(frameH) * 4u;
+        staging_[0].assign(bytes, 0);
+        staging_[1].assign(bytes, 0);
+        frontIdx_ = 0;
+        stagedW_ = frameW;
+        stagedH_ = frameH;
+        hasPendingFrame_ = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(vsyncMu_);
+        const char* name = "svbox_hwc";
+        vsync_ = OH_NativeVSync_Create(name, static_cast<unsigned int>(std::strlen(name)));
+        vsyncArmed_ = false;
+        usingVsync_.store(vsync_ != nullptr);
+    }
+    OH_LOG_INFO(LOG_APP, "HwcRenderer started (OH_NativeVSync=%{public}d)", usingVsync_.load() ? 1 : 0);
+
+    if (!usingVsync_.load()) {
+        fallbackPresentThread_ = std::thread([this]() {
+            SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "hwc-present");
+            while (!stop_.load()) {
+                std::unique_lock<std::mutex> lk(vsyncMu_);
+                presentCv_.wait_for(lk, std::chrono::milliseconds(50), [this]() {
+                    if (stop_.load()) return true;
+                    std::lock_guard<std::mutex> blk(bufMu_);
+                    return hasPendingFrame_ && visible_.load();
+                });
+                lk.unlock();
+                if (!stop_.load() && visible_.load()) {
+                    PresentLatest();
+                }
+            }
+        });
+    }
+
+    worker_ = std::thread(&HwcRenderer::RecvLoop, this, hwcSockPath, frameW, frameH);
 }
 
 void HwcRenderer::Stop() {
     stop_.store(true);
+    presentCv_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
     }
+    if (fallbackPresentThread_.joinable()) {
+        fallbackPresentThread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lk(vsyncMu_);
+        if (vsync_) {
+            OH_NativeVSync_Destroy(vsync_);
+            vsync_ = nullptr;
+        }
+        vsyncArmed_ = false;
+    }
+    usingVsync_.store(false);
     connected_.store(false);
     fps_.store(0);
+}
+
+void HwcRenderer::PresentLatest() {
+    int idx = 0;
+    int32_t w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> lk(bufMu_);
+        if (!hasPendingFrame_) return;
+        idx = frontIdx_;
+        w = stagedW_;
+        h = stagedH_;
+        hasPendingFrame_ = false;
+    }
+    if (w > 0 && h > 0 && staging_[idx].size() >= static_cast<size_t>(w) * static_cast<size_t>(h) * 4u) {
+        PresentRgbaFrame(staging_[idx].data(), w, h);
+    }
 }
 
 bool HwcRenderer::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t srcH) {
@@ -158,10 +270,14 @@ bool HwcRenderer::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t
         const size_t dstStride = handle->stride > 0 ? static_cast<size_t>(handle->stride) : srcStride;
         const size_t copyBytes = srcStride < dstStride ? srcStride : dstStride;
         const int32_t rows = handle->height > 0 && handle->height < srcH ? handle->height : srcH;
-        for (int32_t y = 0; y < rows; ++y) {
-            std::memcpy(dst + static_cast<size_t>(y) * dstStride,
-                        srcRgba + static_cast<size_t>(y) * srcStride,
-                        copyBytes);
+        if (srcStride == dstStride) {
+            std::memcpy(dst, srcRgba, copyBytes * static_cast<size_t>(rows));
+        } else {
+            for (int32_t y = 0; y < rows; ++y) {
+                std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                            srcRgba + static_cast<size_t>(y) * srcStride,
+                            copyBytes);
+            }
         }
         if (mappedLocally) {
             munmap(dst, static_cast<size_t>(handle->size));
@@ -173,16 +289,17 @@ bool HwcRenderer::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t
     return true;
 }
 
-void HwcRenderer::RenderLoop(std::string sockPath, int32_t w, int32_t h) {
-    OH_LOG_INFO(LOG_APP, "HwcRenderer waiting for %s (%dx%d)", sockPath.c_str(), w, h);
+void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "hwc-recv");
+    OH_LOG_INFO(LOG_APP, "HwcRenderer waiting for %{public}s (%{public}dx%{public}d)", sockPath.c_str(), w, h);
 
     while (!stop_.load()) {
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd < 0) {
-            usleep(200000);
+            usleep(100000);
             continue;
         }
-        struct timeval tv = { 0, 500000 }; // 500ms timeout so Stop() is responsive
+        struct timeval tv = { 0, 500000 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -192,15 +309,16 @@ void HwcRenderer::RenderLoop(std::string sockPath, int32_t w, int32_t h) {
 
         if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
             close(fd);
-            usleep(150000);
+            usleep(50000);
             continue;
         }
 
-        OH_LOG_INFO(LOG_APP, "Connected to hwcomposer socket: %s", sockPath.c_str());
+        OH_LOG_INFO(LOG_APP, "Connected to hwcomposer socket: %{public}s", sockPath.c_str());
         connected_.store(true);
 
         auto fpsWindowStart = std::chrono::steady_clock::now();
         int32_t fpsFrames = 0;
+        const size_t frameBytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
 
         while (!stop_.load()) {
             int32_t hdr[16] = {};
@@ -212,19 +330,36 @@ void HwcRenderer::RenderLoop(std::string sockPath, int32_t w, int32_t h) {
                 break;
             }
 
-            size_t minBytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
-            size_t mapSize = hdr[6] > 0 ? static_cast<size_t>(hdr[6]) : minBytes;
-            if (mapSize < minBytes) {
-                mapSize = minBytes;
-            }
+            size_t mapSize = hdr[6] > 0 ? static_cast<size_t>(hdr[6]) : frameBytes;
+            if (mapSize < frameBytes) mapSize = frameBytes;
 
-            void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, primeFd, 0);
-            if (mapped != MAP_FAILED) {
-                PresentRgbaFrame(static_cast<const uint8_t*>(mapped), w, h);
-                munmap(mapped, mapSize);
+            if (visible_.load()) {
+                void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, primeFd, 0);
+                if (mapped != MAP_FAILED) {
+                    int backIdx = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(bufMu_);
+                        backIdx = 1 - frontIdx_;
+                        if (staging_[backIdx].size() < frameBytes) {
+                            staging_[backIdx].resize(frameBytes);
+                        }
+                    }
+                    // Copy outside lock into back buffer, then flip frontIdx_
+                    std::memcpy(staging_[backIdx].data(), mapped, frameBytes);
+                    munmap(mapped, mapSize);
+                    {
+                        std::lock_guard<std::mutex> lk(bufMu_);
+                        frontIdx_ = backIdx;
+                        stagedW_ = w;
+                        stagedH_ = h;
+                        hasPendingFrame_ = true;
+                    }
+                    RequestVsyncFrame();
+                }
             }
             close(primeFd);
 
+            // Immediate ACK decouples SurfaceFlinger from OHNativeWindow swap latency
             const char ack[2] = { 'o', 'k' };
             if (send(fd, ack, 2, MSG_NOSIGNAL) != 2) {
                 break;
@@ -245,7 +380,7 @@ void HwcRenderer::RenderLoop(std::string sockPath, int32_t w, int32_t h) {
         fps_.store(0);
         close(fd);
         if (!stop_.load()) {
-            usleep(200000);
+            usleep(100000);
         }
     }
 }
