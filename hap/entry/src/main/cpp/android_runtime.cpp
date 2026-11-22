@@ -766,7 +766,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "ro.hardware.gralloc=redroid\n"
         "ro.hardware.vulkan=pastel\n"
         "ro.opengles.version=196610\n"
-        "ro.sf.lcd_density=200\n"
+        "ro.sf.lcd_density=320\n"
         "debug.renderengine.backend=gles\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
@@ -905,11 +905,15 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     if (!SleepCancelableMs(350)) return;
 
     const std::string sfLdPath =
-        "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/vendor/lib64/egl:/vendor/lib64/hw:"
+        "LD_LIBRARY_PATH=/system/lib64:/system_ext/lib64:/product/lib64:"
+        "/vendor/lib64:/vendor/lib64/egl:/vendor/lib64/hw:"
         "/apex/com.android.vndk.v30/lib64:/apex/com.android.vndk.current/lib64:"
-        "/apex/com.android.os.statsd/lib64:/apex/com.android.art/lib64:"
-        "/apex/com.android.runtime/lib64/bionic:/apex/com.android.conscrypt/lib64:"
-        "/apex/com.android.i18n/lib64:/apex/com.android.media/lib64";
+        "/apex/com.android.art/lib64:/apex/com.android.adbd/lib64:"
+        "/apex/com.android.runtime/lib64:/apex/com.android.runtime/lib64/bionic:"
+        "/apex/com.android.os.statsd/lib64:/apex/com.android.conscrypt/lib64:"
+        "/apex/com.android.i18n/lib64:/apex/com.android.media/lib64:"
+        "/apex/com.android.media.swcodec/lib64:/apex/com.android.neuralnetworks/lib64:"
+        "/apex/com.android.resolv/lib64";
 
     // 4. Graphics HALs
     runSvbox("hidl_alloc", { "-e", sfLdPath, "system/bin/hw/android.hidl.allocator@1.0-service" });

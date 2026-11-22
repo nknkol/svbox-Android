@@ -11,8 +11,8 @@ struct Index {
   @State private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
   @State private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
   private pollTimer: number = -1;
-  private readonly displayW: number = 480;
-  private readonly displayH: number = 854;
+  private readonly displayW: number = 720;
+  private readonly displayH: number = 1280;
 
   aboutToAppear(): void {
     const autoMode: string | undefined = AppStorage.get<string>('autoStart');
