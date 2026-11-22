@@ -445,9 +445,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-v", rootfs_ + "/system/apex:/apex",
         "-v", rootfs_ + "/system/apex/com.android.art.debug:/apex/com.android.art",
         "-v", rootfs_ + "/system/apex/com.android.vndk.current:/apex/com.android.vndk.v30",
-        "-v", rootfs_ + "/system/apex/com.android.runtime/bin/linker64:/system/bin/linker64",
         "-v", rootfs_ + "/system/etc:/etc",
-        "-v", rootfs_ + "/system/bin:/bin",
         "-v", rootfs_ + "/system/product:/product",
         "-v", rootfs_ + "/system/system_ext:/system_ext",
         "-v", runBase_ + "/__properties__:/dev/__properties__",
@@ -982,7 +980,6 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
 
         std::vector<std::string> zygCmd = {
-            "-e", sfLdPath,
             "-e", "ANDROID_SOCKET_zygote=" + std::to_string(zfd),
             "-e", "ANDROID_SOCKET_usap_pool_primary=" + std::to_string(ufd),
             "system/bin/app_process64",
