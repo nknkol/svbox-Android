@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "svbox-Android Container Runtime" },
+    { "name": "EntryAbility_desc", "value": "svbox-Android Main Window" },
+    { "name": "EntryAbility_label", "value": "svbox Android" },
+    { "name": "perm_internet", "value": "Network access for Android container" },
+    { "name": "perm_user_file", "value": "Access local Android rootfs and svbox runtime binaries" }
+  ]
+}

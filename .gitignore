@@ -1,0 +1,27 @@
+# Android rootfs & images (downloaded externally, never committed)
+rootfs/
+*.tar.gz
+*.img
+
+# Compiled host daemons & screenshots
+binderd/svbox-binderd
+propd/svbox-propd
+first_frame.png
+*.log
+__pycache__/
+*.pyc
+
+# HarmonyOS HAP build artifacts & signing credentials
+hap/.hvigor/
+hap/oh_modules/
+hap/entry/.cxx/
+hap/entry/build/
+hap/entry/oh_modules/
+hap/entry/libs/
+hap/build/
+hap/*.hap
+hap/local.properties
+*.p12
+*.p7b
+*.cer
+*.keystore
