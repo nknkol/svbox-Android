@@ -7,7 +7,8 @@ rootfs/
 # Compiled host daemons & screenshots
 binderd/svbox-binderd
 propd/svbox-propd
-first_frame.png
+netd/svbox-netd
+*.png
 *.log
 hap_logs/
 __pycache__/

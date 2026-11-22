@@ -21,6 +21,7 @@ def main() -> None:
                 {"source": "bin/svbox", "target": "svbox"},
                 {"source": "bin/svbox-binderd", "target": "svbox-binderd"},
                 {"source": "bin/svbox-propd", "target": "svbox-propd"},
+                {"source": "bin/svbox-netd", "target": "svbox-netd"},
             ]
         },
     }
@@ -29,6 +30,7 @@ def main() -> None:
         (svbox_bin, "svbox_0.1.0/bin/svbox"),
         (os.path.join(repo, "binderd", "svbox-binderd"), "svbox_0.1.0/bin/svbox-binderd"),
         (os.path.join(repo, "propd", "svbox-propd"), "svbox_0.1.0/bin/svbox-propd"),
+        (os.path.join(repo, "netd", "svbox-netd"), "svbox_0.1.0/bin/svbox-netd"),
     ]
 
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:

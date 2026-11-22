@@ -35,7 +35,7 @@
 #define MAX_PROCS     128
 #define MAX_NODES     4096
 #define MAX_HANDLES   1024
-#define MAX_THREADS   512
+#define MAX_THREADS   1024
 #define MAX_CONNS     1024
 #define PROC_MEM_SIZE (2u * 1024u * 1024u) /* 2 MiB per process */
 #define MAX_ALLOCS    512
@@ -54,6 +54,9 @@ struct bhandle {
     uint32_t node_id;
     int32_t  strong_refs;
     int32_t  weak_refs;
+    bool     released_strong;
+    bool     has_death;
+    uint64_t death_cookie;
     bool     used;
 };
 
@@ -67,6 +70,7 @@ struct bmsg {
     /* For BR_TRANSACTION: tracks caller thread to deliver BC_REPLY back to. */
     uint32_t reply_to_thread_id;
     bool     is_oneway;
+    uint64_t data_guest_ptr;
     struct bmsg *next;
 };
 
@@ -83,6 +87,9 @@ struct bproc {
     uint64_t guest_base;
     uint64_t guest_map_len;
     uint32_t next_handle;
+    uint32_t max_threads;
+    uint32_t requested_threads;
+    uint32_t requested_threads_started;
     struct mem_block allocs[MAX_ALLOCS];
     struct bhandle handles[MAX_HANDLES];
     struct bmsg *inbox_head;
@@ -98,6 +105,10 @@ struct bnode {
     bool     is_ctx_mgr;
     bool     has_weak_ref;
     bool     has_strong_ref;
+    bool     has_async_txn;
+    uint64_t async_buf_ptr;
+    struct bmsg *async_head;
+    struct bmsg *async_tail;
 };
 
 struct bthread {
@@ -108,6 +119,7 @@ struct bthread {
     uint32_t tid;
     int      rpc_fd;
     bool     is_looper;
+    bool     is_registered_looper;
     bool     waiting_read;
     uint32_t waiting_reply_count;
     uint32_t parked_read_cap;
@@ -282,15 +294,21 @@ static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, ui
     return NULL;
 }
 
+static struct bhandle *find_handle_entry(struct bproc *proc, uint32_t handle)
+{
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        if (proc->handles[i].used && proc->handles[i].handle == handle)
+            return &proc->handles[i];
+    }
+    return NULL;
+}
+
 static struct bnode *lookup_handle_node(struct bproc *proc, uint32_t handle)
 {
     if (handle == 0)
         return find_node(g_ctx_mgr_node_id);
-    for (int i = 0; i < MAX_HANDLES; i++) {
-        if (proc->handles[i].used && proc->handles[i].handle == handle)
-            return find_node(proc->handles[i].node_id);
-    }
-    return NULL;
+    struct bhandle *he = find_handle_entry(proc, handle);
+    return he ? find_node(he->node_id) : NULL;
 }
 
 static uint32_t get_or_create_handle(struct bproc *proc, uint32_t node_id)
@@ -298,17 +316,15 @@ static uint32_t get_or_create_handle(struct bproc *proc, uint32_t node_id)
     if (node_id == g_ctx_mgr_node_id)
         return 0;
     for (int i = 0; i < MAX_HANDLES; i++) {
-        if (proc->handles[i].used && proc->handles[i].node_id == node_id) {
-            proc->handles[i].strong_refs++;
+        if (proc->handles[i].used && proc->handles[i].node_id == node_id)
             return proc->handles[i].handle;
-        }
     }
     for (int i = 0; i < MAX_HANDLES; i++) {
         if (!proc->handles[i].used) {
+            memset(&proc->handles[i], 0, sizeof(proc->handles[i]));
             proc->handles[i].used = true;
             proc->handles[i].handle = proc->next_handle++;
             proc->handles[i].node_id = node_id;
-            proc->handles[i].strong_refs = 1;
             return proc->handles[i].handle;
         }
     }
@@ -437,6 +453,23 @@ static struct bmsg *make_simple_br(uint32_t br_cmd, const void *body, uint32_t b
     return m;
 }
 
+static bool should_spawn_looper(struct bproc *proc, struct bthread *excluding)
+{
+    if (!proc || proc->max_threads == 0)
+        return false;
+    if (proc->requested_threads > 0)
+        return false;
+    if (proc->requested_threads_started >= proc->max_threads)
+        return false;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        struct bthread *ot = &g_threads[i];
+        if (ot->used && ot != excluding && ot->proc_id == proc->proc_id &&
+            ot->is_looper && ot->waiting_read && ot->waiting_reply_count == 0)
+            return false;
+    }
+    return true;
+}
+
 /* Try to satisfy a parked thread's BINDER_WRITE_READ read request. */
 static void try_deliver_to_thread(struct bthread *t)
 {
@@ -446,7 +479,7 @@ static void try_deliver_to_thread(struct bthread *t)
     if (!proc)
         return;
 
-    /* Pick ready messages: direct queue first, then proc inbox if not blocked waiting for a sync reply. */
+    /* Pick ready messages: direct queue first, then proc inbox if looper and not blocked waiting for a sync reply. */
     uint8_t br_buf[65536];
     uint32_t br_off = 0;
     uint32_t cap = t->parked_read_cap;
@@ -458,22 +491,40 @@ static void try_deliver_to_thread(struct bthread *t)
     uint32_t fd_count = 0;
 
     bool got_any = false;
+    bool spawned = false;
     while (br_off < cap) {
         struct bmsg *m = NULL;
         if (t->direct_head) {
             if (br_off + 4 + t->direct_head->payload_len > cap ||
                 fd_count + t->direct_head->fd_count > VDEV_MAX_FDS)
                 break;
+            if (!spawned && t->is_looper && t->direct_head->br_cmd == SV_BR_TRANSACTION &&
+                should_spawn_looper(proc, t) &&
+                br_off + 4 + 4 + t->direct_head->payload_len <= cap) {
+                uint32_t sp = SV_BR_SPAWN_LOOPER;
+                memcpy(br_buf + br_off, &sp, 4);
+                br_off += 4;
+                proc->requested_threads++;
+                spawned = true;
+            }
             m = pop_direct(t);
             if (m && m->br_cmd == SV_BR_TRANSACTION && !m->is_oneway) {
                 if (t->reply_top < 16)
                     t->reply_stack[t->reply_top++] = m->reply_to_thread_id;
             }
-        } else if (t->waiting_reply_count == 0 && proc->inbox_head && !got_any) {
+        } else if (t->is_looper && t->waiting_reply_count == 0 && proc->inbox_head && !got_any) {
             /* Deliver one inbox transaction at a time so other loopers can help. */
             if (br_off + 4 + proc->inbox_head->payload_len > cap ||
                 fd_count + proc->inbox_head->fd_count > VDEV_MAX_FDS)
                 break;
+            if (!spawned && should_spawn_looper(proc, t) &&
+                br_off + 4 + 4 + proc->inbox_head->payload_len <= cap) {
+                uint32_t sp = SV_BR_SPAWN_LOOPER;
+                memcpy(br_buf + br_off, &sp, 4);
+                br_off += 4;
+                proc->requested_threads++;
+                spawned = true;
+            }
             m = pop_inbox(proc);
             if (m && m->br_cmd == SV_BR_TRANSACTION && !m->is_oneway) {
                 if (t->reply_top < 16)
@@ -537,6 +588,30 @@ static void try_deliver_to_thread(struct bthread *t)
 
 static void wake_proc_waiters(struct bproc *proc);
 
+static void node_check_release(struct bnode *node)
+{
+    if (!node || !node->used || node->ptr == 0 || node->is_ctx_mgr)
+        return;
+    struct bproc *owner = find_proc(node->owner_proc_id);
+    if (!owner)
+        return;
+    for (int pi = 0; pi < MAX_PROCS; pi++) {
+        if (!g_procs[pi].used)
+            continue;
+        for (int hi = 0; hi < MAX_HANDLES; hi++) {
+            struct bhandle *he = &g_procs[pi].handles[hi];
+            if (he->used && he->node_id == node->node_id)
+                return;
+        }
+    }
+    if (node->has_strong_ref) {
+        uint64_t pc[2] = { node->ptr, node->cookie };
+        node->has_strong_ref = false;
+        push_inbox(owner, make_simple_br(SV_BR_RELEASE, pc, sizeof(pc)));
+        wake_proc_waiters(owner);
+    }
+}
+
 static void node_inc_refs(struct bnode *node, bool strong, struct bthread *prefer_t)
 {
     if (!node || !node->used || node->ptr == 0)
@@ -571,7 +646,8 @@ static void wake_proc_waiters(struct bproc *proc)
 {
     for (int i = 0; i < MAX_THREADS && proc->inbox_head; i++) {
         if (g_threads[i].used && g_threads[i].proc_id == proc->proc_id &&
-            g_threads[i].waiting_read && g_threads[i].waiting_reply_count == 0) {
+            g_threads[i].is_looper && g_threads[i].waiting_read &&
+            g_threads[i].waiting_reply_count == 0) {
             try_deliver_to_thread(&g_threads[i]);
         }
     }
@@ -794,6 +870,7 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
 
     memcpy(msg->payload, &out_txn, sizeof(out_txn));
     msg->payload_len = sizeof(out_txn);
+    msg->data_guest_ptr = out_txn.data.ptr.buffer;
 
     DLOG("%s proc=%u(pid=%u) -> proc=%u(pid=%u) handle=%u code=0x%x flags=0x%x data=%llu offs=%llu",
          is_reply ? "BC_REPLY" : "BC_TXN",
@@ -807,6 +884,22 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
     if (is_reply) {
         push_direct(reply_t, msg);
         try_deliver_to_thread(reply_t);
+    } else if (is_oneway && target_node) {
+        /* Linux Binder rule: serialize TF_ONE_WAY transactions per target node
+         * until BC_FREE_BUFFER releases the previous oneway buffer. */
+        if (target_node->has_async_txn) {
+            msg->next = NULL;
+            if (target_node->async_tail)
+                target_node->async_tail->next = msg;
+            else
+                target_node->async_head = msg;
+            target_node->async_tail = msg;
+        } else {
+            target_node->has_async_txn = true;
+            target_node->async_buf_ptr = msg->data_guest_ptr;
+            push_inbox(target_p, msg);
+            wake_proc_waiters(target_p);
+        }
     } else {
         if (!is_oneway)
             sender_t->waiting_reply_count++;
@@ -898,11 +991,39 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             uint64_t ptr;
             memcpy(&ptr, arg, 8);
             proc_mem_free(proc, ptr);
+            /* Advance serialized TF_ONE_WAY queue on any node whose active async buffer was freed. */
+            for (int ni = 0; ni < MAX_NODES; ni++) {
+                struct bnode *nd = &g_nodes[ni];
+                if (nd->used && nd->owner_proc_id == proc->proc_id &&
+                    nd->has_async_txn && nd->async_buf_ptr == ptr) {
+                    if (nd->async_head) {
+                        struct bmsg *nxt = nd->async_head;
+                        nd->async_head = nxt->next;
+                        if (!nd->async_head) nd->async_tail = NULL;
+                        nxt->next = NULL;
+                        nd->async_buf_ptr = nxt->data_guest_ptr;
+                        push_inbox(proc, nxt);
+                        wake_proc_waiters(proc);
+                    } else {
+                        nd->has_async_txn = false;
+                        nd->async_buf_ptr = 0;
+                    }
+                    break;
+                }
+            }
             break;
         }
         case SV_BC_ENTER_LOOPER:
+            t->is_looper = true;
+            break;
         case SV_BC_REGISTER_LOOPER:
             t->is_looper = true;
+            if (!t->is_registered_looper) {
+                t->is_registered_looper = true;
+                if (proc->requested_threads > 0)
+                    proc->requested_threads--;
+                proc->requested_threads_started++;
+            }
             break;
         case SV_BC_EXIT_LOOPER:
             t->is_looper = false;
@@ -911,21 +1032,60 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
         case SV_BC_ACQUIRE: {
             uint32_t h = 0;
             memcpy(&h, arg, 4);
+            struct bhandle *he = find_handle_entry(proc, h);
+            if (he) {
+                if (cmd == SV_BC_ACQUIRE) {
+                    he->strong_refs++;
+                    he->released_strong = false;
+                } else {
+                    he->weak_refs++;
+                }
+            }
             struct bnode *n = lookup_handle_node(proc, h);
             if (n)
                 node_inc_refs(n, cmd == SV_BC_ACQUIRE, NULL);
             break;
         }
         case SV_BC_RELEASE:
-        case SV_BC_DECREFS:
+        case SV_BC_DECREFS: {
+            uint32_t h = 0;
+            memcpy(&h, arg, 4);
+            struct bhandle *he = find_handle_entry(proc, h);
+            if (he) {
+                if (cmd == SV_BC_RELEASE) {
+                    if (he->strong_refs > 0) he->strong_refs--;
+                    if (he->strong_refs == 0) he->released_strong = true;
+                } else if (cmd == SV_BC_DECREFS && he->weak_refs > 0) {
+                    he->weak_refs--;
+                }
+            }
+            break;
+        }
         case SV_BC_INCREFS_DONE:
         case SV_BC_ACQUIRE_DONE:
-        case SV_BC_REQUEST_DEATH_NOTIFICATION:
         case SV_BC_DEAD_BINDER_DONE:
             break;
+        case SV_BC_REQUEST_DEATH_NOTIFICATION: {
+            struct sv_binder_handle_cookie hc;
+            memcpy(&hc, arg, sizeof(hc));
+            struct bhandle *he = find_handle_entry(proc, hc.handle);
+            if (he) {
+                struct bnode *n = find_node(he->node_id);
+                if (!n || !n->used) {
+                    push_direct(t, make_simple_br(SV_BR_DEAD_BINDER, &hc.cookie, 8));
+                } else {
+                    he->has_death = true;
+                    he->death_cookie = hc.cookie;
+                }
+            }
+            break;
+        }
         case SV_BC_CLEAR_DEATH_NOTIFICATION: {
             struct sv_binder_handle_cookie hc;
             memcpy(&hc, arg, sizeof(hc));
+            struct bhandle *he = find_handle_entry(proc, hc.handle);
+            if (he)
+                he->has_death = false;
             push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &hc.cookie, 8));
             break;
         }
@@ -972,6 +1132,11 @@ static void drop_conn(struct conn_entry *ce)
             }
             while (t->direct_head)
                 free_bmsg(pop_direct(t));
+            if (t->is_registered_looper) {
+                struct bproc *tp = find_proc(t->proc_id);
+                if (tp && tp->requested_threads_started > 0)
+                    tp->requested_threads_started--;
+            }
             t->used = false;
         }
     } else if (ce->kind == CONN_NOTIFY) {
@@ -993,10 +1158,48 @@ static void drop_conn(struct conn_entry *ce)
                 }
                 free_bmsg(m);
             }
+            /* Release all handles held by this dying process so target owners get BR_RELEASE/BR_DECREFS. */
+            uint32_t rel_nodes[MAX_HANDLES];
+            int rel_count = 0;
+            for (int hi = 0; hi < MAX_HANDLES; hi++) {
+                if (p->handles[hi].used) {
+                    rel_nodes[rel_count++] = p->handles[hi].node_id;
+                    p->handles[hi].used = false;
+                    p->handles[hi].strong_refs = 0;
+                    p->handles[hi].weak_refs = 0;
+                    p->handles[hi].has_death = false;
+                }
+            }
+            for (int ri = 0; ri < rel_count; ri++)
+                node_check_release(find_node(rel_nodes[ri]));
+
             for (int i = 0; i < MAX_NODES; i++) {
                 if (g_nodes[i].used && g_nodes[i].owner_proc_id == p->proc_id) {
+                    uint32_t dead_nid = g_nodes[i].node_id;
+                    /* Deliver BR_DEAD_BINDER to any live process watching this node. */
+                    for (int pi = 0; pi < MAX_PROCS; pi++) {
+                        struct bproc *op = &g_procs[pi];
+                        if (!op->used || op->proc_id == p->proc_id)
+                            continue;
+                        for (int hi = 0; hi < MAX_HANDLES; hi++) {
+                            struct bhandle *oh = &op->handles[hi];
+                            if (oh->used && oh->node_id == dead_nid && oh->has_death) {
+                                uint64_t cookie = oh->death_cookie;
+                                oh->has_death = false;
+                                push_inbox(op, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
+                                wake_proc_waiters(op);
+                            }
+                        }
+                    }
                     if (g_ctx_mgr_node_id == g_nodes[i].node_id)
                         g_ctx_mgr_node_id = 0;
+                    while (g_nodes[i].async_head) {
+                        struct bmsg *am = g_nodes[i].async_head;
+                        g_nodes[i].async_head = am->next;
+                        free_bmsg(am);
+                    }
+                    g_nodes[i].async_tail = NULL;
+                    g_nodes[i].has_async_txn = false;
                     g_nodes[i].used = false;
                 }
             }
@@ -1143,6 +1346,13 @@ static void handle_conn_event(struct conn_entry *ce)
         int32_t rc = 0;
         if (!p) {
             rc = -EBADF;
+        } else if (hdr.arg0 == SV_BINDER_SET_MAX_THREADS) {
+            uint32_t mt = 15;
+            if (hdr.payload_len >= 4)
+                memcpy(&mt, payload, 4);
+            if (mt > 64) mt = 64;
+            p->max_threads = mt;
+            DLOG("SET_MAX_THREADS proc=%u max=%u", p->proc_id, p->max_threads);
         } else if (hdr.arg0 == SV_BINDER_SET_CONTEXT_MGR || hdr.arg0 == SV_BINDER_SET_CONTEXT_MGR_EXT) {
             if (g_ctx_mgr_node_id != 0) {
                 rc = -EBUSY;

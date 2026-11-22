@@ -36,6 +36,7 @@ SYSPOWER_DIR = f"{RUN_BASE}/sys_power"
 DEV_INPUT_DIR = f"{RUN_BASE}/dev_input"
 IPC_DIR = f"{RUN_BASE}/ipc"
 OVERRIDE_PROP = f"{RUN_BASE}/override.prop"
+OWNER_DB = f"{RUN_BASE}/owner.db"
 LOG_FILE = f"{RUN_BASE}/logcat.txt"
 
 BOOTCLASSPATH = (
@@ -98,6 +99,7 @@ def svbox_base_cmd():
         "--hostname", "localhost",
         "--emulate-mounts",
         "--mount-scratch", f"{RUN_BASE}/tmpfs",
+        "--owner-db", OWNER_DB,
         "-v", "/proc:/proc",
         "-v", "/dev/null:/dev/null",
         "-v", "/dev/zero:/dev/zero",
@@ -112,6 +114,12 @@ def svbox_base_cmd():
         "-v", f"{DEV_INPUT_DIR}:/dev/input",
         "-v", f"{IPC_DIR}:/ipc",
         "-v", f"{DATA_DIR}:/data",
+        "-v", f"{DATA_DIR}/data:/data/user/0",
+        "-v", f"{DATA_DIR}/user:/data_mirror/data_ce/null",
+        "-v", f"{DATA_DIR}/data:/data_mirror/data_ce/null/0",
+        "-v", f"{DATA_DIR}/user_de:/data_mirror/data_de/null",
+        "-v", f"{DATA_DIR}/misc/profiles/cur:/data_mirror/cur_profiles",
+        "-v", f"{DATA_DIR}/misc/profiles/ref:/data_mirror/ref_profiles",
         "-v", f"{CACHE_DIR}:/cache",
         "-v", f"{ACCT_DIR}:/acct",
         "-v", f"{CGROUP_DIR}:/sys/fs/cgroup",
@@ -207,6 +215,18 @@ def start_hwc_receiver(sock_path, stop_ev, stats):
                 time.sleep(0.2)
                 continue
 
+            last_raw = None
+            dirty = False
+
+            def _save_png(raw_bytes):
+                import zlib
+                def _chk(t, d):
+                    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+                rows = b"".join(b"\x00" + raw_bytes[y * 720 * 4:(y + 1) * 720 * 4] for y in range(1280))
+                png = b"\x89PNG\r\n\x1a\n" + _chk(b"IHDR", struct.pack(">IIBBBBB", 720, 1280, 8, 6, 0, 0, 0)) + _chk(b"IDAT", zlib.compress(rows, 1)) + _chk(b"IEND", b"")
+                with open(f"{ANDROID_DIR}/desktop_frame.png", "wb") as pf:
+                    pf.write(png)
+
             while not stop_ev.is_set():
                 try:
                     hdr = recv_exact(s, 64)
@@ -223,36 +243,85 @@ def start_hwc_receiver(sock_path, stop_ev, stats):
                     fields = struct.unpack("<16i", hdr)
                     stats["frames"] += 1
                     n = stats["frames"]
-                    if n <= 3 or n % 30 == 0:
-                        nz = -1
-                        if prime_fd >= 0:
-                            try:
-                                sz = os.fstat(prime_fd).st_size
-                                if sz <= 0:
-                                    sz = max(fields[6], 720 * 1280 * 4)
-                                mm = mmap.mmap(prime_fd, min(sz, 16 * 1024 * 1024), prot=mmap.PROT_READ)
+                    if prime_fd >= 0:
+                        try:
+                            sz = os.fstat(prime_fd).st_size
+                            if sz <= 0:
+                                sz = max(fields[6], 720 * 1280 * 4)
+                            mm = mmap.mmap(prime_fd, min(sz, 16 * 1024 * 1024), prot=mmap.PROT_READ)
+                            if len(mm) >= 720 * 1280 * 4:
+                                last_raw = mm[:720 * 1280 * 4]
+                                stats["last_raw"] = last_raw
+                                dirty = True
+                            if n <= 3 or n % 30 == 0:
                                 sample = mm[:min(len(mm), 65536)]
                                 nz = sum(1 for b in sample if b != 0)
                                 stats["last_size"] = len(mm)
                                 stats["last_nz"] = nz
-                                mm.close()
-                            except Exception as e:
-                                nz = -2
-                                print(f"[HWC-STREAM] mmap err: {e}", flush=True)
-                        print(f"[HWC-STREAM] frame #{n}: fd={prime_fd} fields={fields[:12]} sample_nz={nz}", flush=True)
-                    if prime_fd >= 0:
+                                print(f"[HWC-STREAM] frame #{n}: fd={prime_fd} fields={fields[:12]} sample_nz={nz}", flush=True)
+                            if (n == 5 or (n >= 60 and n % 60 == 0)) and last_raw is not None:
+                                _save_png(last_raw)
+                                dirty = False
+                            mm.close()
+                        except Exception as e:
+                            print(f"[HWC-STREAM] mmap err: {e}", flush=True)
                         os.close(prime_fd)
                     s.sendall(b"ok")
                 except socket.timeout:
+                    if dirty and last_raw is not None:
+                        _save_png(last_raw)
+                        dirty = False
                     continue
                 except OSError as e:
                     print(f"[HWC-STREAM] recv err: {e}", flush=True)
                     break
+            if dirty and last_raw is not None:
+                _save_png(last_raw)
             s.close()
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
     return t
+
+def start_lmkd_stub(sock_path, stop_ev):
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.bind(sock_path)
+    os.chmod(sock_path, 0o666)
+    s.listen(8)
+    s.settimeout(0.2)
+
+    def handle_client(c):
+        c.settimeout(0.5)
+        try:
+            while not stop_ev.is_set():
+                try:
+                    data = c.recv(256)
+                    if not data:
+                        break
+                except socket.timeout:
+                    continue
+        except Exception:
+            pass
+        finally:
+            c.close()
+
+    def loop():
+        while not stop_ev.is_set():
+            try:
+                c, _ = s.accept()
+                threading.Thread(target=handle_client, args=(c,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+        s.close()
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
+
 
 def prep_dirs():
     if os.path.exists(RUN_BASE):
@@ -270,6 +339,7 @@ def prep_dirs():
         f"{DATA_DIR}/misc/profiles/ref",
         f"{DATA_DIR}/misc/apexdata",
         f"{DATA_DIR}/misc/keystore",
+        f"{DATA_DIR}/misc/gatekeeper",
         f"{DATA_DIR}/misc/installd",
         f"{DATA_DIR}/misc/user/0",
         f"{DATA_DIR}/misc/media",
@@ -318,10 +388,22 @@ def prep_dirs():
         f"{DEV_STUNE}/background",
         f"{DEV_STUNE}/top-app",
         f"{MNT_DIR}/user/0",
-        f"{MNT_DIR}/runtime/default",
+        f"{MNT_DIR}/expand",
+        f"{MNT_DIR}/runtime/default/emulated/0",
+        f"{MNT_DIR}/runtime/read/emulated/0",
+        f"{MNT_DIR}/runtime/write/emulated/0",
+        f"{MNT_DIR}/runtime/full/emulated/0",
+        f"{MNT_DIR}/pass_through/0/emulated/0",
+        f"{MNT_DIR}/installer/0/emulated/0",
+        f"{MNT_DIR}/androidwritable/0/emulated/0",
         f"{STORAGE_DIR}/emulated/0",
     ]:
         os.makedirs(d, exist_ok=True)
+    # Initialize empty svbox virtual ownership database (ELFOWN1, 65536 slots)
+    with open(OWNER_DB, "wb") as f:
+        cap = 65536
+        f.write(struct.pack("<8sIIII40x", b"ELFOWN1\0", cap, 0, 0, 0))
+        f.truncate(64 + cap * 32)
     # Write Redroid guest-mode display & runtime property overrides
     with open(OVERRIDE_PROP, "w") as f:
         f.write(
@@ -340,6 +422,8 @@ def prep_dirs():
             "bpf.progs_loaded=1\n"
             "log.tag.libprocessgroup=F\n"
             "sys.use_memfd=false\n"
+            "persist.zygote.app_data_isolation=0\n"
+            "persist.sys.vold_app_data_isolation_enabled=false\n"
         )
     # Create dummy /sys/power files for android.system.suspend@1.0-service
     for fn, content in [
@@ -381,6 +465,7 @@ def main():
     try:
         # 1. Start logdw receiver & HWC frame stream receiver
         start_logdw(f"{SOCK_DIR}/logdw", stop_ev, log_fp)
+        start_lmkd_stub(f"{SOCK_DIR}/lmkd", stop_ev)
         hwc_stats = {"frames": 0, "last_size": 0, "last_nz": 0}
         start_hwc_receiver(f"{IPC_DIR}/hwcomposer.sock", stop_ev, hwc_stats)
 
@@ -464,8 +549,12 @@ def main():
             ("power_hal", ["vendor/bin/hw/android.hardware.power-service.example"]),
             ("health_hal", ["vendor/bin/hw/android.hardware.health@2.1-service"]),
             ("gatekeeper_hal", ["vendor/bin/hw/android.hardware.gatekeeper@1.0-service.software"]),
+            ("gatekeeperd", ["system/bin/gatekeeperd", "/data/misc/gatekeeper"]),
             ("keymaster_hal", ["vendor/bin/hw/android.hardware.keymaster@3.0-service"]),
             ("sensors_hal", ["vendor/bin/hw/android.hardware.sensors@2.1-service.mock"]),
+            ("gnss_hal", ["vendor/bin/hw/android.hardware.gnss@2.1-service"]),
+            ("wifi_hal", ["vendor/bin/hw/android.hardware.wifi@1.0-service"]),
+            ("bt_hal", ["vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim"]),
             ("gralloc_hal", ["vendor/bin/hw/android.hardware.graphics.allocator@2.0-service"]),
             ("hwc_hal", ["vendor/bin/hw/android.hardware.graphics.composer@2.1-service"]),
         ]:
@@ -478,24 +567,18 @@ def main():
             procs.append((hname, p))
         time.sleep(1.0)
 
-        # 4b2. Start netd (with inherited dnsproxyd/mdns/fwmarkd sockets)
+        # 4b2. Start unprivileged svbox-netd stub (registers INetd + IDnsResolver)
         s_dns = make_listen_unix(f"{SOCK_DIR}/dnsproxyd")
         s_mdns = make_listen_unix(f"{SOCK_DIR}/mdns")
         s_fw = make_listen_unix(f"{SOCK_DIR}/fwmarkd")
         socks.extend([s_dns, s_mdns, s_fw])
         p_netd = subprocess.Popen(
-            svbox_base_cmd() + [
-                "-e", f"ANDROID_SOCKET_dnsproxyd={s_dns.fileno()}",
-                "-e", f"ANDROID_SOCKET_mdns={s_mdns.fileno()}",
-                "-e", f"ANDROID_SOCKET_fwmarkd={s_fw.fileno()}",
-                "system/bin/netd",
-            ],
-            pass_fds=(s_dns.fileno(), s_mdns.fileno(), s_fw.fileno()),
+            [f"{ANDROID_DIR}/netd/svbox-netd", f"{SOCK_DIR}/binder.sock"],
             stdout=open(f"{RUN_BASE}/netd.out", "w"),
             stderr=open(f"{RUN_BASE}/netd.err", "w"),
         )
-        procs.append(("netd", p_netd))
-        time.sleep(0.5)
+        procs.append(("svbox-netd", p_netd))
+        time.sleep(0.3)
 
         # 4c. Start SurfaceFlinger (uses gralloc.redroid + hwcomposer.redroid + SwiftShader GLES)
         sf_env = ["-e", "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/vendor/lib64/egl:/vendor/lib64/hw:/apex/com.android.vndk.current/lib64"]
@@ -579,7 +662,18 @@ def main():
             svbox_base_cmd() + ["system/bin/getprop", "sys.boot_completed"],
             capture_output=True, text=True, timeout=5,
         )
-        print(f"\n=== Boot & HWC Summary ===\nsys.boot_completed='{bc.stdout.strip()}' hwc_stats={hwc_stats}", flush=True)
+        ba_rc = p_ba.poll()
+        if hwc_stats.get("last_raw"):
+            import zlib
+            raw_bytes = hwc_stats["last_raw"]
+            def _chk(t, d):
+                return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+            rows = b"".join(b"\x00" + raw_bytes[y * 720 * 4:(y + 1) * 720 * 4] for y in range(1280))
+            png = b"\x89PNG\r\n\x1a\n" + _chk(b"IHDR", struct.pack(">IIBBBBB", 720, 1280, 8, 6, 0, 0, 0)) + _chk(b"IDAT", zlib.compress(rows, 1)) + _chk(b"IEND", b"")
+            with open(f"{ANDROID_DIR}/desktop_frame.png", "wb") as pf:
+                pf.write(png)
+            print(f"[HWC-STREAM] Saved final frame #{hwc_stats['frames']} -> {ANDROID_DIR}/desktop_frame.png ({len(png)} bytes)", flush=True)
+        print(f"\n=== Boot & HWC Summary ===\nsys.boot_completed='{bc.stdout.strip()}' bootanim_rc={ba_rc} frames={hwc_stats['frames']} last_nz={hwc_stats['last_nz']}", flush=True)
 
         # End-to-end live Binder IPC verification against system_server!
         print("\n=== Live IPC check: cmd package list packages ===", flush=True)

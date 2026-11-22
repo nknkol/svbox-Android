@@ -28,6 +28,8 @@ public:
 private:
     AndroidRuntime() = default;
     void BootWorker(std::string mode, int32_t width, int32_t height);
+    void LmkdLoop(std::string sockPath);
+    void LogdwLoop(std::string sockPath, std::string outPath);
     bool SleepCancelableMs(int totalMs) const;
     void SetStatus(const std::string& s);
     pid_t Spawn(const std::vector<std::string>& argv,
@@ -43,6 +45,8 @@ private:
     std::vector<pid_t> pids_;
     std::vector<int> ownedFds_;
     std::thread bootThread_;
+    std::thread lmkdThread_;
+    std::thread logdwThread_;
 
     std::string runBase_;
     std::string svboxPath_;
