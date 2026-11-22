@@ -1,6 +1,6 @@
 # svbox-Android 鸿蒙 PC 安卓容器实战手记（Experience Log）
 
-> **用途**：持续记录从单二进制内存加载器（`elf-patch-loader`）演进到通用无特权用户态容器（`svbox`），最终在普通签名 **HarmonyOS PC (2in1, API 26, ARM64 / Maleoon 935)** HAP 内跑起原版未改动 **Android 11 桌面 + 硬件加速** 的完整工程历程、踩坑根因、跨项目借鉴经验与真机数据对比。
+> **用途**：持续记录从单二进制内存加载器（`elf-patch-loader`）演进到通用无特权用户态容器（`svbox`），最终在普通签名 **HarmonyOS PC (2in1, API 26, ARM64 / Maleoon 916)** HAP 内跑起原版未改动 **Android 11 桌面 + 硬件加速** 的完整工程历程、踩坑根因、跨项目借鉴经验与真机数据对比。
 > **记录规则**：每完成一个工程步骤，均在此追加实测数据、踩坑根因与架构取舍，作为长期外部记忆与后续技术博客原始素材。
 
 ---
@@ -45,13 +45,13 @@
 
 ### 0.3 本机工作区跨项目经验复用清单
 
-在启动 Step 1–4 前，系统梳理了同设备（Maleoon 935, API 26）上已验证通过的 6 个项目经验：
+在启动 Step 1–4 前，系统梳理了同设备（Maleoon 916, API 26）上已验证通过的 6 个项目经验：
 
 1. **[`GPUIWorK/gpui-ohos`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos)**（核心参考）
    * [`sched_qos.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/sched_qos.rs)：**极重要沙箱实坑**——shell 下可读的 `/sys/devices/system/cpu/*/cpu_capacity` 在 HAP 沙箱内被拦截！改用 ~2ms/核单核 ALU 微测探针自动识别大/中/小核集群；同时验证 `dlopen("libqos.so")` + `OH_QoS_SetThreadQoS` 与 `HMS_FAST_SchedulingOptimization_PerfHint` 不可对同一 `tid` 混用。
    * [`seccomp_guard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/seccomp_guard.rs)：20 行零栈 AArch64 `SIGSYS` handler，直接将 `si_code == SYS_SECCOMP` 的陷阱写成 `uc_mcontext.regs[0] = -ENOSYS`。
    * [`frame_delivery.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/frame_delivery.rs) & [`ohos-performance.md`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/docs/ohos-performance.md)：`OH_NativeVSync` 按需帧调度与切后台自动注销停帧。
-   * [`wgpu_context.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/wgpu_context.rs)、[`audio.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/audio.rs)、[`keyboard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/keyboard.rs)、[`clipboard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/clipboard.rs)：Maleoon 935 上的 GLES/Vulkan 双后端、`OHAudio`、API 26 硬件键与剪贴板实机范本。
+   * [`wgpu_context.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/wgpu_context.rs)、[`audio.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/audio.rs)、[`keyboard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/keyboard.rs)、[`clipboard.rs`](file:///storage/Users/currentUser/Workspace/GPUIWorK/gpui-ohos/src/ohos/clipboard.rs)：Maleoon 916 上的 GLES/Vulkan 双后端、`OHAudio`、API 26 硬件键与剪贴板实机范本。
 2. **[`blender-app`](file:///storage/Users/currentUser/blender-app/entry/src/main/cpp/xcomponent_input.h)**
    * 同一 GPU 上验证通过的 `XComponent` 鼠标/触摸/滚轮/硬键盘/IME 与窗口 resize 事件映射逻辑。
 3. **[`harmonybrew-cask/patches/elf-patch-loader`](file:///storage/Users/currentUser/Workspace/harmonybrew-cask/patches/elf-patch-loader/README.md)**
@@ -87,7 +87,7 @@
 
 ---
 
-## 第 1 章（Step 1）：`svbox` 通用容器底座升级（commit `a2eba39` on `feat/vdev-binder`）
+## 第 1 章（Step 1）：`svbox` 通用容器底座升级（commits `a2eba39` + `3e82322` on `feat/vdev-binder`）
 
 ### 1.1 本步目标与设计约束
 保持 `svbox` 100% 通用、零 Android 硬编码，一次性补齐后续交互、资源控制与沙箱容错所需的 5 项通用 Linux 容器原语：
@@ -124,22 +124,23 @@
      * **现象**：`EventHub` 成功识别了 `event0`（`classes=0x14`），但 `InputReader` 判定 X/Y 轴不支持。
      * **根因**：`svbox/src/payload/logic/vdev.c` 的 `generic_chr_ioctl` 中，`req` 指针与 `recv_msg` 接收缓冲区共用了同一个栈数组 `buf[]`！收到 24 字节的 `struct input_absinfo` 时，偏移 20 处的 `ai.resolution = 0` **正好覆写了 `req->out_len`**，导致随后的 `if (req->out_len > 0)` 判定为假、从未把 `input_absinfo` 拷回 guest 内存！
      * **修复**：调用 `recv_msg` 前先用局部变量 `uint32_t out_len = req->out_len;` 保存长度；`EVIOCGABS` 立刻生效，日志输出：`Device reconfigured: id=3, name='svbox-touchscreen', size 720x1280, orientation 0, mode 1, display id 0`。
-  2. **坑 2-2：键盘 `EVIOCSREP` 警告**
-     * **现象**：`EventHub` 报 `Unable to disable kernel key repeat for /dev/input/event1: Inappropriate ioctl`。
-     * **修复**：在 `input_bridge.cpp` 中处理 `nr == 0x03`（`EVIOCGREP/EVIOCSREP`）返回 `0`，日志清零。
+  2. **坑 2-2：键盘 `EVIOCSREP` 警告、`.idc` 缺失导致 `ADISPLAY_ID_NONE` 与鸿蒙 NDK `KEY_UNKNOWN` 宏冲突**
+     * **现象 A**：`EventHub` 报 `Unable to disable kernel key repeat for /dev/input/event1: Inappropriate ioctl` → 在 `input_bridge.cpp` 中处理 `nr == 0x03`（`EVIOCGREP/EVIOCSREP`）返回 `0`。
+     * **现象 B**：未提供 `.idc` 时，`InputReader` 把 `svbox-touchscreen` 绑定到 `ADISPLAY_ID_NONE`，触控坐标无法投射到主屏 → 运行时生成并挂载 `/system/usr/idc/svbox-touchscreen.idc`（`touch.deviceType = touchScreen`、`device.internal = 1`），即刻关联 `display id 0`。
+     * **现象 C（编译坑）**：同时 `#include <linux/input-event-codes.h>` 与鸿蒙 `ace/xcomponent/native_interface_xcomponent.h` 时，前者的 `#define KEY_UNKNOWN 0` 会破坏后者枚举 `OH_NativeXComponent_KeyCode::KEY_UNKNOWN` → 在 `napi_init.cpp` 中改用局部 `constexpr` 定义 Linux 键值常量避免宏污染。
 
 ### 2.2 消灭 10.2 秒启动卡顿 + 64 位真声音（`OHAudio`）
 * **根因定位**：回看 `hap_logs/logcat.txt` 发现 `StartAudioService` 耗时 **10,224ms** 的真正元凶是 `ServiceManager: Waiting for service 'media.metrics'`（两次 5 秒同步超时）+ 缺少合规 Audio HAL / AudioFlinger。
 * **关键实坑与根因**：
-  1. **坑 2-3：Redroid 11 的 `/vendor/bin/hw/android.hardware.audio.service` 是 32 位 ARM ELF！**
-     * **现象**：64 位 `svbox` 启动它时直接报 `error: bogus ELF header`，但反查 `/vendor/lib64/hw/android.hardware.audio@6.0-impl.so`、`/vendor/lib64/hw/android.hardware.audio.effect@6.0-impl.so` 和 `/system/bin/audioserver` **全都是 64 位 ARM64**！
-     * **解法**：自写 75 行 64 位 `audio_hal/svbox_audio_service.cpp`，直接调用 `libhidlbase.so` 导出的 `configureRpcThreadpool` + `registerPassthroughServiceImplementation` + `joinRpcThreadpool`，以 64 位宿主进程托管原版 `IDevicesFactory@6.0` 与 `IEffectsFactory@6.0`！
+  1. **坑 2-3：Redroid 11 的 `/vendor/bin/hw/android.hardware.audio.service` 是 32 位 ARM ELF，且 `svbox` 初始可执行文件早于 bind mount 加载！**
+     * **现象**：64 位 `svbox` 启动它时直接报 `error: bogus ELF header`，但反查 `/vendor/lib64/hw/android.hardware.audio@6.0-impl.so`、`/vendor/lib64/hw/android.hardware.audio.effect@6.0-impl.so` 和 `/system/bin/audioserver` **全都是 64 位 ARM64**；另外，最初尝试只用 `--bind` 覆盖路径启动自编译二进制时仍命中旧文件，因为 `svbox` loader 是在 payload 虚拟挂载表接管**之前**直接相对 `--root` 打开首个可执行文件的。
+     * **解法**：自写 75 行 64 位 `audio_hal/svbox_audio_service.cpp`，直接调用 `libhidlbase.so` 导出的 `configureRpcThreadpool` + `registerPassthroughServiceImplementation` + `joinRpcThreadpool`，以 64 位宿主进程托管原版 `IDevicesFactory@6.0` 与 `IEffectsFactory@6.0`，并在启动前复制到 `rootfs_/vendor/bin/hw/svbox-audio-service` 以独立路径拉起！
   2. **坑 2-4：只链 `libdl.so` 动态 `dlopen(libhidlbase.so)` 触发 Bionic IE-TLS 报错**
      * **现象**：`dlopen failed: TLS symbol "(null)" in dlopened "/system/lib64/libc.so" referenced from "/system/lib64/libc.so" using IE access model`。
      * **根因**：Android Bionic `libc.so` 使用 Initial-Exec（IE）TLS 模型，必须在进程启动阶段作为 `DT_NEEDED` 静态声明加载，不能在运行时被 `dlopen` 延迟拉起。
      * **解法**：编译 `svbox-audio-service` 时直接带 `-Wl,--no-as-needed` 链接 Android 11 的 `libc.so` + `libdl.so` + `libhidlbase.so`，启动后 `register IDevicesFactory@6.0 -> 0`、`register IEffectsFactory@6.0 -> 0` 一次通过！
-  3. **坑 2-5：零依赖 `audio.primary.svbox.so` → 鸿蒙 PC `libohaudio.so`**
-     * 反汇编验证了 Android 11 `audio_hw_device_t`（320B）与 `audio_stream_out_t`（280B）精确字段偏移，用纯 `-nostdlib -shared` + 原生 AArch64 `svc #0`（零 libc 依赖、零 ABI 冲突）编写 `audio_hal/audio_primary_svbox.c`，通过 `/ipc/audio.sock` 把 `AudioFlinger` 混音后的 `44100Hz / Stereo / S16LE` PCM 流送入 HAP 的 `AudioBridge`（256 KiB 环形缓冲 + `OH_AudioStreamBuilder_SetRendererWriteDataCallback` + 600ms 静音自动 `OH_AudioRenderer_Pause` 符合鸿蒙低功耗规范）。
+  3. **坑 2-5：零依赖 `audio.primary.svbox.so` → 鸿蒙 PC `libohaudio.so`（含 `getMicMute: -38` 细节）**
+     * 反汇编验证了 Android 11 `audio_hw_device_t`（320B）与 `audio_stream_out_t`（280B）精确字段偏移，用纯 `-nostdlib -shared` + 原生 AArch64 `svc #0`（零 libc 依赖、零 ABI 冲突）编写 `audio_hal/audio_primary_svbox.c`，通过 `/ipc/audio.sock` 把 `AudioFlinger` 混音后的 `44100Hz / Stereo / S16LE` PCM 流送入 HAP 的 `AudioBridge`（256 KiB 环形缓冲 + `OH_AudioStreamBuilder_SetRendererWriteDataCallback` + 600ms 静音自动 `OH_AudioRenderer_Pause` 符合鸿蒙低功耗规范）；初版未实现 `get_mic_mute`/`set_mic_mute`/`get_master_mute` 时 `AudioFlinger` 反复打印 `getMicMute: error -38`，补齐状态字段后告警清零。
 
 ### 2.3 `webview_zygote` 彻底复活 + DNS 代理 + 事件就绪启动
 * **坑 2-6：`webview_zygote` 过了 `symlink` 又卡在 `setfilecon /data/user/0 Permission denied`**
@@ -202,6 +203,21 @@
 | **Android 11 契合度** | **100% 原生**：AOSP Android 11 Cuttlefish / Emulator 官方标配图形栈（含 `gralloc.ranchu` / `hwcomposer.ranchu` 协议参考） | Android 11 上 `venus` 仍偏早期实验，ANGLE 需额外裁剪 |
 
 **结论（供 Step 4 拍板）**：**首选裁剪 Google `gfxstream`**（Socket + Ashmem 传输层 + 鸿蒙 `OHNativeWindow` / `EGL 1.4 + GLES 3.2` / `Vulkan 1.2 + VK_OHOS_surface` 宿主渲染器），保留现有 SwiftShader 作为兜底模式，实现 **`SwiftShader / OpenGL ES / Vulkan` 三选一渲染器切换**！
+
+---
+
+### 3.5 当前已知限制与待解问题清单（Open Issues，截至 Step 3）
+
+为了便于后续会话（`/compact` 后）与博客收尾时精准衔接，集中记录当前尚未覆盖的边界与待办项：
+
+| 编号 | 类别 | 当前状态 / 已知限制 | 计划解决阶段 |
+| --- | --- | --- | --- |
+| **O1** | GPU 硬件加速 | 目前仍由 SwiftShader 进行 CPU 软渲染，桌面/滚动帧率与 CPU 占用受限于软栅格化 | **Step 4**（裁剪移植 `gfxstream`，实现 `SwiftShader / GLES / Vulkan` 切换） |
+| **O2** | 音频录制（麦克风） | `audio_primary_svbox.c` 已打通播放输出（`open_output_stream` → `OHAudio`），尚未实现录音输入（`open_input_stream`） | Step 4 后按需补齐 |
+| **O3** | 动态分辨率 & 窗口缩放 | 当前虚拟屏分辨率固定 `720×1280 @ 320dpi`，`XComponent` 拖动 resize 时仅做拉伸映射，未动态通知 Android 改变逻辑分辨率/横竖屏 | 桌面化体验阶段 |
+| **O4** | 桌面输入与互通 | 物理键盘按键已通，但尚未接鸿蒙中文 IME 文本直传、宿主↔安卓双向剪贴板同步、文件拖拽/APK 一键安装与共享目录 | 桌面化体验阶段（可复用 `gpui-ohos/clipboard.rs` 与 `tdesktop` 经验） |
+| **O5** | 相机 / 传感器 / 媒体硬解 | 尚未接入摄像头、传感器与鸿蒙硬件编解码（`AVCodec`）桥接 | 远期可选增强 |
+| **O6** | `svbox` 分支合流 | `svbox` 的全部通用改动目前沉淀在 `feat/vdev-binder`（`3e82322`），`main` 分支保持干净未合并 | 待整体回归或需要发布时由人工决定是否合入 `main` |
 
 ---
 *(Step 4 开始后将在此继续追加 `gfxstream` 交叉编译、传输层嫁接与真机帧率/CPU 对比实测。)*
