@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <native_window/external_window.h>
 #include <string>
 #include <sys/types.h>
 #include <thread>
@@ -27,6 +29,11 @@ public:
     void SetResourceConfig(const std::string& profile,
                            const std::string& customCpuset,
                            uint32_t memLimitMb);
+    void SetGpuMode(const std::string& gpuMode);
+    std::string GpuMode() const;
+    bool UseGfxstream() const;
+    void OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h);
+    void OnSurfaceDestroyed(OHNativeWindow* window = nullptr);
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
 
@@ -59,11 +66,17 @@ private:
     std::atomic<bool> paused_{false};
     std::string status_ = "Idle";
     std::string profile_ = "perf";
+    std::string gpuMode_ = "gles";
+    std::string activeGpuMode_ = "gles";
     std::string customCpuset_;
     std::string activeCpuset_;
     int32_t activeNice_ = 0x7fffffff;
     std::string activeSched_;
     std::atomic<uint32_t> memLimitMb_{4096};
+
+    OHNativeWindow* surfaceWindow_ = nullptr;
+    int32_t surfaceW_ = 0;
+    int32_t surfaceH_ = 0;
 
     std::vector<pid_t> pids_;
     std::vector<int> ownedFds_;
@@ -77,6 +90,7 @@ private:
     std::string svboxPath_;
     std::string audioHalPath_;
     std::string audioSvcPath_;
+    std::string gpuGuestDir_;
     std::string androidDir_;
     std::string rootfs_;
 };

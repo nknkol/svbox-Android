@@ -212,7 +212,7 @@
 
 | 编号 | 类别 | 当前状态 / 已知限制 | 计划解决阶段 |
 | --- | --- | --- | --- |
-| **O1** | GPU 硬件加速 | 目前仍由 SwiftShader 进行 CPU 软渲染，桌面/滚动帧率与 CPU 占用受限于软栅格化 | **Step 4**（裁剪移植 `gfxstream`，实现 `SwiftShader / GLES / Vulkan` 切换） |
+| **O1** | GPU 硬件加速 | **已解决（Step 4 完成）**：裁剪移植 Google `gfxstream`，打通 Maleoon 916 OpenGL ES 3.2 与 Vulkan 1.2 + `SkiaVK` + `OH_NativeBuffer` 零拷贝，支持 `SwiftShader / GLES / Vulkan` 同进程实时切换 | **已完成（见第 4 章）** |
 | **O2** | 音频录制（麦克风） | `audio_primary_svbox.c` 已打通播放输出（`open_output_stream` → `OHAudio`），尚未实现录音输入（`open_input_stream`） | Step 4 后按需补齐 |
 | **O3** | 动态分辨率 & 窗口缩放 | 当前虚拟屏分辨率固定 `720×1280 @ 320dpi`，`XComponent` 拖动 resize 时仅做拉伸映射，未动态通知 Android 改变逻辑分辨率/横竖屏 | 桌面化体验阶段 |
 | **O4** | 桌面输入与互通 | 物理键盘按键已通，但尚未接鸿蒙中文 IME 文本直传、宿主↔安卓双向剪贴板同步、文件拖拽/APK 一键安装与共享目录 | 桌面化体验阶段（可复用 `gpui-ohos/clipboard.rs` 与 `tdesktop` 经验） |
@@ -220,4 +220,111 @@
 | **O6** | `svbox` 分支合流 | `svbox` 的全部通用改动目前沉淀在 `feat/vdev-binder`（`3e82322`），`main` 分支保持干净未合并 | 待整体回归或需要发布时由人工决定是否合入 `main` |
 
 ---
-*(Step 4 开始后将在此继续追加 `gfxstream` 交叉编译、传输层嫁接与真机帧率/CPU 对比实测。)*
+
+## 第 4 章（Step 4）：基于裁剪版 Google `gfxstream` 的 Maleoon 916 硬件 GPU 加速（GLES 3.2 + Vulkan 1.2 + `OH_NativeBuffer` 零拷贝）
+
+### 4.1 整体架构与裁剪边界
+
+严格维持 `svbox`（`feat/vdev-binder`）**100% 通用 Linux 用户态容器**不侵入任何 Android 逻辑，全部 GPU 加速代码均沉淀在 `svbox-Android` 仓库内：
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Android 11 Guest (svbox 容器内，/vendor/lib64 按 gpuMode 动态挂载)       │
+│  App / Launcher3 / SystemUI                                             │
+│   ├─ GLES 模式: libhwui (skiagl) -> libEGL_emulation + libGLESv2_emu    │
+│   └─ Vulkan 模式: libhwui (skiavk) -> vulkan.ranchu + libvulkan_enc     │
+│  SurfaceFlinger -> gralloc.ranchu + hwcomposer.ranchu (零 CPU 回读直呈)  │
+│        │                                                                │
+│        ▼ svbox_pipe_guest.cpp (AF_UNIX /ipc/gfxstream.sock)             │
+├────────┼────────────────────────────────────────────────────────────────┤
+│ HarmonyOS PC Host (org.svbox.android HAP, ARM64 API 26, Maleoon 916)    │
+│  GfxstreamBridge -> libgfxstream_host.so (6.7 MB stripped)              │
+│   ├─ 单 epoll AF_UNIX 管道复用器 (opengles / GLProcessPipe / refcount)  │
+│   ├─ GLES 后端: glestranslator (egl2egl -> libEGL + libGLESv3)          │
+│   │             -> DisplayGl -> OHNativeWindow (XComponent)             │
+│   └─ Vulkan 后端: VkDecoder + VkEmulation (Maleoon 916 Vulkan 1.2.309)  │
+│             ├─ ColorBufferVk <-> ColorBufferGl:                         │
+│             │   VK_OHOS_external_memory (OH_NativeBuffer)               │
+│             │   <-> EGL_NATIVE_BUFFER_OHOS (0x34E1) 真零拷贝共享         │
+│             └─ DisplayVk -> VK_OHOS_surface Swapchain -> OHNativeWindow │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+* **宿主机引擎**（[`gpu/ohos_host/`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/CMakeLists.txt)）：基于固定版本的 `aemu` + `gfxstream`（见 [`gpu/fetch_sources.sh`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/fetch_sources.sh)），通过幂等脚本 [`apply_host_patches.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/apply_host_patches.py) 施加全部 `__OHOS__` 补丁，使用鸿蒙 NDK 交叉编译为单动态库 `libgfxstream_host.so`（strip 后 **6.7 MB**），通过 [`svbox_gfxstream_capi.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/svbox_gfxstream_capi.cpp) 暴露极简 C API 并将 `gfxstream` 全部日志桥接到 `hilog`（Tag `SvboxGfx`）。
+* **Android 11 Guest 驱动栈**（[`gpu/android_guest/`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/CMakeLists.txt)）：基于 `goldfish-opengl`（`android11-gsi`），施加 [`apply_guest_patches.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/apply_guest_patches.py)，以自研 [`svbox_pipe_guest.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/svbox_pipe_guest.cpp) 替换内核 `/dev/goldfish_pipe` 为 `/ipc/gfxstream.sock`，以零回读 [`hwcomposer_ranchu.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/hwcomposer_ranchu.cpp) 走 `rcFBPost(cbHandle)` 直呈，产出 14 枚 `.so` 经 `scripts/pack_hnp.py` strip 后打入 `svbox.hnp`（总计 **5.3 MB**）。
+* **运行时三模式切换**：[`Index.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/Index.ets) + [`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp) + [`gfxstream_bridge.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/gfxstream_bridge.cpp) 支持在 UI / `aa start --ps gpuMode <swiftshader|gles|vulkan>` 一键动态切换三种后端，无需重启 HAP 进程。
+
+---
+
+### 4.2 鸿蒙 PC（Maleoon 916, API 26）真机硬核踩坑全记录
+
+> 这一节记录了在真实华为鸿蒙 PC（`HAD-W32`，Maleoon 916 GPU）上逐一攻克的 **12 个底层图形驱动与协议坑**，每一个都经真机日志与像素验证，可直接作为博客核心技术干货。
+
+1. **坑 4-1：鸿蒙 `libGLESv2.so` 不导出部分 GLES 3.x 符号**
+   * **现象**：`glestranslator` 的 `EglOsApi_egl.cpp` 默认 `dlopen("libGLESv2.so")`，导致 GLES 3.x 函数表解析残缺。
+   * **解法**：`#elif defined(__OHOS__)` 优先加载 `libGLESv3.so`（`libGLESv2.so` 作为 Alt）。
+2. **坑 4-2：`OH_NativeWindow_NativeWindowHandleOpt(GET_BUFFER_GEOMETRY)` 参数顺序是 `(height, width)`**
+   * **现象**：与直觉相反，鸿蒙 NDK `GET_BUFFER_GEOMETRY` 的可变参数顺序是**高度在前、宽度在后**（`(&ohH, &ohW)`），写反会导致视口宽高互换。
+   * **解法**：在 [`NativeSubWindow_ohos.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/NativeSubWindow_ohos.cpp) 与 `EglOsApi_egl.cpp` 严格按 `(&ohH, &ohW)` 读取。
+3. **坑 4-3：华为 `higpu` EGL 强制要求 `EGL_ALPHA_SIZE=8` 与 `SET_FORMAT = EGL_NATIVE_VISUAL_ID`**
+   * **现象**：`EmulationGl.cpp` 默认只请求 RGB 888 配置，在鸿蒙 `higpu` 上直接创建 `OHNativeWindow` Surface 时格式不匹配导致 `eglCreateWindowSurface` 失败。
+   * **解法**：`EmulationGl.cpp` 在 `__OHOS__` 补充 `EGL_ALPHA_SIZE, 8`，并在 `EglOsApi_egl.cpp` 调用 `eglCreateWindowSurface` 前通过 `SET_FORMAT` 同步 `EGL_NATIVE_VISUAL_ID`。
+4. **坑 4-4：GLES 模式画面全黑（`cbPx=(0,0,0,255)`）—— Desktop GL `#version 330 core` 隐形杀手**
+   * **现象**：`SurfaceFlinger` 和 `DisplayGl::post` 全链路 `glGetError()==0`、`eglSwapBuffers==1`，但每一个 `ColorBuffer` 读回都是纯黑 `(0,0,0,255)`。
+   * **根因**：把 `gfxstream` 内部日志全部桥接到 `hilog` 后立即现形：`[E GLEScontext.cpp:2755] fail to compile: Language version '330' unknown, this compiler only supports up to version '320 es'`！原来 `GLESVersionDetector::shouldEnableCoreProfile()` 在 `SELECTED_RENDERER_HOST && dispatchMaj > 2` 时默认返回 `true`，导致 `glestranslator`（`setupImageBlitState` / `CoreProfileEngine`）误以为宿主机是桌面 OpenGL，发射了 `#version 330 core` 着色器，被 Maleoon 916 原生 GLES 3.2 编译器全部拒绝，所有 FBO/Texture blit 静默失效。
+   * **解法**：`GLESVersionDetector.cpp` 中 `#ifdef __OHOS__ return false;`，修复后 **GLES 模式立刻一帧点亮**！
+5. **坑 4-5：GLES 画面顶部和右侧被裁切**
+   * **根因**：`svbox_gfxstream_capi.cpp` 向 `showOpenGLSubwindow` 传入了窗口物理尺寸 `surfaceW×surfaceH`（`626×1113`）去设置 `SET_BUFFER_GEOMETRY`，却在 `glViewport` 里渲染 `720×1280`，导致超出部分被裁切。
+   * **解法**：统一将 Guest 逻辑分辨率 `fbW×fbH`（`720×1280`）传给 `showOpenGLSubwindow`，让鸿蒙 RenderService 做硬件等比缩放，画面瞬间 100% 完整无裁切。
+6. **坑 4-6：Vulkan 交换链创建后报错 `VulkanSwapchainLayer RequestBuffer[3] failed (40601000)`**
+   * **根因**：鸿蒙 `XComponent` 的 `OHNativeWindow` `BufferQueue` 默认只有 **3 个槽位**，而 `gfxstream` 的 `SwapChainStateVk` 默认按 `minImageCount + 1` 申请了 4 张 Swapchain Image。
+   * **解法**：`SwapChainStateVk.cpp` 在 `__OHOS__` 上将 `imageCount` 钳位在 `[2, 3]`，并选用 `VK_FORMAT_R8G8B8A8_UNORM` 与自适应 `compositeAlpha`（`OPAQUE -> INHERIT -> PRE_MULTIPLIED`）。
+7. **坑 4-7：同一 `OHNativeWindow` 无法在 EGL 与 Vulkan 之间切换（`VK_ERROR_SURFACE_LOST_KHR`）**
+   * **根因**：鸿蒙 `BufferQueue` 绑定了 EGL 生产者后，即便 `eglDestroySurface`，在同一个 `OHNativeWindow` 上创建 `VK_OHOS_surface` 交换链仍会报 `VK_ERROR_SURFACE_LOST_KHR`。
+   * **解法**：[`Index.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/Index.ets) 引入 `surfaceEpoch` 状态交替挂载 `svbox_android_surface_a/b` 重建全新 `OHNativeWindow`，同时在 [`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp) 的 `OnSurfaceDestroyed(void* window)` 校验指针防止旧窗口析构误清掉新窗口。
+8. **坑 4-8：同进程第二次切回 Vulkan 触发 `FATAL: Attempted to re-initialize VkDecoderGlobalState`**
+   * **根因**：`FrameBuffer` 销毁时不会主动调用 `VkDecoderGlobalState::reset()`，第二次初始化 Vulkan 模式时触发单例断言中止。
+   * **解法**：在 `VkDecoderGlobalState::initialize()` 中改为 `if (sGlobalDecoderState) { reset(); }`，实测 `Vulkan -> GLES -> Vulkan -> SwiftShader` 无限次热切换零崩溃。
+9. **坑 4-9：Maleoon 916 不支持 `OPAQUE_FD` 导出 `VkImage`，打通 `VK_OHOS_external_memory` (`OH_NativeBuffer`) + `EGL_NATIVE_BUFFER_OHOS` 真零拷贝互通**
+   * **硬件探针实测结论**：Maleoon 916 上 `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT` 对 `VkImage` 返回 `VK_ERROR_FORMAT_NOT_SUPPORTED`，导致 Android `SkiaVK` 报错 `MakeFromAHardwareBuffer failed`。而鸿蒙扩展 **`VK_OHOS_external_memory`**（`OH_NativeBuffer`，句柄位 `0x00008000`）对全部常规图像格式均报告 `features=0x7`（`DEDICATED_ONLY | EXPORTABLE | IMPORTABLE`），且支持经 `OH_NativeWindow_CreateNativeWindowBufferFromNativeBuffer` + `eglCreateImageKHR(EGL_NATIVE_BUFFER_OHOS=0x34E1)` + `glEGLImageTargetTexture2DOES` 零拷贝导入 OpenGL ES！
+   * **关键实现细节**（均在 [`apply_host_patches.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/apply_host_patches.py)）：
+     * 因 `gfxstream` 自带旧版 `vulkan_core.h` 优先于鸿蒙 sysroot，显式定义常量：`kVkStNativeBufferPropsOhos = 1000452001`、`kVkStImportNativeBufferOhos = 1000452003`、`kVkStMemGetNativeBufferOhos = 1000452004`、`kVkExtMemHandleOhosNativeBuffer = 0x8000`；
+     * 导出侧：所有 `ColorBufferVk` 图像强制走 `dedicatedImage` + `vkGetMemoryNativeBufferOHOS` 拿到 `OH_NativeBuffer*`，再调用 `vkGetNativeBufferPropertiesOHOS` 回填真实 `allocationSize`；
+     * 导入侧（Guest `VkDevice`）：通过 `vkGetNativeBufferPropertiesOHOS` 获取宿主机 `allocationSize` 和 `memoryTypeBits`（Maleoon 916 上为 `0x2`，即 host type index `1`），且**必须绕过** `getHostMemoryInfoFromGuestMemoryTypeIndex` 防止宿主机索引被二次错误重映射；
+     * GL 互通侧：`ColorBufferGl::importOhosNativeBuffer` 通过 `EGL_NATIVE_BUFFER_OHOS` 绑定到 `m_tex`，并调用新增的 `emulationVk->setColorBufferGlExported(handle)`，实现 `SurfaceFlinger`（GLES）与 `SkiaVK`（Vulkan）及 `DisplayVk` 三方真零拷贝共享！
+10. **坑 4-10：Android 11 Guest `goldfish-opengl-r` 剥离 `VkMemoryDedicatedAllocateInfo` 导致 `dedicated=0`**
+    * **现象**：打通 `OH_NativeBuffer` 后，`DisplayVk` 正常显示壁纸，但 `Launcher3` / `SystemUI` 全部 `SkiaVK` 图层仍不可见。诊断日志暴露 `VkDecoderGlobalState::on_vkAllocateMemory` 收到的全部 ColorBuffer 导入均为 `dedicated=0`！
+    * **根因**：2020 年版 `goldfish-opengl-r` 的 `ResourceTracker.cpp:3965` 写了 `shouldPassThroughDedicatedAllocInfo = !exportAllocateInfoPtr && !importAhbInfoPtr && ...`，主动剥离了 `SkiaVK` 传下来的 `VkMemoryDedicatedAllocateInfo`，违背 Maleoon 916 `OH_NativeBuffer` 的 `DEDICATED_ONLY_BIT` 约束。
+    * **解法**：在 [`apply_guest_patches.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/apply_guest_patches.py) 放行 `importAhbInfoPtr` / `exportAllocateInfoPtr` 的 `dedicatedAllocInfo` 透传，修复后 `dedicated=1` 且 `ColorBufferVk` 与 `ColorBufferGl` 像素计数 **100% 比特级一致**（`vkNZ == glNZ == 98616`）。
+11. **坑 4-11：容器无 `/dev/goldfish_sync` 时的日志刷屏与异步栅栏竞态**
+    * **现象**：`logcat` 每秒刷数十条 `ensureSyncDeviceFd: failed to create sync device`，且 `on_vkGetSemaphoreFdKHR` / `on_vkQueueSignalReleaseImageANDROID` 在 GPU 未完成时即返回 `-1`（代表已触发）。
+    * **解法**：Guest 端缓存 `ensureSyncDeviceFd()` 结果消除刷屏，无 sync 设备时在 `on_vkGetSemaphoreFdKHR` 调用 `vkDeviceWaitIdle`、在 `on_vkGetFenceFdKHR` 调用 `vkWaitForFences` 后返回 `-1`；Host 端 `VkAndroidNativeBuffer.cpp` 在 `__OHOS__` 同步等待 `qsriFence` 完成再返回 `-1`。
+12. **坑 4-12（压轴大坑）：Vulkan 桌面“只有无纹理几何遮罩、图标与文字全透明”—— `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` 被宿主剥离**
+    * **现象**：`dedicated=1` 生效后，转储 `Launcher3` 的 `ColorBuffer` 发现底部热区圆角遮罩（纯着色器无纹理绘制）已经清晰渲染，但所有应用图标、搜索框图标、状态栏文字时钟、导航栏图标全部空白 `(0,0,0,0)`。
+    * **根因定位**：在 `VkSubDecoder.cpp` 打印完整命令流，一举捕获惊人真相：`HardwareBitmapUploader` 在上传每个图标时录制的都是**空命令缓冲 `[BeginCommandBuffer, EndCommandBuffer]`**，连一次 `vkCmdCopyBufferToImage` 都没发！追查发现宿主机 `VkEmulatedPhysicalDeviceMemory.cpp:65` 在无 `GlDirectMem` / `VirtioGpuNext` 时将暴露给 Guest 的**全部内存类型的 `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` 全部剥离**（这直接违反 Vulkan 1.0 规范 10.2 节“至少存在一种 `HOST_VISIBLE | HOST_COHERENT` 内存类型”的强制保证），导致 Android 11 `SkiaVK` 的 `GrVkTransferBuffer` 和 `HardwareBitmapUploader` 找不到匹配的 Staging Buffer 内存类型而静默跳过全部纹理/字形上传！（而 Vertex/Uniform 缓冲允许非 Coherent 并主动调 `vkFlushMappedMemoryRanges`，所以无纹理几何能画出来。）
+    * **解法**：我们在 Guest 端 [`apply_guest_patches.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/apply_guest_patches.py) 已通过匿名 `mmap` 影子内存 + `on_vkUnmapMemory`/`on_vkQueueSubmit` 自动调用 `vkFlushMappedMemoryRanges` 完整模拟了 `HOST_COHERENT` 语义；在宿主 `VkEmulatedPhysicalDeviceMemory.cpp` 对 `#ifndef __OHOS__` 保留 `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` 后，**Android 11 `SkiaVK` 完整桌面（壁纸、状态栏时钟、Google 搜索栏、Gallery/Contacts/Camera 图标、底部导航栏）瞬间 100% 像素级清晰点亮！**
+
+---
+
+### 4.3 真机三模式同进程实测对比（`HAD-W32` · Maleoon 916）
+
+测试环境：同一台华为鸿蒙 PC（`HAD-W32`，HarmonyOS API 26，20 核大小核 `L=4, M=8, B=8`，Maleoon 916 GPU），同一份纯净构建的 `org.svbox.android` HAP，统一 `profile=perf`（`CPU[12-19]`、`4096 MB` 内存上限、`720×1280 @ 60Hz`），**在同一 HAP 进程（`PID 42473`）内连续完成 `Vulkan -> GLES -> Vulkan -> SwiftShader` 实时切换并同口径采样（启动后 `+15s`）**：
+
+| 指标 | SwiftShader（CPU 软渲染） | GLES（Maleoon 916 GLES 3.2） | Vulkan（Maleoon 916 Vulkan 1.2 + `SkiaVK`） |
+| --- | --- | --- | --- |
+| **Guest 渲染管线** | `libEGL_swiftshader` + `skiagl` | `libEGL_emulation` + `skiagl` | `vulkan.ranchu` + `skiavk` + `libEGL_emulation` |
+| **Host 合成/呈现** | `svbox-hwc` ashmem 拷屏 | `DisplayGl` → `eglSwapBuffers` | `DisplayVk` → `VK_OHOS_surface` + `OH_NativeBuffer` 零拷贝 |
+| **`TotalBootTime`（进桌面）** | `4,518 ms` | `4,473 ms`（最快 `3,896 ms`） | **`4,313 ms`** |
+| **`SurfaceFlinger Boot is finished`** | `6,426 ms` | `6,629 ms` | **`6,161 ms`** |
+| **最短帧耗时 (`app_time_stats min`)** | N/A（纯 CPU 栅格化） | **`2.12 ms`**（峰值 45 fps） | **`2.67 ms`** |
+| **`+15s` 全 UID 总 CPU%**（HAP + 容器） | `129.3%`（`8.4%` + `120.9%`） | **`59.6%`**（`9.3%` + `50.3%`，**↓2.17×**） | **`54.4%`**（`9.3%` + `45.1%`，**↓2.38×**） |
+| **稳态桌面全 UID 总 CPU%** | `129%–297%`（动画/重绘期） | `~59.6%` | **`35.3%`**（`9.2%` + `26.1%`，**↓3.7×–8.4×**） |
+| **`+15s` 全 UID 总 RSS 内存**（HAP + 容器） | `4,774.9 MB`（`175.8` + `4,599.0`） | **`4,031.2 MB`**（`190.9` + `3,840.2`，**-744 MB**） | **`4,112.6 MB`**（稳态回落至 **`3,391.6 MB`**，**-1,383 MB**） |
+| **视觉截图核验** | 像素级完好（`snap_bench_swiftshader.png`） | 像素级完好（`snap_bench_gles.png`） | 像素级完好（`snap_bench_vulkan2.png`） |
+| **同进程实时模式切换（`PID 42473`）** | 通过 | 通过（`Vulkan -> GLES`） | 通过（`GLES -> Vulkan` 二次初始化零崩溃） |
+
+### 4.4 构建与打包要点备忘
+
+* 每次使用 `hvigorw assembleHap` 重新生成未签名 HAP 后，**必须执行** `python3 scripts/pack_hnp.py /storage/Users/currentUser/Workspace/svbox/build/svbox hap/entry/build/default/outputs/default/entry-default-unsigned.hap` 将 `hnp/arm64-v8a/svbox.hnp` 注入 HAP 包内，否则 `hda install` 会因 `ExtractHnpFiles` 缺失 HNP 报 `code:9568409 errno:22`。
+* 仓库边界核验：`/storage/Users/currentUser/Workspace/svbox`（`feat/vdev-binder` @ `3e82322`）在 Step 4 全程 **0 改动**，继续保持 100% 通用 Linux 用户态容器定位。
+

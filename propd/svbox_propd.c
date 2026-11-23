@@ -419,6 +419,9 @@ int main(int argc, char **argv)
     if (!g_serial_area || !g_default_area || write_property_info_file(path) != 0)
         return 1;
 
+    /* Default GPU driver before loading override.prop */
+    set_property("ro.hardware.egl", "swiftshader");
+
     for (int i = 0; i < nfiles; i++)
         load_prop_file(prop_files[i]);
 
@@ -433,7 +436,6 @@ int main(int argc, char **argv)
     set_property("ro.crypto.state", "unsupported");
     set_property("ro.boot.hardware", "redroid");
     set_property("ro.hardware", "redroid");
-    set_property("ro.hardware.egl", "swiftshader");
     set_property("ro.debuggable", "1");
     set_property("ro.secure", "0");
     set_property("sys.boot_completed", "0");

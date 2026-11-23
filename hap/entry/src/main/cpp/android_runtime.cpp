@@ -5,6 +5,7 @@
  * Android 11 (Zygote64 -> system_server) using svbox. */
 #include "android_runtime.h"
 #include "audio_bridge.h"
+#include "gfxstream_bridge.h"
 #include "hwc_renderer.h"
 #include "input_bridge.h"
 #include "sched_qos.h"
@@ -450,6 +451,54 @@ void AndroidRuntime::SetResourceConfig(const std::string& profile,
     }
 }
 
+void AndroidRuntime::SetGpuMode(const std::string& gpuMode) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (gpuMode == "swiftshader" || gpuMode == "gles" || gpuMode == "vulkan") {
+        gpuMode_ = gpuMode;
+    }
+}
+
+std::string AndroidRuntime::GpuMode() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return running_.load() ? activeGpuMode_ : gpuMode_;
+}
+
+bool AndroidRuntime::UseGfxstream() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::string& m = running_.load() ? activeGpuMode_ : gpuMode_;
+    return (m == "gles" || m == "vulkan");
+}
+
+void AndroidRuntime::OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h) {
+    bool useGfx = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        surfaceWindow_ = window;
+        surfaceW_ = w;
+        surfaceH_ = h;
+        useGfx = running_.load() ? (activeGpuMode_ != "swiftshader") : (gpuMode_ != "swiftshader");
+    }
+    if (useGfx) {
+        GfxstreamBridge::Instance().SetWindow(window, w, h);
+    } else {
+        HwcRenderer::Instance().SetWindow(window, w, h);
+    }
+}
+
+void AndroidRuntime::OnSurfaceDestroyed(OHNativeWindow* window) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (window != nullptr && surfaceWindow_ != nullptr && window != surfaceWindow_) {
+            return;
+        }
+        surfaceWindow_ = nullptr;
+        surfaceW_ = 0;
+        surfaceH_ = 0;
+    }
+    HwcRenderer::Instance().ClearWindow();
+    GfxstreamBridge::Instance().ClearWindow();
+}
+
 std::string AndroidRuntime::SetPaused(bool paused) {
     if (!running_.load()) return "Not running";
     paused_.store(paused);
@@ -465,13 +514,22 @@ std::string AndroidRuntime::SetPaused(bool paused) {
             kill(p, sig);
         }
     }
-    HwcRenderer::Instance().SetVisible(!paused);
+    if (UseGfxstream()) {
+        GfxstreamBridge::Instance().SetVisible(!paused);
+    } else {
+        HwcRenderer::Instance().SetVisible(!paused);
+    }
     SetStatus(paused ? "Paused (SIGSTOP · 0% CPU)" : "Running Android 11");
     return StatusText();
 }
 
 void AndroidRuntime::SetVisible(bool visible) {
-    HwcRenderer::Instance().SetVisible(visible && !paused_.load());
+    const bool show = visible && !paused_.load();
+    if (UseGfxstream()) {
+        GfxstreamBridge::Instance().SetVisible(show);
+    } else {
+        HwcRenderer::Instance().SetVisible(show);
+    }
 }
 
 SchedQos::Telemetry AndroidRuntime::GetTelemetry() {
@@ -722,6 +780,12 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
         FileExists(hnpBin + "/svbox-audio-service")
             ? (hnpBin + "/svbox-audio-service")
             : (androidDir + "/audio_hal/svbox-audio-service");
+    const std::string hnpGpuGuest = "/data/app/svbox.org/svbox_0.1.0/gpu_guest/lib64";
+    const std::string devGpuGuest = androidDir + "/gpu/build_guest/out/lib64";
+    const std::string gpuGuestDir =
+        FileExists(hnpGpuGuest + "/egl/libEGL_emulation.so")
+            ? hnpGpuGuest
+            : (FileExists(devGpuGuest + "/egl/libEGL_emulation.so") ? devGpuGuest : "");
     const std::string rootfsTar = androidDir + "/rootfs.tar";
     std::string sandboxFiles = sandboxTempDir;
     if (sandboxFiles.size() >= 5 && sandboxFiles.compare(sandboxFiles.size() - 5, 5, "/temp") == 0) {
@@ -745,18 +809,22 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     svboxPath_ = resolvedSvbox;
     audioHalPath_ = FileExists(audioHal) ? audioHal : "";
     audioSvcPath_ = FileExists(audioSvc) ? audioSvc : "";
+    gpuGuestDir_ = gpuGuestDir;
     androidDir_ = androidDir;
     rootfs_ = rootfs;
 
-    // Resolve active cpuset/nice/sched from current profile & probed topology
+    // Resolve active cpuset/nice/sched and GPU mode
+    std::string chosenGpu;
     {
         std::lock_guard<std::mutex> lk(mu_);
         activeCpuset_ = SchedQos::ResolveCpuset(profile_, customCpuset_, &activeNice_, &activeSched_);
+        activeGpuMode_ = gpuMode_;
+        chosenGpu = activeGpuMode_;
     }
 
     paused_.store(false);
     running_.store(true);
-    SetStatus("Booting Android 11 (" + mode + ")...");
+    SetStatus("Booting Android 11 (" + mode + " · " + chosenGpu + ")...");
     bootThread_ = std::thread(&AndroidRuntime::BootWorker, this, mode, width, height);
     return StatusText();
 }
@@ -993,20 +1061,50 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "device.internal = 1\n");
     WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
 
+    std::string gpuModeSnap;
+    OHNativeWindow* winSnap = nullptr;
+    int32_t winWSnap = 0, winHSnap = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        gpuModeSnap = activeGpuMode_;
+        winSnap = surfaceWindow_;
+        winWSnap = surfaceW_;
+        winHSnap = surfaceH_;
+    }
+    const bool useGfx = (gpuModeSnap == "gles" || gpuModeSnap == "vulkan");
+    const bool useVk = (gpuModeSnap == "vulkan");
+
     const std::string overrideProp = runBase_ + "/override.prop";
+    std::string gpuProps;
+    if (useGfx) {
+        gpuProps =
+            "ro.hardware.egl=emulation\n"
+            "ro.hardware.gralloc=ranchu\n"
+            "ro.hardware.hwcomposer=ranchu\n"
+            "ro.hardware.vulkan=" + std::string(useVk ? "ranchu" : "pastel") + "\n"
+            "ro.opengles.version=196609\n"
+            "debug.hwui.renderer=" + std::string(useVk ? "skiavk" : "skiagl") + "\n"
+            "debug.renderengine.backend=gles\n"
+            "ro.boot.qemu.gltransport=pipe\n";
+    } else {
+        gpuProps =
+            "ro.hardware.egl=swiftshader\n"
+            "ro.hardware.gralloc=redroid\n"
+            "ro.hardware.hwcomposer=redroid\n"
+            "ro.hardware.vulkan=pastel\n"
+            "ro.opengles.version=196610\n"
+            "debug.hwui.renderer=skiagl\n"
+            "debug.renderengine.backend=gles\n"
+            "ro.boot.use_redroid_stream=1\n";
+    }
     WriteFile(overrideProp,
-        "ro.hardware.egl=swiftshader\n"
-        "ro.hardware.gralloc=redroid\n"
-        "ro.hardware.vulkan=pastel\n"
-        "ro.opengles.version=196610\n"
+        gpuProps +
         "ro.sf.lcd_density=320\n"
-        "debug.renderengine.backend=gles\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
         "ro.boot.redroid_width=" + std::to_string(width) + "\n"
         "ro.boot.redroid_height=" + std::to_string(height) + "\n"
         "ro.boot.redroid_fps=60\n"
-        "ro.boot.use_redroid_stream=1\n"
         "net.dns1=223.5.5.5\n"
         "net.dns2=8.8.8.8\n"
         "bpf.progs_loaded=1\n"
@@ -1016,6 +1114,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "persist.sys.vold_app_data_isolation_enabled=false\n");
 
     unlink((ipcDir + "/hwcomposer.sock").c_str());
+    unlink((ipcDir + "/gfxstream.sock").c_str());
     unlink((ipcDir + "/audio.sock").c_str());
     unlink((sockDir + "/binder.sock").c_str());
     unlink((sockDir + "/hwbinder.sock").c_str());
@@ -1034,8 +1133,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         OH_LOG_INFO(LOG_APP, "%{public}s", s.c_str());
     };
-    logLine("BootWorker start: runBase=" + runBase_ + " mode=" + mode +
-            " svbox=" + svboxPath_ + " binderd=" + binderd + " rootfs=" + rootfs_);
+    logLine("BootWorker start: runBase=" + runBase_ + " mode=" + mode + " gpu=" + gpuModeSnap +
+            " svbox=" + svboxPath_ + " binderd=" + binderd + " rootfs=" + rootfs_ +
+            " gpuGuest=" + gpuGuestDir_);
     const std::string rootfsTar = androidDir_ + "/rootfs.tar";
     if (!FileExists(rootfs_ + "/.imported_v2") && FileExists(rootfsTar)) {
         logLine("Importing Android 11 rootfs into sandbox from " + rootfsTar + " ...");
@@ -1126,11 +1226,84 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         return;
     }
 
-    // Start XComponent HWC consumer, virtual evdev InputBridge, and OHAudio AudioBridge
+    // Stage Android 11 gfxstream guest libraries into sandbox rootfs /vendor/lib64/{,egl,hw}
+    if (useGfx) {
+        if (gpuGuestDir_.empty()) {
+            logLine("Missing gpu_guest libraries for hardware GPU mode!");
+            SetStatus("Missing gpu_guest libraries in HNP");
+            running_.store(false);
+            return;
+        }
+        static const char* kGuestLibs[] = {
+            "libandroidemu.so",
+            "libOpenglCodecCommon.so",
+            "lib_renderControl_enc.so",
+            "libGLESv1_enc.so",
+            "libGLESv2_enc.so",
+            "libvulkan_enc.so",
+            "libOpenglSystemCommon.so",
+            "libGoldfishProfiler.so",
+            "egl/libEGL_emulation.so",
+            "egl/libGLESv1_CM_emulation.so",
+            "egl/libGLESv2_emulation.so",
+            "hw/gralloc.ranchu.so",
+            "hw/hwcomposer.ranchu.so",
+            "hw/vulkan.ranchu.so",
+        };
+        MkdirP(rootfs_ + "/vendor/lib64/egl");
+        MkdirP(rootfs_ + "/vendor/lib64/hw");
+        int copied = 0;
+        for (const char* rel : kGuestLibs) {
+            const std::string src = gpuGuestDir_ + "/" + rel;
+            const std::string dst = rootfs_ + "/vendor/lib64/" + rel;
+            struct stat sSrc = {}, sDst = {};
+            if (stat(src.c_str(), &sSrc) != 0) {
+                logLine("Missing guest GPU lib: " + src);
+                SetStatus("Missing guest GPU lib: " + std::string(rel));
+                running_.store(false);
+                return;
+            }
+            if (stat(dst.c_str(), &sDst) != 0 || sDst.st_size != sSrc.st_size ||
+                sDst.st_mtime < sSrc.st_mtime) {
+                if (!CopyRegularFile(src, dst)) {
+                    logLine("Failed copying guest GPU lib: " + src + " -> " + dst);
+                    SetStatus("Failed staging guest GPU lib");
+                    running_.store(false);
+                    return;
+                }
+                chmod(dst.c_str(), 0644);
+                ++copied;
+            }
+        }
+        logLine("Staged gfxstream guest libs (copied=" + std::to_string(copied) + "/14)");
+    }
+
+    // Start XComponent renderer (gfxstream hardware GPU or HwcRenderer SwiftShader), InputBridge, AudioBridge
     logdwThread_ = std::thread(&AndroidRuntime::LogdwLoop, this, sockDir + "/logdw", logDir + "/logcat.txt");
     InputBridge::Instance().Start(sockDir + "/input_touch.sock", sockDir + "/input_kbd.sock", width, height);
     AudioBridge::Instance().Start(ipcDir + "/audio.sock");
-    HwcRenderer::Instance().Start(ipcDir + "/hwcomposer.sock", width, height);
+    if (useGfx) {
+        HwcRenderer::Instance().ClearWindow();
+        if (winSnap) {
+            GfxstreamBridge::Instance().SetWindow(winSnap, winWSnap, winHSnap);
+        }
+        const SvboxGfxMode gfxMode = useVk ? SVBOX_GFX_MODE_VULKAN : SVBOX_GFX_MODE_GLES;
+        if (!GfxstreamBridge::Instance().Start(ipcDir + "/gfxstream.sock", width, height, gfxMode)) {
+            const std::string err = GfxstreamBridge::Instance().LastError();
+            logLine("GfxstreamBridge start failed: " + err);
+            SetStatus("GPU init failed: " + err);
+            running_.store(false);
+            return;
+        }
+        logLine("GfxstreamBridge started: " + GfxstreamBridge::Instance().RendererName() +
+                " (mode=" + gpuModeSnap + ")");
+    } else {
+        GfxstreamBridge::Instance().ClearWindow();
+        if (winSnap) {
+            HwcRenderer::Instance().SetWindow(winSnap, winWSnap, winHSnap);
+        }
+        HwcRenderer::Instance().Start(ipcDir + "/hwcomposer.sock", width, height);
+    }
     WaitForFile(sockDir + "/input_touch.sock", 500);
     WaitForFile(sockDir + "/input_kbd.sock", 500);
 
@@ -1161,19 +1334,27 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/apex/com.android.media.swcodec/lib64:/apex/com.android.neuralnetworks/lib64:"
         "/apex/com.android.resolv/lib64";
 
-    // 4. Graphics HALs (event-driven wait on hwcomposer.sock)
+    // 4. Graphics HALs
     runSvbox("hidl_alloc", { "-e", sfLdPath, "system/bin/hw/android.hidl.allocator@1.0-service" });
     if (!SleepCancelableMs(40)) return;
     runSvbox("gralloc", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.allocator@2.0-service" });
-    if (!SleepCancelableMs(40)) return;
+    if (!SleepCancelableMs(60)) return;
     runSvbox("hwcomposer", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.composer@2.1-service" });
-    WaitForFile(ipcDir + "/hwcomposer.sock", 1500);
+    if (useGfx) {
+        if (!SleepCancelableMs(180)) return;
+    } else {
+        WaitForFile(ipcDir + "/hwcomposer.sock", 1500);
+    }
     if (!running_.load()) return;
 
-    // 5. SurfaceFlinger (event-driven wait on HwcRenderer connection)
-    SetStatus("Starting SurfaceFlinger...");
+    // 5. SurfaceFlinger
+    SetStatus("Starting SurfaceFlinger (" + gpuModeSnap + ")...");
     runSvbox("surfaceflinger", { "-e", sfLdPath, "system/bin/surfaceflinger" });
-    WaitForConditionMs(1500, []() { return HwcRenderer::Instance().IsConnected(); });
+    if (useGfx) {
+        WaitForConditionMs(3000, []() { return GfxstreamBridge::Instance().IsConnected(); });
+    } else {
+        WaitForConditionMs(1500, []() { return HwcRenderer::Instance().IsConnected(); });
+    }
     if (!running_.load()) return;
 
     if (mode == "bootanim") {
@@ -1320,6 +1501,7 @@ std::string AndroidRuntime::Stop() {
     for (int fd : fdsCopy) {
         if (fd >= 0) close(fd);
     }
+    GfxstreamBridge::Instance().Stop();
     SetStatus("Stopped");
     return "Stopped";
 }

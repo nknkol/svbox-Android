@@ -31,3 +31,10 @@ hap/local.properties
 *.p7b
 *.cer
 *.keystore
+
+# Step 4 GPU engine fetched sources, sysroot & build outputs
+gpu/third_party/
+gpu/ndk_sysroot/
+gpu/build_host/
+gpu/build_guest/
+gpu/out/

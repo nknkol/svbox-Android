@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 #include "android_runtime.h"
 #include "audio_bridge.h"
+#include "gfxstream_bridge.h"
 #include "hwc_renderer.h"
 #include "input_bridge.h"
 #include "sched_qos.h"
 
 #include <ace/xcomponent/native_interface_xcomponent.h>
+#include <cstdio>
 #include <hilog/log.h>
 #include <napi/native_api.h>
 #include <string>
@@ -61,7 +63,7 @@ void OnSurfaceCreatedCB(OH_NativeXComponent* component, void* window) {
     uint64_t w = 0, h = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &w, &h);
     InputBridge::Instance().SetSurfaceSize(static_cast<int32_t>(w), static_cast<int32_t>(h));
-    HwcRenderer::Instance().SetWindow(
+    AndroidRuntime::Instance().OnSurfaceChanged(
         static_cast<OHNativeWindow*>(window),
         static_cast<int32_t>(w),
         static_cast<int32_t>(h));
@@ -71,14 +73,14 @@ void OnSurfaceChangedCB(OH_NativeXComponent* component, void* window) {
     uint64_t w = 0, h = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &w, &h);
     InputBridge::Instance().SetSurfaceSize(static_cast<int32_t>(w), static_cast<int32_t>(h));
-    HwcRenderer::Instance().SetWindow(
+    AndroidRuntime::Instance().OnSurfaceChanged(
         static_cast<OHNativeWindow*>(window),
         static_cast<int32_t>(w),
         static_cast<int32_t>(h));
 }
 
-void OnSurfaceDestroyedCB(OH_NativeXComponent*, void*) {
-    HwcRenderer::Instance().ClearWindow();
+void OnSurfaceDestroyedCB(OH_NativeXComponent*, void* window) {
+    AndroidRuntime::Instance().OnSurfaceDestroyed(static_cast<OHNativeWindow*>(window));
 }
 
 void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
@@ -225,6 +227,17 @@ napi_value SetResourceConfigNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value SetGpuModeNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string gpuMode = argc > 0 ? GetStringArg(env, args[0]) : "gles";
+    AndroidRuntime::Instance().SetGpuMode(gpuMode);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
 napi_value SetPausedNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {};
@@ -233,6 +246,35 @@ napi_value SetPausedNapi(napi_env env, napi_callback_info info) {
     std::string res = AndroidRuntime::Instance().SetPaused(paused);
     napi_value out = nullptr;
     napi_create_string_utf8(env, res.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
+napi_value SaveRawSnapshotNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    bool ok = false;
+    if (argc >= 4) {
+        std::string path = GetStringArg(env, args[0]);
+        uint32_t w = static_cast<uint32_t>(GetInt32Arg(env, args[1], 0));
+        uint32_t h = static_cast<uint32_t>(GetInt32Arg(env, args[2], 0));
+        void* data = nullptr;
+        size_t len = 0;
+        if (!path.empty() && w > 0 && h > 0 &&
+            napi_get_arraybuffer_info(env, args[3], &data, &len) == napi_ok &&
+            data && len >= static_cast<size_t>(w) * h * 4) {
+            FILE* fp = fopen(path.c_str(), "wb");
+            if (fp) {
+                uint32_t hdr[2] = { w, h };
+                fwrite(hdr, sizeof(uint32_t), 2, fp);
+                fwrite(data, 1, static_cast<size_t>(w) * h * 4, fp);
+                fclose(fp);
+                ok = true;
+            }
+        }
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
     return out;
 }
 
@@ -279,26 +321,30 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
 
     auto& rt = AndroidRuntime::Instance();
     auto& hwc = HwcRenderer::Instance();
+    auto& gfx = GfxstreamBridge::Instance();
     auto& inp = InputBridge::Instance();
     auto& aud = AudioBridge::Instance();
     auto tel = rt.GetTelemetry();
     auto topo = SchedQos::GetCoreTopology();
+    const bool useGfx = rt.UseGfxstream();
 
     setBool("running", rt.IsRunning());
     setBool("paused", rt.IsPaused());
-    setBool("connected", hwc.IsConnected());
-    setBool("vsyncActive", hwc.UsingNativeVsync());
+    setBool("connected", useGfx ? gfx.IsConnected() : hwc.IsConnected());
+    setBool("vsyncActive", useGfx ? gfx.IsActive() : hwc.UsingNativeVsync());
     setBool("inputReady", inp.HasTouchClient() || inp.HasKbdClient());
     setBool("audioActive", aud.IsActive());
-    setI64("frames", static_cast<int64_t>(hwc.FrameCount()));
-    setI32("width", hwc.FrameWidth());
-    setI32("height", hwc.FrameHeight());
-    setI32("fps", hwc.Fps());
+    setI64("frames", static_cast<int64_t>(useGfx ? gfx.FrameCount() : hwc.FrameCount()));
+    setI32("width", useGfx ? gfx.FrameWidth() : hwc.FrameWidth());
+    setI32("height", useGfx ? gfx.FrameHeight() : hwc.FrameHeight());
+    setI32("fps", useGfx ? gfx.Fps() : hwc.Fps());
     setDouble("cpuPercent", tel.systemCpuPercent);
     setI32("memMb", static_cast<int32_t>(tel.containerRssMb));
     setI32("memLimitMb", static_cast<int32_t>(rt.MemLimitMb()));
     setI32("activeProcs", static_cast<int32_t>(tel.activeProcs));
     setStr("profile", rt.Profile());
+    setStr("gpuMode", rt.GpuMode());
+    setStr("gpuRenderer", useGfx ? gfx.RendererName() : "SwiftShader (CPU)");
     setStr("cpuset", rt.ActiveCpuset());
     setStr("topology", topo.summary);
     setStr("statusText", rt.StatusText());
@@ -315,8 +361,10 @@ napi_value Init(napi_env env, napi_value exports) {
         { "sendNavKey", nullptr, SendNavKeyNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "sendScroll", nullptr, SendScrollNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setResourceConfig", nullptr, SetResourceConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setGpuMode", nullptr, SetGpuModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setPaused", nullptr, SetPausedNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

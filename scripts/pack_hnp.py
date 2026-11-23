@@ -35,8 +35,43 @@ def main() -> None:
         (os.path.join(repo, "audio_hal", "svbox-audio-service"), "svbox_0.1.0/bin/svbox-audio-service"),
     ]
 
+    guest_gpu_dir = os.path.join(repo, "gpu", "build_guest", "out", "lib64")
+    guest_gpu_files = [
+        "libandroidemu.so",
+        "libOpenglCodecCommon.so",
+        "lib_renderControl_enc.so",
+        "libGLESv1_enc.so",
+        "libGLESv2_enc.so",
+        "libvulkan_enc.so",
+        "libOpenglSystemCommon.so",
+        "libGoldfishProfiler.so",
+        "egl/libEGL_emulation.so",
+        "egl/libGLESv1_CM_emulation.so",
+        "egl/libGLESv2_emulation.so",
+        "hw/gralloc.ranchu.so",
+        "hw/hwcomposer.ranchu.so",
+        "hw/vulkan.ranchu.so",
+    ]
+    has_gpu_guest = all(os.path.exists(os.path.join(guest_gpu_dir, rel)) for rel in guest_gpu_files)
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    llvm_strip = "/data/service/hnp/hmos-clt.org/hmos-clt_1.0.0/sdk/default/openharmony/native/llvm/bin/llvm-strip"
+    if not os.path.exists(llvm_strip):
+        llvm_strip = shutil.which("llvm-strip") or ""
+
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for d in ("svbox_0.1.0/", "svbox_0.1.0/bin/"):
+        dirs_to_add = ["svbox_0.1.0/", "svbox_0.1.0/bin/"]
+        if has_gpu_guest:
+            dirs_to_add.extend([
+                "svbox_0.1.0/gpu_guest/",
+                "svbox_0.1.0/gpu_guest/lib64/",
+                "svbox_0.1.0/gpu_guest/lib64/egl/",
+                "svbox_0.1.0/gpu_guest/lib64/hw/",
+            ])
+        for d in dirs_to_add:
             zi = zipfile.ZipInfo(d)
             zi.external_attr = (0o040755) << 16
             zf.writestr(zi, b"")
@@ -52,6 +87,25 @@ def main() -> None:
             zi.external_attr = (0o100755) << 16
             with open(src, "rb") as f:
                 zf.writestr(zi, f.read())
+
+        if has_gpu_guest:
+            with tempfile.TemporaryDirectory() as td:
+                for rel in guest_gpu_files:
+                    src = os.path.join(guest_gpu_dir, rel)
+                    dst = f"svbox_0.1.0/gpu_guest/lib64/{rel}"
+                    payload_path = src
+                    if llvm_strip:
+                        stripped = os.path.join(td, os.path.basename(rel))
+                        shutil.copy2(src, stripped)
+                        subprocess.run([llvm_strip, "--strip-unneeded", stripped], check=True)
+                        payload_path = stripped
+                    zi = zipfile.ZipInfo(dst)
+                    zi.external_attr = (0o100644) << 16
+                    with open(payload_path, "rb") as f:
+                        zf.writestr(zi, f.read())
+            print(f"Bundled {len(guest_gpu_files)} Android 11 gfxstream guest libs into HNP")
+        else:
+            print("Warning: gpu/build_guest/out/lib64 not found; skipping gpu_guest libs")
 
     print(f"Built {out_path} ({os.path.getsize(out_path)} bytes)")
 

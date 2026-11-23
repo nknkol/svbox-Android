@@ -7,10 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(entry SHARED
     napi_init.cpp
     hwc_renderer.cpp
+    gfxstream_bridge.cpp
     input_bridge.cpp
     audio_bridge.cpp
     sched_qos.cpp
     android_runtime.cpp
+)
+
+target_include_directories(entry PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../gpu/ohos_host
 )
 
 target_link_libraries(entry PUBLIC

@@ -21,6 +21,12 @@ audio_hal/svbox-audio-service: audio_hal/svbox_audio_service.cpp
 
 stage-hnp: all
 	rm -rf hap/entry/libs/arm64-v8a/libsvbox*.so
+	@if [ -f gpu/build_host/libgfxstream_host.so ]; then \
+		mkdir -p hap/entry/libs/arm64-v8a; \
+		cp gpu/build_host/libgfxstream_host.so hap/entry/libs/arm64-v8a/libgfxstream_host.so; \
+		/data/service/hnp/hmos-clt.org/hmos-clt_1.0.0/sdk/default/openharmony/native/llvm/bin/llvm-strip --strip-unneeded hap/entry/libs/arm64-v8a/libgfxstream_host.so || true; \
+		ls -lh hap/entry/libs/arm64-v8a/libgfxstream_host.so; \
+	fi
 	python3 scripts/pack_hnp.py $(SVBOX_DIR)/build/svbox
 
 clean:
