@@ -39,4 +39,7 @@ export const setGpuMode: (gpuMode: string) => boolean;
 export const setPaused: (paused: boolean) => string;
 export const setVisible: (visible: boolean) => boolean;
 export const saveRawSnapshot: (path: string, width: number, height: number, pixels: ArrayBuffer) => boolean;
+export const runGuestCmd: (cmd: string, outPath: string) => boolean;
+export const dumpProcs: (outPath: string) => boolean;
+export const injectTap: (x: number, y: number) => boolean;
 export const getStatus: () => RuntimeStatus;
