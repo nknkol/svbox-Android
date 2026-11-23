@@ -364,4 +364,57 @@
 * **20 轮连续多应用切换压测**：`STRESS_FAIL=0`（20/20 通过，单次切换 `82–235ms`），全程 `0` 条 `enforceInterface` 错乱、`0` 次超时/ANR。
 * **超越首帧的连续 60Hz 动画与交互验证**：在 **Vulkan**（`39 fps · CPU 32% · 3504MB RSS · #1467`）和 **GLES**（`39 fps · CPU 24% · #1810`）双模式下，打开 `Settings` 点击进入子页面 `Battery`，打开 `DeskClock` 切换到 `Stopwatch` 启动秒表连续计时并截图核验流畅运行。
 
+---
+
+## 第 5 章：架构定调——以 `svbox` 为核心的三层解耦与演进路线
+
+> **核心定位明确（2026-11-23）**：项目的真正长期产品是 **`svbox` 本身**（一款可在鸿蒙 PC、无 Root Android / Termux、受限普通 Linux 上运行的通用无特权/无 Namespace 用户态容器）。Android 11 扮演的是**最严苛的兼容性压力测试负载**——原版 Android 镜像尽量 **0 改动**；开发过程中踩出的所有容器通用兼容性问题全部沉淀进 `svbox`，鸿蒙平台专属桥接做成**面向标准 Linux 协议的通用桥接层**（未来可直接接入 Ubuntu / Debian / Alpine 等任意 Linux 发行版），Android 适配仅作为最外层的薄兼容模块。
+
+### 5.1 三层解耦边界
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Layer 3: Guest 兼容薄壳（Android 镜像原则上 0 改动 / 只读）           │
+│   svbox-binderd · svbox-propd · svbox-netd · svbox-cameraserver      │
+│   GPU guest HALs / Audio HAL 全部通过外置进程 + bind mount 注入       │
+├──────────────────────────────────────────────────────────────────────┤
+│ Layer 2: OHOS 通用宿主机桥接层（面向标准 Linux 协议，任意 Linux 复用） │
+│   显示 & GPU（OHNativeWindow / EGL / Vulkan / OH_NativeBuffer）       │
+│   外设输入（XComponent 键鼠/触控/滚轮/手柄 → 标准 Linux evdev）       │
+│   音频（OHAudio ↔ 标准 PCM Socket） · USB（目录 / vdev tty / DDK）    │
+│   宿主机共享目录 · 剪贴板 · 大小核 QoS 调度                           │
+├──────────────────────────────────────────────────────────────────────┤
+│ Layer 1: svbox 核心引擎（跨平台无 Root / 无 Namespace Linux 容器）    │
+│   VFS / Overlay / EROFS(--lower) / owner.db / fake_ids               │
+│   通用资源视图（--cpuset / --mem-mb / --disk-mb）                     │
+│   通用 --vdev 协议（chr / binder / tun / tty）                        │
+│   用户态网络隔离与虚拟网卡 / TUN 代理（net_view → user-space netstack）│
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 四大关键子系统架构决策
+
+1. **网络隔离与 TUN 代理软件（方案 2，归属 `svbox` 通用层）**
+   * **架构决策**：不借宿主机全局 `VpnExtensionAbility`，而是在 **`svbox` 层**基于现有 [`net_view.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/net_view.c) 与 `--vdev` 构建通用的**用户态虚拟网卡 + `/dev/net/tun` + 容器级 socket 重定向**（支持按 fd 豁免直连，兼容 Android `VpnService.protect(fd)` 与 Linux 标记语义）。
+   * **Guest 表现层**：参考 Android Emulator，向 Android 暴露标准 `eth0`/`wlan0` 在线网络状态与 `tun0`，让 Clash / sing-box / WireGuard 等 TUN 代理软件无需 `CAP_NET_ADMIN` 且不劫持宿主机全局流量即可原生运行。
+2. **硬件外设范围收敛**
+   * 聚焦桌面刚需 4 件套：**网络（模拟器语义）、GPU（已达成）、键鼠/触控/手柄外设、USB**；放弃鸿蒙沙箱不开放裸 HCI 的蓝牙协议栈与蜂窝基带（蓝牙耳机/键鼠由鸿蒙宿主机接管经音频/输入桥天然可用）。
+   * 手柄无需改动 `svbox`（沿用通用 `--vdev /dev/input/eventN:...:chr`），在 OHOS 桥接层输出标准 Linux `evdev` 手柄轴/键码即可被 Android 游戏与 Linux 原生识别；USB 经鸿蒙 NDK `usb`/`usb_serial`/`hid`/`ddk` 授权后映射为目录挂载或 `--vdev` 字符设备。
+3. **存储空间、分区与零改镜像（归属 `svbox` 通用层，100% Linux 兼容）**
+   * `svbox` 已原生具备 `--lower DIR[:IMAGE]`（含 EROFS 只读镜像按需读取）、`--root-mode ro|rw|deny`、`-v HOST:GUEST[:ro|rw|deny]` 与 `mount -t overlay`。
+   * 后续补齐 `svbox` 通用 `--disk-mb`（`statfs`/`fstatfs` 虚拟容量视图），并在 `svbox-Android` 侧切换为：**只读 `--lower` 原版镜像（0 字节改写）+ 持久化 `filesDir/userdata` + 单文件 `-v` 注入外置 HAL + 宿主机共享目录双向 bind mount**。
+4. **ROOT、内核态 KernelSU 与调试**
+   * **对比结论**：Windows/Linux 完整 VM（WSA / QEMU / Cuttlefish）通过替换带 KernelSU 补丁的独立 Guest Linux 内核支持 `.ko` 模块；Linux 共享内核容器（Waydroid / Redroid）与无内核特权的 `svbox-Android` 则走**纯用户态方案**——Systemless 修改走 `svbox` `--lower`+`overlay`，细粒度 `su` 授权与 Root 隐藏走 `svbox` `fake_ids`（安全沙箱内 Root、零宿主机逃逸风险），Hook 生态走用户态 Zygisk/Riru 钩子。
+   * **调试**：直接拉起镜像自带的 64 位原生 `adbd`（绑定 `127.0.0.1:5555`），一次打通 `adb shell` / `adb install` / `adb push/pull` / `adb logcat` / JDWP 断点调试，并消除当前 `logcat` 中的 `jdwp control socket` 刷屏。
+
+### 5.3 后续演进路线（Step 5 → Step 8）
+
+| 阶段 | 核心目标 | 沉淀到 `svbox` 核心层 | 沉淀到 OHOS 桥接 / Android 薄层 | 真机验收标准 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Step 5** | **零改只读镜像 + 存储/兼容反哺 + `adbd` 调试台** | 修 `vdev_proto.h` 12B `packed` 宏；修 `/proc/meminfo` `fstat` `EACCES`；新增通用 `--disk-mb` 虚拟配额 | 切换 `--lower` 只读 `rootfs` + `-v` 注入全部 HAL（0 写入原镜像）；`/data` 迁至 `filesDir` 持久化 + 共享目录；拉起 `adbd` (`127.0.0.1:5555`) | `adb connect` 装/卸 APK 流畅、`jdwp` 零报错、重启数据持久化、原版 `rootfs` 哈希 0 变化 |
+| **Step 6** | **`svbox` 通用用户态网络隔离与虚拟 TUN（方案 2）** | 通用用户态 `netstack` + `--vdev` 虚拟 `/dev/net/tun` + 容器内 socket 拦截与直连豁免 + 虚拟网卡视图 | 模拟器风格 `eth0`/`wlan0` 在线状态上报 + `VpnService` 接入虚拟 `tun0` | 普通 Linux 容器 `tun` 单元测试通过；Android 内实装 Clash / sing-box TUN 模式接管容器流量且不影响宿主机 |
+| **Step 7** | **OHOS 通用桥接层解耦 + 手柄 / USB + 跨 Linux 复用验证** | 如有通用 `evdev`/`tty`/USB `ioctl` 缺口反哺 `svbox` | 从 HAP 抽离独立 `ohos_bridge/`（显示/GPU/输入/音频/USB/共享目录），补齐 Gamepad `evdev` 与 USB 桥接 | Android 游戏识别手柄；**用同一套 `svbox` + `ohos_bridge/` 直接拉起一个标准 Linux 发行版（如 Debian/Alpine 图形/终端）**证明通用复用 |
+| **Step 8** | **跨宿主机移植验证 & 用户态 Root 管理** | 验证 `svbox` 在无 Root Android（Termux）/ 标准受限 Linux 宿主机上的可移植性 | 可选用户态 `su` 按 UID 授权管理 + 多容器实例/快照 | 同一套 `svbox` 源码在鸿蒙 PC 与无 Root Linux/Android 宿主机均通过核心回归测试 |
+
+
 
