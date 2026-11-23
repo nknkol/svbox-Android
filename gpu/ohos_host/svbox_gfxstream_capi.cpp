@@ -115,6 +115,7 @@ struct HostState {
     int32_t fbH = 1280;
     int32_t surfaceW = 720;
     int32_t surfaceH = 1280;
+    int32_t vsyncHz = 60;
     OHNativeWindow* window = nullptr;
     bool windowAttached = false;
     std::atomic<bool> visible{true};
@@ -524,7 +525,7 @@ int svbox_gfx_init(int32_t width, int32_t height, int mode, const char* sockPath
     st.renderLib->setWindowOps(*sAgents.android_get_QAndroidEmulatorWindowAgent(),
                                *sAgents.android_get_QAndroidMultiDisplayAgent());
     st.renderLib->setRenderer(SELECTED_RENDERER_HOST);
-    st.renderLib->setAvdInfo(true, 30); // phone, Android 11 (API 30)
+    st.renderLib->setAvdInfo(true, 34); // phone, Android 14 (API 34)
 
     gfxstream::host::FeatureSet features;
     features.GlesDynamicVersion.enabled = true;
@@ -561,7 +562,7 @@ int svbox_gfx_init(int32_t width, int32_t height, int mode, const char* sockPath
     }
 
     st.onLastCbRef = st.renderLib->getOnLastColorBufferRef();
-    st.renderer->setVsyncHz(60);
+    st.renderer->setVsyncHz(st.vsyncHz > 0 ? st.vsyncHz : 60);
     st.renderer->setDisplayConfigs(0, width, height, 320, 320);
     st.renderer->setDisplayActiveConfig(0);
 
@@ -696,6 +697,18 @@ void svbox_gfx_set_visible(int visible) {
     st.visible.store(visible != 0);
     if (visible) {
         svbox_gfx_repaint();
+    }
+}
+
+void svbox_gfx_set_vsync_hz(int32_t hz) {
+    if (hz < 30) hz = 60;
+    if (hz > 240) hz = 120;
+    HostState& st = State();
+    std::lock_guard<std::mutex> lk(st.mu);
+    st.vsyncHz = hz;
+    if (st.initialized && st.renderer) {
+        st.renderer->setVsyncHz(hz);
+        GFX_LOGI("svbox_gfx_set_vsync_hz(%d)", hz);
     }
 }
 

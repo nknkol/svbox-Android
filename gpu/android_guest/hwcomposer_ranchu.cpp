@@ -37,7 +37,19 @@
 namespace {
 
 constexpr hwc2_display_t kPrimaryDisplayId = 0;
-constexpr hwc2_config_t kDefaultConfigId = 0;
+constexpr uint32_t kNumConfigs = 3;
+constexpr int kConfigFps[kNumConfigs] = {60, 90, 120};
+constexpr int64_t kConfigVsyncNs[kNumConfigs] = {
+    1000000000LL / 60,
+    1000000000LL / 90,
+    1000000000LL / 120,
+};
+
+hwc2_config_t configForFps(int fps) {
+    if (fps >= 105) return 2;
+    if (fps >= 75) return 1;
+    return 0;
+}
 
 int readIntProp(const char* name, int defaultVal) {
     char buf[PROPERTY_VALUE_MAX] = {};
@@ -63,13 +75,16 @@ public:
     RanchuHwc2Device() {
         width_ = readIntProp("ro.boot.redroid_width", 720);
         height_ = readIntProp("ro.boot.redroid_height", 1280);
-        fps_ = readIntProp("ro.boot.redroid_fps", 60);
-        if (fps_ < 15 || fps_ > 120) fps_ = 60;
-        dpi_ = readIntProp("ro.boot.redroid_dpi", 320);
-        vsyncPeriodNs_ = 1000000000LL / fps_;
+        int reqFps = readIntProp("ro.boot.redroid_fps", 60);
+        hwc2_config_t initCfg = configForFps(reqFps);
+        activeConfig_.store(initCfg);
+        fps_.store(kConfigFps[initCfg]);
+        vsyncPeriodNs_.store(kConfigVsyncNs[initCfg]);
+        dpi_ = readIntProp("ro.boot.redroid_dpi", readIntProp("ro.sf.lcd_density", 320));
 
-        ALOGI("RanchuHwc2Device init: %dx%d @ %dHz (%d dpi, vsyncPeriod=%lld ns)",
-              width_, height_, fps_, dpi_, static_cast<long long>(vsyncPeriodNs_));
+        ALOGI("RanchuHwc2Device init: %dx%d @ %dHz (cfg=%u, %d dpi, vsyncPeriod=%lld ns, modes=60/90/120Hz)",
+              width_, height_, fps_.load(), initCfg, dpi_,
+              static_cast<long long>(vsyncPeriodNs_.load()));
 
         vsyncThread_ = std::thread(&RanchuHwc2Device::vsyncLoop, this);
     }
@@ -177,10 +192,13 @@ public:
         if (display != kPrimaryDisplayId) return HWC2_ERROR_BAD_DISPLAY;
         if (!outNumConfigs) return HWC2_ERROR_BAD_PARAMETER;
         if (!outConfigs) {
-            *outNumConfigs = 1;
-        } else if (*outNumConfigs >= 1) {
-            outConfigs[0] = kDefaultConfigId;
-            *outNumConfigs = 1;
+            *outNumConfigs = kNumConfigs;
+        } else {
+            uint32_t n = (*outNumConfigs < kNumConfigs) ? *outNumConfigs : kNumConfigs;
+            for (uint32_t i = 0; i < n; ++i) {
+                outConfigs[i] = i;
+            }
+            *outNumConfigs = n;
         }
         return HWC2_ERROR_NONE;
     }
@@ -188,20 +206,29 @@ public:
     int32_t getActiveConfig(hwc2_display_t display, hwc2_config_t* outConfig) {
         if (display != kPrimaryDisplayId) return HWC2_ERROR_BAD_DISPLAY;
         if (!outConfig) return HWC2_ERROR_BAD_PARAMETER;
-        *outConfig = kDefaultConfigId;
+        *outConfig = activeConfig_.load();
         return HWC2_ERROR_NONE;
     }
 
     int32_t setActiveConfig(hwc2_display_t display, hwc2_config_t config) {
         if (display != kPrimaryDisplayId) return HWC2_ERROR_BAD_DISPLAY;
-        if (config != kDefaultConfigId) return HWC2_ERROR_BAD_CONFIG;
+        if (config >= kNumConfigs) return HWC2_ERROR_BAD_CONFIG;
+        {
+            std::lock_guard<std::mutex> lk(vsyncMutex_);
+            activeConfig_.store(config);
+            fps_.store(kConfigFps[config]);
+            vsyncPeriodNs_.store(kConfigVsyncNs[config]);
+        }
+        vsyncCv_.notify_all();
+        ALOGI("setActiveConfig: display=%" PRIu64 " config=%u -> %dHz (vsyncPeriod=%lld ns)",
+              display, config, kConfigFps[config], static_cast<long long>(kConfigVsyncNs[config]));
         return HWC2_ERROR_NONE;
     }
 
     int32_t getDisplayAttribute(hwc2_display_t display, hwc2_config_t config,
                                 int32_t attribute, int32_t* outValue) {
         if (display != kPrimaryDisplayId) return HWC2_ERROR_BAD_DISPLAY;
-        if (config != kDefaultConfigId) return HWC2_ERROR_BAD_CONFIG;
+        if (config >= kNumConfigs) return HWC2_ERROR_BAD_CONFIG;
         if (!outValue) return HWC2_ERROR_BAD_PARAMETER;
         switch (attribute) {
             case HWC2_ATTRIBUTE_WIDTH:
@@ -211,11 +238,14 @@ public:
                 *outValue = height_;
                 return HWC2_ERROR_NONE;
             case HWC2_ATTRIBUTE_VSYNC_PERIOD:
-                *outValue = static_cast<int32_t>(vsyncPeriodNs_);
+                *outValue = static_cast<int32_t>(kConfigVsyncNs[config]);
                 return HWC2_ERROR_NONE;
             case HWC2_ATTRIBUTE_DPI_X:
             case HWC2_ATTRIBUTE_DPI_Y:
                 *outValue = dpi_ * 1000;
+                return HWC2_ERROR_NONE;
+            case 6: // HWC2_ATTRIBUTE_CONFIG_GROUP (same resolution group -> seamless switch)
+                *outValue = 0;
                 return HWC2_ERROR_NONE;
             default:
                 *outValue = -1;
@@ -376,8 +406,8 @@ public:
     void dump(uint32_t* outSize, char* outBuffer) {
         char info[256];
         int len = snprintf(info, sizeof(info),
-                           "svbox-gfxstream hwcomposer.ranchu %dx%d@%dHz frames=%" PRIu64 "\n",
-                           width_, height_, fps_, presentCount_.load());
+                           "svbox-gfxstream hwcomposer.ranchu %dx%d@%dHz (cfg=%u) frames=%" PRIu64 "\n",
+                           width_, height_, fps_.load(), activeConfig_.load(), presentCount_.load());
         if (len < 0) len = 0;
         if (!outBuffer) {
             *outSize = static_cast<uint32_t>(len);
@@ -404,7 +434,8 @@ private:
             }
 
             while (true) {
-                nextTick.tv_nsec += vsyncPeriodNs_;
+                int64_t period = vsyncPeriodNs_.load();
+                nextTick.tv_nsec += period;
                 while (nextTick.tv_nsec >= 1000000000LL) {
                     nextTick.tv_nsec -= 1000000000LL;
                     nextTick.tv_sec += 1;
@@ -437,9 +468,10 @@ private:
 
     int width_ = 720;
     int height_ = 1280;
-    int fps_ = 60;
+    std::atomic<hwc2_config_t> activeConfig_{0};
+    std::atomic<int> fps_{60};
     int dpi_ = 320;
-    int64_t vsyncPeriodNs_ = 16666666LL;
+    std::atomic<int64_t> vsyncPeriodNs_{16666666LL};
 
     std::mutex mutex_;
     hwc2_layer_t nextLayerId_ = 1;

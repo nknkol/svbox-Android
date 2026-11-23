@@ -9,6 +9,7 @@ export interface RuntimeStatus {
   width: number;
   height: number;
   fps: number;
+  refreshRate: number;
   cpuPercent: number;
   memMb: number;
   memLimitMb: number;
@@ -36,6 +37,7 @@ export const sendNavKey: (key: string) => boolean;
 export const sendScroll: (x: number, y: number, deltaY: number) => boolean;
 export const setResourceConfig: (profile: string, cpuset: string, memMb: number) => boolean;
 export const setGpuMode: (gpuMode: string) => boolean;
+export const setRefreshRate: (hz: number) => boolean;
 export const setPaused: (paused: boolean) => string;
 export const setVisible: (visible: boolean) => boolean;
 export const saveRawSnapshot: (path: string, width: number, height: number, pixels: ArrayBuffer) => boolean;

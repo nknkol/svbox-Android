@@ -26,7 +26,7 @@
 #define PROP_AREA_VERSION 0xfc6ed0abu
 #define PROP_VALUE_MAX    92u
 #define PROP_LONG_FLAG    (1u << 16)
-#define PROP_AREA_SIZE    (512u * 1024u) /* 512 KiB comfortably fits all AOSP props */
+#define PROP_AREA_SIZE    (1024u * 1024u) /* 1 MiB comfortably fits all Android 14 AOSP props */
 
 #define PROP_MSG_SETPROP  1u
 #define PROP_MSG_SETPROP2 0x00020001u

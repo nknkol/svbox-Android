@@ -30,6 +30,8 @@ bool GfxstreamBridge::EnsureLoadedLocked() {
         dlsym(dlHandle_, "svbox_gfx_repaint"));
     fnSetVisible_ = reinterpret_cast<void (*)(int)>(
         dlsym(dlHandle_, "svbox_gfx_set_visible"));
+    fnSetVsyncHz_ = reinterpret_cast<void (*)(int32_t)>(
+        dlsym(dlHandle_, "svbox_gfx_set_vsync_hz"));
     fnStop_ = reinterpret_cast<void (*)(void)>(
         dlsym(dlHandle_, "svbox_gfx_stop"));
     fnGetStats_ = reinterpret_cast<void (*)(SvboxGfxStats*)>(
@@ -60,6 +62,9 @@ bool GfxstreamBridge::Start(const std::string& sockPath, int32_t width, int32_t 
     if (pendingWindow_) {
         fnSetWindow_(pendingWindow_, pendingW_ > 0 ? pendingW_ : width,
                      pendingH_ > 0 ? pendingH_ : height);
+    }
+    if (fnSetVsyncHz_) {
+        fnSetVsyncHz_(targetHz_);
     }
 
     int rc = fnInit_(width, height, static_cast<int>(mode), sockPath.c_str());
@@ -112,6 +117,15 @@ void GfxstreamBridge::ClearWindow() {
 void GfxstreamBridge::SetVisible(bool visible) {
     std::lock_guard<std::mutex> lk(mu_);
     if (active_.load() && fnSetVisible_) fnSetVisible_(visible ? 1 : 0);
+}
+
+void GfxstreamBridge::SetRefreshRate(int32_t hz) {
+    if (hz != 60 && hz != 90 && hz != 120) hz = 60;
+    std::lock_guard<std::mutex> lk(mu_);
+    targetHz_ = hz;
+    if (active_.load() && fnSetVsyncHz_) {
+        fnSetVsyncHz_(hz);
+    }
 }
 
 bool GfxstreamBridge::IsConnected() const {

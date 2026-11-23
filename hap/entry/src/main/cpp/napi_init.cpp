@@ -10,6 +10,7 @@
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <cstdio>
 #include <hilog/log.h>
+#include <mutex>
 #include <napi/native_api.h>
 #include <string>
 #include <thread>
@@ -62,7 +63,24 @@ bool GetBoolArg(napi_env env, napi_value val, bool fallback) {
     return out;
 }
 
+std::mutex g_xcMu;
+OH_NativeXComponent* g_activeXC = nullptr;
+
+void ApplyExpectedFrameRateLocked(OH_NativeXComponent* component, int32_t hz) {
+    if (!component) return;
+    if (hz != 60 && hz != 90 && hz != 120) hz = 60;
+    OH_NativeXComponent_ExpectedRateRange range = { 60, hz, hz };
+    int32_t rc = OH_NativeXComponent_SetExpectedFrameRateRange(component, &range);
+    OH_LOG_INFO(LOG_APP, "OH_NativeXComponent_SetExpectedFrameRateRange(60..%d, exp=%d) -> %d",
+                hz, hz, rc);
+}
+
 void OnSurfaceCreatedCB(OH_NativeXComponent* component, void* window) {
+    {
+        std::lock_guard<std::mutex> lk(g_xcMu);
+        g_activeXC = component;
+        ApplyExpectedFrameRateLocked(component, AndroidRuntime::Instance().RefreshRate());
+    }
     uint64_t w = 0, h = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &w, &h);
     InputBridge::Instance().SetSurfaceSize(static_cast<int32_t>(w), static_cast<int32_t>(h));
@@ -82,7 +100,13 @@ void OnSurfaceChangedCB(OH_NativeXComponent* component, void* window) {
         static_cast<int32_t>(h));
 }
 
-void OnSurfaceDestroyedCB(OH_NativeXComponent*, void* window) {
+void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
+    {
+        std::lock_guard<std::mutex> lk(g_xcMu);
+        if (g_activeXC == component) {
+            g_activeXC = nullptr;
+        }
+    }
     AndroidRuntime::Instance().OnSurfaceDestroyed(static_cast<OHNativeWindow*>(window));
 }
 
@@ -234,8 +258,24 @@ napi_value SetGpuModeNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    std::string gpuMode = argc > 0 ? GetStringArg(env, args[0]) : "gles";
+    std::string gpuMode = argc > 0 ? GetStringArg(env, args[0]) : "vulkan";
     AndroidRuntime::Instance().SetGpuMode(gpuMode);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value SetRefreshRateNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t hz = argc > 0 ? GetInt32Arg(env, args[0], 60) : 60;
+    if (hz != 60 && hz != 90 && hz != 120) hz = 60;
+    AndroidRuntime::Instance().SetRefreshRate(hz);
+    {
+        std::lock_guard<std::mutex> lk(g_xcMu);
+        ApplyExpectedFrameRateLocked(g_activeXC, hz);
+    }
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
@@ -411,6 +451,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setI32("width", useGfx ? gfx.FrameWidth() : hwc.FrameWidth());
     setI32("height", useGfx ? gfx.FrameHeight() : hwc.FrameHeight());
     setI32("fps", useGfx ? gfx.Fps() : hwc.Fps());
+    setI32("refreshRate", rt.RefreshRate());
     setDouble("cpuPercent", tel.systemCpuPercent);
     setI32("memMb", static_cast<int32_t>(tel.containerRssMb));
     setI32("memLimitMb", static_cast<int32_t>(rt.MemLimitMb()));
@@ -435,6 +476,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "sendScroll", nullptr, SendScrollNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setResourceConfig", nullptr, SetResourceConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setGpuMode", nullptr, SetGpuModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setRefreshRate", nullptr, SetRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setPaused", nullptr, SetPausedNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

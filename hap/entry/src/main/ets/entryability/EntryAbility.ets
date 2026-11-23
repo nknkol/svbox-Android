@@ -13,6 +13,9 @@ export default class EntryAbility extends UIAbility {
   private applyWant(want: Want, isNewWant: boolean): void {
     const rawAuto: Object | undefined = want.parameters ? want.parameters['autoStart'] : undefined;
     const rawGpu: Object | undefined = want.parameters ? want.parameters['gpuMode'] : undefined;
+    const rawRes: Object | undefined = want.parameters ? want.parameters['resolution'] : undefined;
+    const rawHz: Object | undefined = want.parameters ? want.parameters['refreshRate'] : undefined;
+    const rawSetHz: Object | undefined = want.parameters ? want.parameters['setRefreshRate'] : undefined;
     const rawSnap: Object | undefined = want.parameters ? want.parameters['snapPath'] : undefined;
     const rawCmd: Object | undefined = want.parameters ? want.parameters['guestCmd'] : undefined;
     const rawCmdOut: Object | undefined = want.parameters ? want.parameters['guestCmdOut'] : undefined;
@@ -20,11 +23,23 @@ export default class EntryAbility extends UIAbility {
     const rawTap: Object | undefined = want.parameters ? want.parameters['injectTap'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
+    const resStr: string = typeof rawRes === 'string' ? rawRes : '';
+    const hzStr: string = typeof rawHz === 'string' ? rawHz : (typeof rawHz === 'number' ? String(rawHz) : '');
+    const setHzStr: string = typeof rawSetHz === 'string' ? rawSetHz : (typeof rawSetHz === 'number' ? String(rawSetHz) : '');
     const snapStr: string = typeof rawSnap === 'string' ? rawSnap : '';
     const cmdStr: string = typeof rawCmd === 'string' ? rawCmd : '';
     const cmdOutStr: string = typeof rawCmdOut === 'string' ? rawCmdOut : '';
     const dumpStr: string = typeof rawDump === 'string' ? rawDump : '';
     const tapStr: string = typeof rawTap === 'string' ? rawTap : '';
+
+    if (setHzStr.length > 0 && autoStr.length === 0) {
+      const hz: number = Number(setHzStr);
+      if (hz === 60 || hz === 90 || hz === 120) {
+        AppStorage.setOrCreate<number>('refreshRate', hz);
+        native.setRefreshRate(hz);
+      }
+      return;
+    }
 
     if (cmdStr.length > 0 && autoStr.length === 0) {
       native.runGuestCmd(cmdStr, cmdOutStr);
@@ -53,6 +68,15 @@ export default class EntryAbility extends UIAbility {
 
     if (gpuStr.length > 0) {
       AppStorage.setOrCreate<string>('gpuMode', gpuStr);
+    }
+    if (resStr.length > 0) {
+      AppStorage.setOrCreate<string>('resolution', resStr);
+    }
+    if (hzStr.length > 0) {
+      const hz: number = Number(hzStr);
+      if (hz === 60 || hz === 90 || hz === 120) {
+        AppStorage.setOrCreate<number>('refreshRate', hz);
+      }
     }
     if (autoStr.length > 0 || !isNewWant) {
       AppStorage.setOrCreate<string>('autoStart', autoStr);

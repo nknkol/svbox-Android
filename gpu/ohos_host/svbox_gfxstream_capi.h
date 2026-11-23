@@ -44,6 +44,9 @@ void svbox_gfx_repaint(void);
 /* Enable/disable active display presentation when backgrounded/paused. */
 void svbox_gfx_set_visible(int visible);
 
+/* Set target host VSync refresh rate (60 / 90 / 120 Hz). */
+void svbox_gfx_set_vsync_hz(int32_t hz);
+
 /* Stop socket server and shut down gfxstream host renderer cleanly. */
 void svbox_gfx_stop(void);
 

@@ -32,6 +32,10 @@ public:
     void SetGpuMode(const std::string& gpuMode);
     std::string GpuMode() const;
     bool UseGfxstream() const;
+    void SetRefreshRate(int32_t hz);
+    int32_t RefreshRate() const { return refreshRate_.load(); }
+    int32_t DisplayWidth() const { return displayW_.load(); }
+    int32_t DisplayHeight() const { return displayH_.load(); }
     void OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h);
     void OnSurfaceDestroyed(OHNativeWindow* window = nullptr);
     std::string SetPaused(bool paused);
@@ -68,14 +72,17 @@ private:
     std::atomic<bool> paused_{false};
     std::string status_ = "Idle";
     std::string profile_ = "perf";
-    std::string gpuMode_ = "gles";
-    std::string activeGpuMode_ = "gles";
+    std::string gpuMode_ = "vulkan";
+    std::string activeGpuMode_ = "vulkan";
     std::string customCpuset_;
     std::string activeCpuset_;
     int32_t activeNice_ = 0x7fffffff;
     std::string activeSched_;
     std::atomic<uint32_t> memLimitMb_{4096};
     std::atomic<uint32_t> diskLimitMb_{32768};
+    std::atomic<int32_t> refreshRate_{60};
+    std::atomic<int32_t> displayW_{720};
+    std::atomic<int32_t> displayH_{1280};
 
     OHNativeWindow* surfaceWindow_ = nullptr;
     int32_t surfaceW_ = 0;

@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
-/* In-HAP Android 11 container supervisor:
+/* In-HAP Android 14 container supervisor:
  * Launches svbox-propd, svbox-binderd, servicemanager, hwservicemanager,
  * graphics HALs, SurfaceFlinger, and either BootAnimation demo or full
- * Android 11 (Zygote64 -> system_server) using svbox. */
+ * Android 14 (Zygote64 -> system_server) using svbox. */
 #include "android_runtime.h"
 #include "ohos_bridge/audio_bridge.h"
 #include "ohos_bridge/gpu_bridge.h"
@@ -39,45 +39,156 @@ namespace {
 constexpr const char* kBootClassPath =
     "/apex/com.android.art/javalib/core-oj.jar:"
     "/apex/com.android.art/javalib/core-libart.jar:"
-    "/apex/com.android.art/javalib/core-icu4j.jar:"
     "/apex/com.android.art/javalib/okhttp.jar:"
     "/apex/com.android.art/javalib/bouncycastle.jar:"
     "/apex/com.android.art/javalib/apache-xml.jar:"
     "/system/framework/framework.jar:"
+    "/system/framework/framework-graphics.jar:"
     "/system/framework/ext.jar:"
     "/system/framework/telephony-common.jar:"
     "/system/framework/voip-common.jar:"
     "/system/framework/ims-common.jar:"
-    "/system/framework/framework-atb-backward-compatibility.jar:"
+    "/apex/com.android.i18n/javalib/core-icu4j.jar:"
+    "/apex/com.android.adservices/javalib/framework-adservices.jar:"
+    "/apex/com.android.adservices/javalib/framework-sdksandbox.jar:"
+    "/apex/com.android.appsearch/javalib/framework-appsearch.jar:"
+    "/apex/com.android.btservices/javalib/framework-bluetooth.jar:"
+    "/apex/com.android.configinfrastructure/javalib/framework-configinfrastructure.jar:"
     "/apex/com.android.conscrypt/javalib/conscrypt.jar:"
+    "/apex/com.android.devicelock/javalib/framework-devicelock.jar:"
+    "/apex/com.android.healthfitness/javalib/framework-healthfitness.jar:"
+    "/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar:"
     "/apex/com.android.media/javalib/updatable-media.jar:"
     "/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar:"
+    "/apex/com.android.ondevicepersonalization/javalib/framework-ondevicepersonalization.jar:"
     "/apex/com.android.os.statsd/javalib/framework-statsd.jar:"
     "/apex/com.android.permission/javalib/framework-permission.jar:"
+    "/apex/com.android.permission/javalib/framework-permission-s.jar:"
+    "/apex/com.android.scheduling/javalib/framework-scheduling.jar:"
     "/apex/com.android.sdkext/javalib/framework-sdkextensions.jar:"
-    "/apex/com.android.wifi/javalib/framework-wifi.jar:"
-    "/apex/com.android.tethering/javalib/framework-tethering.jar";
+    "/apex/com.android.tethering/javalib/framework-connectivity.jar:"
+    "/apex/com.android.tethering/javalib/framework-connectivity-t.jar:"
+    "/apex/com.android.tethering/javalib/framework-tethering.jar:"
+    "/apex/com.android.uwb/javalib/framework-uwb.jar:"
+    "/apex/com.android.virt/javalib/framework-virtualization.jar:"
+    "/apex/com.android.wifi/javalib/framework-wifi.jar";
 
 constexpr const char* kDex2OatBootClassPath =
     "/apex/com.android.art/javalib/core-oj.jar:"
     "/apex/com.android.art/javalib/core-libart.jar:"
-    "/apex/com.android.art/javalib/core-icu4j.jar:"
     "/apex/com.android.art/javalib/okhttp.jar:"
     "/apex/com.android.art/javalib/bouncycastle.jar:"
     "/apex/com.android.art/javalib/apache-xml.jar:"
     "/system/framework/framework.jar:"
+    "/system/framework/framework-graphics.jar:"
     "/system/framework/ext.jar:"
     "/system/framework/telephony-common.jar:"
     "/system/framework/voip-common.jar:"
     "/system/framework/ims-common.jar:"
-    "/system/framework/framework-atb-backward-compatibility.jar";
+    "/apex/com.android.i18n/javalib/core-icu4j.jar";
 
 constexpr const char* kSystemServerClassPath =
     "/system/framework/com.android.location.provider.jar:"
     "/system/framework/services.jar:"
-    "/system/framework/ethernet-service.jar:"
+    "/apex/com.android.adservices/javalib/service-adservices.jar:"
+    "/apex/com.android.adservices/javalib/service-sdksandbox.jar:"
+    "/apex/com.android.appsearch/javalib/service-appsearch.jar:"
+    "/apex/com.android.art/javalib/service-art.jar:"
+    "/apex/com.android.configinfrastructure/javalib/service-configinfrastructure.jar:"
+    "/apex/com.android.healthfitness/javalib/service-healthfitness.jar:"
+    "/apex/com.android.media/javalib/service-media-s.jar:"
+    "/apex/com.android.ondevicepersonalization/javalib/service-ondevicepersonalization.jar:"
     "/apex/com.android.permission/javalib/service-permission.jar:"
-    "/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar";
+    "/apex/com.android.rkpd/javalib/service-rkp.jar";
+
+constexpr const char* kStandaloneSystemServerJars =
+    "/apex/com.android.btservices/javalib/service-bluetooth.jar:"
+    "/apex/com.android.devicelock/javalib/service-devicelock.jar:"
+    "/apex/com.android.os.statsd/javalib/service-statsd.jar:"
+    "/apex/com.android.scheduling/javalib/service-scheduling.jar:"
+    "/apex/com.android.tethering/javalib/service-connectivity.jar:"
+    "/apex/com.android.uwb/javalib/service-uwb.jar:"
+    "/apex/com.android.wifi/javalib/service-wifi.jar";
+
+int32_t ComputeDpiForResolution(int32_t w, int32_t h) {
+    if (w == 720 && h == 1280) return 320;
+    if (w == 1080 && h == 1920) return 420;
+    if (w == 1280 && h == 720) return 240;
+    if (w == 1600 && h == 900) return 280;
+    if (w == 1920 && h == 1080) return 320;
+    int32_t shortEdge = (w < h) ? w : h;
+    int32_t dpi = (shortEdge * 320) / 720;
+    if (dpi < 160) dpi = 160;
+    if (dpi > 480) dpi = 480;
+    return dpi;
+}
+
+void WriteApexInfoListXml(const std::string& apexDir, const std::string& outXmlPath) {
+    std::ostringstream oss;
+    oss << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n";
+    DIR* d = opendir(apexDir.c_str());
+    if (d) {
+        std::vector<std::string> names;
+        while (struct dirent* de = readdir(d)) {
+            if (de->d_name[0] == '.') continue;
+            struct stat st = {};
+            std::string full = apexDir + "/" + de->d_name;
+            if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                names.emplace_back(de->d_name);
+            }
+        }
+        closedir(d);
+        for (const std::string& name : names) {
+            std::string modName = name;
+            uint64_t verCode = 1;
+            std::string pbPath = apexDir + "/" + name + "/apex_manifest.pb";
+            int fd = open(pbPath.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                uint8_t buf[512];
+                ssize_t n = read(fd, buf, sizeof(buf));
+                close(fd);
+                ssize_t i = 0;
+                while (i < n) {
+                    uint8_t tag = buf[i++];
+                    if (tag == 0x0a && i < n) {
+                        uint8_t ln = buf[i++];
+                        if (i + ln <= n) {
+                            modName.assign(reinterpret_cast<const char*>(buf + i), ln);
+                            i += ln;
+                        } else {
+                            break;
+                        }
+                    } else if (tag == 0x10) {
+                        uint64_t v = 0;
+                        int sh = 0;
+                        while (i < n && sh < 64) {
+                            uint8_t b = buf[i++];
+                            v |= static_cast<uint64_t>(b & 0x7fu) << sh;
+                            sh += 7;
+                            if (!(b & 0x80u)) break;
+                        }
+                        verCode = v;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            oss << "  <apex-info moduleName=\"" << modName
+                << "\" modulePath=\"/system/apex/" << name
+                << "\" preinstalledModulePath=\"/system/apex/" << name
+                << "\" versionCode=\"" << verCode
+                << "\" versionName=\"\" isFactory=\"true\" isActive=\"true\" />\n";
+        }
+    }
+    oss << "</apex-info-list>\n";
+    int fd = open(outXmlPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        std::string s = oss.str();
+        (void)write(fd, s.data(), s.size());
+        close(fd);
+        chmod(outXmlPath.c_str(), 0644);
+    }
+}
 
 bool MkdirP(const std::string& path) {
     if (path.empty()) return false;
@@ -264,8 +375,8 @@ std::string ResolveAndroidTarget(const std::string& dstDir,
                                  const std::string& target) {
     if (target.empty()) return "";
     if (target[0] == '/') {
-        if (target.rfind("/apex/com.android.art/", 0) == 0) {
-            return dstDir + "/system/apex/com.android.art.debug/" + target.substr(22);
+        if (target.rfind("/apex/com.android.vndk.v34/", 0) == 0) {
+            return dstDir + "/system/apex/com.android.vndk.current/" + target.substr(27);
         }
         if (target.rfind("/apex/com.android.vndk.v30/", 0) == 0) {
             return dstDir + "/system/apex/com.android.vndk.current/" + target.substr(27);
@@ -547,6 +658,24 @@ bool AndroidRuntime::UseGfxstream() const {
     return (m == "gles" || m == "vulkan");
 }
 
+void AndroidRuntime::SetRefreshRate(int32_t hz) {
+    if (hz != 60 && hz != 90 && hz != 120) hz = 60;
+    refreshRate_.store(hz);
+    GfxstreamBridge::Instance().SetRefreshRate(hz);
+    if (running_.load()) {
+        int32_t cfgIdx = (hz >= 105) ? 2 : ((hz >= 75) ? 1 : 0);
+        int32_t w = displayW_.load();
+        int32_t h = displayH_.load();
+        std::ostringstream cmd;
+        cmd << "service call SurfaceFlinger 1035 i32 " << cfgIdx
+            << "; settings put system peak_refresh_rate " << hz << ".0"
+            << "; settings put system min_refresh_rate " << hz << ".0"
+            << "; cmd display set-user-preferred-display-mode " << w << " " << h << " " << hz;
+        RunGuestCmd(cmd.str(), androidDir_ + "/hap_logs/refresh_switch.log");
+        OH_LOG_INFO(LOG_APP, "Switched Android 14 refresh rate live to %dHz (cfg=%d)", hz, cfgIdx);
+    }
+}
+
 void AndroidRuntime::OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h) {
     bool useGfx = false;
     {
@@ -597,7 +726,7 @@ std::string AndroidRuntime::SetPaused(bool paused) {
     } else {
         HwcRenderer::Instance().SetVisible(!paused);
     }
-    SetStatus(paused ? "Paused (SIGSTOP · 0% CPU)" : "Running Android 11");
+    SetStatus(paused ? "Paused (SIGSTOP · 0% CPU)" : "Running Android 14");
     return StatusText();
 }
 
@@ -651,9 +780,10 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--cap-add", "ALL",
         "--trap-sigsys",
         "--kernel-sysname", "Linux",
-        "--kernel-release", "5.10.0-android11",
+        "--kernel-release", "5.15.0-android14",
         "--hostname", "localhost",
         "--emulate-mounts",
+        "--emulate-bpf",
         "--mount-scratch", runBase_ + "/tmpfs",
         "--owner-db", dataBase_ + "/owner.db",
     };
@@ -686,8 +816,9 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", "/dev/random:/dev/random",
         "-v", "/dev/ashmem:/dev/ashmem",
         "-v", rootfs_ + "/system/apex:/apex",
-        "-v", rootfs_ + "/system/apex/com.android.art.debug:/apex/com.android.art",
-        "-v", rootfs_ + "/system/apex/com.android.vndk.current:/apex/com.android.vndk.v30",
+        "-v", rootfs_ + "/system/apex/com.android.vndk.current:/apex/com.android.vndk.v34",
+        "-v", runBase_ + "/apex-info-list.xml:/apex/apex-info-list.xml",
+        "-v", runBase_ + "/linkerconfig:/linkerconfig",
         "-v", rootfs_ + "/system/etc:/etc",
         "-v", runBase_ + "/resolv.conf:/etc/resolv.conf",
         "-v", rootfs_ + "/system/product:/product",
@@ -707,6 +838,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/cache:/cache",
         "-v", runBase_ + "/acct:/acct",
         "-v", runBase_ + "/cgroup:/sys/fs/cgroup",
+        "-v", runBase_ + "/sys_fs_bpf:/sys/fs/bpf",
         "-v", runBase_ + "/sys_power:/sys/power",
         "-v", runBase_ + "/cpuset:/dev/cpuset",
         "-v", runBase_ + "/stune:/dev/stune",
@@ -768,6 +900,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-e", std::string("BOOTCLASSPATH=") + kBootClassPath,
         "-e", std::string("DEX2OATBOOTCLASSPATH=") + kDex2OatBootClassPath,
         "-e", std::string("SYSTEMSERVERCLASSPATH=") + kSystemServerClassPath,
+        "-e", std::string("STANDALONE_SYSTEMSERVER_JARS=") + kStandaloneSystemServerJars,
         "-e", "PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/vendor/bin",
     };
     args.insert(args.end(), vdevsAndEnv.begin(), vdevsAndEnv.end());
@@ -918,28 +1051,28 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
         FileExists(hnpGpuGuest + "/egl/libEGL_emulation.so")
             ? hnpGpuGuest
             : (FileExists(devGpuGuest + "/egl/libEGL_emulation.so") ? devGpuGuest : "");
-    const std::string rootfsTar = androidDir + "/rootfs.tar";
+    const std::string rootfsTar = androidDir + "/rootfs14.tar";
     std::string sandboxFiles = sandboxTempDir;
     if (sandboxFiles.size() >= 5 && sandboxFiles.compare(sandboxFiles.size() - 5, 5, "/temp") == 0) {
         sandboxFiles.replace(sandboxFiles.size() - 5, 5, "/files");
     } else {
         sandboxFiles = "/data/storage/el2/base/haps/entry/files";
     }
-    const std::string sandboxRootfs = sandboxFiles + "/rootfs";
-    const std::string externalRootfs = androidDir + "/rootfs";
-    const bool useSandboxTar = FileExists(sandboxRootfs + "/.imported_v2") || FileExists(rootfsTar);
+    const std::string sandboxRootfs = sandboxFiles + "/rootfs14";
+    const std::string externalRootfs = androidDir + "/rootfs14";
+    const bool useSandboxTar = FileExists(sandboxRootfs + "/.imported_a14_v1") || FileExists(rootfsTar);
     const std::string rootfs = useSandboxTar ? sandboxRootfs : externalRootfs;
 
     if (!FileExists(resolvedSvbox)) return "Missing svbox binary: " + resolvedSvbox;
     if (!FileExists(binderd)) return "Missing svbox-binderd: " + binderd;
     if (!FileExists(propd)) return "Missing svbox-propd: " + propd;
     if (!useSandboxTar && !FileExists(externalRootfs + "/system/bin/surfaceflinger")) {
-        return "Missing Android 11 rootfs or rootfs.tar at: " + androidDir;
+        return "Missing Android 14 rootfs14 or rootfs14.tar at: " + androidDir;
     }
 
     sandboxFiles_ = sandboxFiles;
-    runBase_ = sandboxTempDir + "/svbox-android-hap";
-    dataBase_ = sandboxFiles + "/userdata";
+    runBase_ = sandboxTempDir + "/svbox-android14-hap";
+    dataBase_ = sandboxFiles + "/userdata14";
     rootUpper_ = runBase_ + "/root_upper";
     injectLayer_ = runBase_ + "/inject_layer";
     shareHostDir_ = "/storage/Users/currentUser/Download/svbox-share";
@@ -950,6 +1083,8 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     gpuGuestDir_ = gpuGuestDir;
     androidDir_ = androidDir;
     rootfs_ = rootfs;
+    displayW_.store(width);
+    displayH_.store(height);
 
     // Resolve active cpuset/nice/sched and GPU mode
     std::string chosenGpu;
@@ -962,7 +1097,9 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
 
     paused_.store(false);
     running_.store(true);
-    SetStatus("Booting Android 11 (" + mode + " · " + chosenGpu + ")...");
+    SetStatus("Booting Android 14 (" + mode + " · " + chosenGpu + " · " +
+              std::to_string(width) + "x" + std::to_string(height) + "@" +
+              std::to_string(refreshRate_.load()) + "Hz)...");
     bootThread_ = std::thread(&AndroidRuntime::BootWorker, this, mode, width, height);
     return StatusText();
 }
@@ -1598,7 +1735,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     // Ephemeral per-boot runtime directories (under sandboxTempDir)
     const char* runDirs[] = {
-        "", "/sockets", "/__properties__", "/ipc", "/cache", "/acct", "/cgroup",
+        "", "/sockets", "/__properties__", "/ipc", "/linkerconfig", "/cache", "/acct", "/cgroup",
+        "/sys_fs_bpf", "/sys_fs_bpf/netd_shared", "/sys_fs_bpf/net_shared",
         "/sys_power", "/dev_input", "/dev_bus_usb", "/dev_bus_usb/001", "/cpuset", "/cpuset/foreground", "/cpuset/background",
         "/cpuset/system-background", "/cpuset/top-app", "/stune", "/stune/foreground",
         "/stune/background", "/stune/top-app", "/mnt/user/0", "/mnt/expand",
@@ -1613,18 +1751,26 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         MkdirP(runBase_ + sub);
     }
 
-    // Rebuild ephemeral overlay upper + injection layer cleanly on every boot
+    // Rebuild ephemeral overlay upper + injection layer + linkerconfig cleanly on every boot
     // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
     RemoveDirRecursive(rootUpper_);
     MkdirP(rootUpper_);
     RemoveDirRecursive(injectLayer_);
     MkdirP(injectLayer_);
+    RemoveDirRecursive(runBase_ + "/linkerconfig");
+    MkdirP(runBase_ + "/linkerconfig");
 
-    // Persistent Android /data partition (under sandboxFilesDir/userdata)
+    // Persistent Android 14 /data partition (under sandboxFilesDir/userdata14)
     const char* dataDirs[] = {
         "", "/data", "/data/system/users/0", "/data/system/dropbox", "/data/system/usagestats",
+        "/data/system/environ", "/data/system/heapdump",
         "/data/system_de/0", "/data/system_ce/0", "/data/misc/profiles/cur/0",
-        "/data/misc/profiles/ref", "/data/misc/apexdata", "/data/misc/keystore",
+        "/data/misc/profiles/ref", "/data/misc/apexdata",
+        "/data/misc/apexdata/com.android.tethering/misc/ethernet",
+        "/data/misc/apexdata/com.android.art",
+        "/data/misc/apexdata/com.android.permission",
+        "/data/misc/odrefresh",
+        "/data/misc/keystore",
         "/data/misc/gatekeeper", "/data/misc/installd", "/data/misc/user/0",
         "/data/misc/media", "/data/misc/credstore", "/data/misc/ethernet",
         "/data/misc_ce/0", "/data/misc_de/0", "/data/vendor_ce/0", "/data/vendor_de/0",
@@ -1649,11 +1795,62 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     EnsureOwnerDb(dataBase_ + "/owner.db");
     WriteEthernetStaticIpConfig(dataBase_ + "/data/misc/ethernet/ipconfig.txt");
+    WriteEthernetStaticIpConfig(
+        dataBase_ + "/data/misc/apexdata/com.android.tethering/misc/ethernet/ipconfig.txt");
 
     WriteFile(runBase_ + "/sys_power/wake_lock", "");
     WriteFile(runBase_ + "/sys_power/wake_unlock", "");
     WriteFile(runBase_ + "/sys_power/state", "mem\n");
     WriteFile(runBase_ + "/sys_power/wakeup_count", "0\n");
+
+    // Stage Android 14 BPF map/program descriptors for svbox --emulate-bpf
+    // (exact specs parsed from /system/etc/bpf/{gpuMem,gpuWork}.o and
+    // com.android.tethering/etc/bpf/{netd,block,clatd,dscpPolicy}.o)
+    struct BpfSpec { const char* rel; const char* meta; };
+    static const BpfSpec kAndroid14BpfSpecs[] = {
+        { "/map_gpuMem_gpu_mem_total_map",                   "bpf-map type=1 key=8 value=8 max=1024\n" },
+        { "/prog_gpuMem_tracepoint_gpu_mem_gpu_mem_total",   "bpf-prog type=5\n" },
+        { "/map_gpuWork_gpu_work_map",                       "bpf-map type=1 key=8 value=32 max=512\n" },
+        { "/map_gpuWork_gpu_work_global_data",               "bpf-map type=2 key=4 value=8 max=1\n" },
+        { "/prog_gpuWork_tracepoint_power_gpu_work_period",  "bpf-prog type=5\n" },
+        { "/netd_shared/map_netd_configuration_map",         "bpf-map type=2 key=4 value=4 max=2\n" },
+        { "/netd_shared/map_netd_cookie_tag_map",            "bpf-map type=1 key=8 value=8 max=10000\n" },
+        { "/netd_shared/map_netd_uid_counterset_map",        "bpf-map type=1 key=4 value=1 max=4000\n" },
+        { "/netd_shared/map_netd_app_uid_stats_map",         "bpf-map type=1 key=4 value=32 max=10000\n" },
+        { "/netd_shared/map_netd_stats_map_A",               "bpf-map type=1 key=16 value=32 max=5000\n" },
+        { "/netd_shared/map_netd_stats_map_B",               "bpf-map type=1 key=16 value=32 max=5000\n" },
+        { "/netd_shared/map_netd_iface_stats_map",           "bpf-map type=1 key=4 value=32 max=1000\n" },
+        { "/netd_shared/map_netd_uid_owner_map",             "bpf-map type=1 key=4 value=8 max=4000\n" },
+        { "/netd_shared/map_netd_uid_permission_map",        "bpf-map type=1 key=4 value=1 max=4000\n" },
+        { "/netd_shared/map_netd_iface_index_name_map",      "bpf-map type=1 key=4 value=16 max=1000\n" },
+        { "/netd_shared/map_netd_packet_trace_enabled_map",  "bpf-map type=2 key=4 value=1 max=1\n" },
+        { "/netd_shared/map_netd_packet_trace_ringbuf",      "bpf-map type=27 key=0 value=0 max=32768\n" },
+        { "/netd_shared/prog_netd_schedact_ingress_account", "bpf-prog type=3\n" },
+        { "/netd_shared/prog_netd_cgroupskb_egress_stats",   "bpf-prog type=8\n" },
+        { "/netd_shared/prog_netd_cgroupskb_ingress_stats",  "bpf-prog type=8\n" },
+        { "/netd_shared/prog_netd_cgroupsock_inet_create",   "bpf-prog type=9\n" },
+        { "/netd_shared/prog_netd_skfilter_allowlist_xtbpf", "bpf-prog type=1\n" },
+        { "/netd_shared/prog_netd_skfilter_denylist_xtbpf",  "bpf-prog type=1\n" },
+        { "/netd_shared/prog_netd_skfilter_egress_xtbpf",    "bpf-prog type=1\n" },
+        { "/netd_shared/prog_netd_skfilter_ingress_xtbpf",   "bpf-prog type=1\n" },
+        { "/net_shared/map_block_blocked_ports_map",         "bpf-map type=2 key=4 value=8 max=1024\n" },
+        { "/net_shared/prog_block_bind4_block_port",         "bpf-prog type=8\n" },
+        { "/net_shared/prog_block_bind6_block_port",         "bpf-prog type=8\n" },
+        { "/net_shared/map_clatd_clat_ingress6_map",         "bpf-map type=1 key=36 value=8 max=16\n" },
+        { "/net_shared/map_clatd_clat_egress4_map",          "bpf-map type=1 key=8 value=40 max=16\n" },
+        { "/net_shared/prog_clatd_schedcls_egress4_clat_rawip",  "bpf-prog type=3\n" },
+        { "/net_shared/prog_clatd_schedcls_ingress6_clat_rawip", "bpf-prog type=3\n" },
+        { "/net_shared/prog_clatd_schedcls_ingress6_clat_ether", "bpf-prog type=3\n" },
+        { "/net_shared/map_dscpPolicy_socket_policy_cache_map",  "bpf-map type=1 key=8 value=44 max=1024\n" },
+        { "/net_shared/map_dscpPolicy_ipv4_dscp_policies_map",   "bpf-map type=2 key=4 value=48 max=16\n" },
+        { "/net_shared/map_dscpPolicy_ipv6_dscp_policies_map",   "bpf-map type=2 key=4 value=48 max=16\n" },
+        { "/net_shared/prog_dscpPolicy_schedcls_set_dscp_ether", "bpf-prog type=3\n" },
+    };
+    for (const auto& sp : kAndroid14BpfSpecs) {
+        std::string p = runBase_ + "/sys_fs_bpf" + sp.rel;
+        WriteFile(p, sp.meta);
+        chmod(p.c_str(), 0644);
+    }
 
     for (const char* sub : { "", "/foreground", "/background", "/system-background", "/top-app" }) {
         const std::string base = runBase_ + "/cpuset" + sub;
@@ -1682,6 +1879,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const bool useGfx = (gpuModeSnap == "gles" || gpuModeSnap == "vulkan");
     const bool useVk = (gpuModeSnap == "vulkan");
 
+    const int32_t targetHz = refreshRate_.load();
+    const int32_t targetDpi = ComputeDpiForResolution(width, height);
     const std::string overrideProp = runBase_ + "/override.prop";
     std::string gpuProps;
     if (useGfx) {
@@ -1696,7 +1895,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "ro.boot.qemu.gltransport=pipe\n";
     } else {
         gpuProps =
-            "ro.hardware.egl=swiftshader\n"
+            "ro.hardware.egl=angle\n"
             "ro.hardware.gralloc=redroid\n"
             "ro.hardware.hwcomposer=redroid\n"
             "ro.hardware.vulkan=pastel\n"
@@ -1707,12 +1906,19 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     WriteFile(overrideProp,
         gpuProps +
-        "ro.sf.lcd_density=320\n"
+        "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
+        "ro.boot.redroid_dpi=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
         "ro.boot.redroid_width=" + std::to_string(width) + "\n"
         "ro.boot.redroid_height=" + std::to_string(height) + "\n"
-        "ro.boot.redroid_fps=60\n"
+        "ro.boot.redroid_fps=" + std::to_string(targetHz) + "\n"
+        "ro.surface_flinger.use_content_detection_for_refresh_rate=false\n"
+        "ro.surface_flinger.set_idle_timer_ms=0\n"
+        "ro.surface_flinger.set_touch_timer_ms=0\n"
+        "ro.surface_flinger.set_display_power_timer_ms=0\n"
+        "ro.zygote.disable_gl_preload=true\n"
+        "log.tag.Scheduler=F\n"
         "net.dns1=223.5.5.5\n"
         "net.dns2=8.8.8.8\n"
         "bpf.progs_loaded=1\n"
@@ -1756,28 +1962,27 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             " mode=" + mode + " gpu=" + gpuModeSnap +
             " svbox=" + svboxPath_ + " binderd=" + binderd + " rootfs=" + rootfs_ +
             " gpuGuest=" + gpuGuestDir_ + " shareHost=" + shareHostDir_);
-    const std::string rootfsTar = androidDir_ + "/rootfs.tar";
-    if (!FileExists(rootfs_ + "/.imported_v2") && FileExists(rootfsTar)) {
-        logLine("Importing Android 11 rootfs into sandbox from " + rootfsTar + " ...");
-        SetStatus("Importing Android 11 rootfs into sandbox (0%)...");
+    const std::string rootfsTar = androidDir_ + "/rootfs14.tar";
+    if (!FileExists(rootfs_ + "/.imported_a14_v2") && FileExists(rootfsTar)) {
+        logLine("Importing Android 14 rootfs into sandbox from " + rootfsTar + " ...");
+        SetStatus("Importing Android 14 rootfs into sandbox (0%)...");
         std::string errMsg, diagMsg;
         bool ok = ExtractTarToDir(
             rootfsTar, rootfs_, running_,
             [&](int pct) {
-                SetStatus("Importing Android 11 rootfs into sandbox (" + std::to_string(pct) + "%)...");
+                SetStatus("Importing Android 14 rootfs into sandbox (" + std::to_string(pct) + "%)...");
             },
             errMsg, diagMsg);
         if (!ok) {
-            logLine("Rootfs import failed: " + errMsg);
-            SetStatus("Rootfs import failed: " + errMsg);
+            logLine("Rootfs14 import failed: " + errMsg);
+            SetStatus("Rootfs14 import failed: " + errMsg);
             running_.store(false);
             return;
         }
-        WriteFile(rootfs_ + "/.imported_v2", "ok\n");
-        logLine("Rootfs import complete -> " + rootfs_ + " (" + diagMsg + ")");
+        WriteFile(rootfs_ + "/.imported_a14_v2", "ok\n");
+        logLine("Rootfs14 import complete -> " + rootfs_ + " (" + diagMsg + ")");
     }
-    // One-time cleanup of stale injected files left in sandbox rootfs by pre-Step-5 builds.
-    // Afterwards rootfs_ is treated as strictly read-only and never modified again.
+
     static const char* kGuestGpuLibs[] = {
         "libandroidemu.so",
         "libOpenglCodecCommon.so",
@@ -1794,62 +1999,22 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "hw/hwcomposer.ranchu.so",
         "hw/vulkan.ranchu.so",
     };
-    const std::string cleanMarker = sandboxFiles_ + "/.rootfs_clean_v1";
-    if (!FileExists(cleanMarker)) {
-        int removed = 0;
-        for (const char* rel : kGuestGpuLibs) {
-            if (unlink((rootfs_ + "/vendor/lib64/" + rel).c_str()) == 0) ++removed;
-        }
-        if (unlink((rootfs_ + "/vendor/bin/hw/svbox-audio-service").c_str()) == 0) ++removed;
-        if (unlink((rootfs_ + "/system/bin/svbox-cameraserver").c_str()) == 0) ++removed;
-        WriteFile(cleanMarker, "cleaned=" + std::to_string(removed) + "\n");
-        logLine("One-time rootfs cleanup removed " + std::to_string(removed) + " legacy injected files");
-    }
-    // Android 11 Bionic linker64 rejects group/world-writable ld.config.txt (mode & 0022).
-    // Only fix permissions if actually group/world-writable so normal boots do zero writes to rootfs_.
-    auto ensureNotGroupWorldWritable = [](const std::string& p, mode_t targetMode) {
-        struct stat st = {};
-        if (stat(p.c_str(), &st) == 0 && (st.st_mode & 0022) != 0) {
-            chmod(p.c_str(), targetMode);
-        }
-    };
-    ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig", 0755);
-    ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/ld.config.txt", 0644);
-    for (const char* sub : { "com.android.adbd", "com.android.art", "com.android.conscrypt",
-                             "com.android.media.swcodec", "com.android.os.statsd",
-                             "com.android.runtime", "com.android.sdkext" }) {
-        ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/" + sub, 0755);
-        ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/" + sub + "/ld.config.txt", 0644);
-    }
-    {
-        struct stat st1 = {}, st2 = {};
-        int r1 = stat((rootfs_ + "/linkerconfig/ld.config.txt").c_str(), &st1);
-        int r2 = stat((rootfs_ + "/system/apex/com.android.os.statsd/lib64/libstatssocket.so").c_str(), &st2);
-        logLine("ld.config stat=" + std::to_string(r1) + " size=" + std::to_string(st1.st_size) +
-                " mode=" + std::to_string(st1.st_mode) +
-                " | statsd stat=" + std::to_string(r2) + " size=" + std::to_string(st2.st_size));
-    }
-    {
-        char lbuf[256] = {};
-        ssize_t lr = readlink((rootfs_ + "/system/bin/linker64").c_str(), lbuf, sizeof(lbuf) - 1);
-        int lerr = errno;
-        struct stat lst = {};
-        int sr = lstat((rootfs_ + "/system/bin/linker64").c_str(), &lst);
-        int serr = errno;
-        logLine("linker64 probe: readlink=" + std::to_string(lr) + " (err=" + std::to_string(lerr) +
-                " val=" + std::string(lr > 0 ? lbuf : "") + ") lstat=" + std::to_string(sr) +
-                " (err=" + std::to_string(serr) + " mode=" + std::to_string(lst.st_mode) + ")");
-    }
+
+    // Generate ephemeral /apex/apex-info-list.xml for Android 14 linkerconfig & apexd consumers
+    WriteApexInfoListXml(rootfs_ + "/system/apex", runBase_ + "/apex-info-list.xml");
 
     SetStatus("Starting propd & binder daemons...");
 
-    // 1. Start propd
+    // 1. Start propd (load all Android 14 partition build.props + override.prop)
     std::vector<std::string> propArgs = { propd, "--dir", propDir, "--sock", sockDir + "/property_service" };
     for (const std::string& pf : { rootfs_ + "/system/etc/prop.default",
                                    rootfs_ + "/default.prop",
                                    rootfs_ + "/system/build.prop",
+                                   rootfs_ + "/system/system_ext/etc/build.prop",
+                                   rootfs_ + "/system/product/etc/build.prop",
                                    rootfs_ + "/vendor/build.prop",
                                    rootfs_ + "/vendor/default.prop",
+                                   rootfs_ + "/vendor/odm/etc/build.prop",
                                    overrideProp }) {
         if (FileExists(pf)) propArgs.push_back(pf);
     }
@@ -1913,20 +2078,6 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 chmod(dst.c_str(), 0644);
             }
         }
-        if (!audioSvcPath_.empty() && FileExists(audioSvcPath_)) {
-            MkdirP(injectLayer_ + "/vendor/bin/hw");
-            const std::string dst1 = injectLayer_ + "/vendor/bin/hw/svbox-audio-service";
-            const std::string dst2 = injectLayer_ + "/vendor/bin/hw/android.hardware.audio.service";
-            if (CopyRegularFile(audioSvcPath_, dst1)) chmod(dst1.c_str(), 0755);
-            if (CopyRegularFile(audioSvcPath_, dst2)) chmod(dst2.c_str(), 0755);
-        }
-        if (!cameraSvcPath_.empty() && FileExists(cameraSvcPath_)) {
-            MkdirP(injectLayer_ + "/system/bin");
-            const std::string dst = injectLayer_ + "/system/bin/svbox-cameraserver";
-            if (CopyRegularFile(cameraSvcPath_, dst)) {
-                chmod(dst.c_str(), 0755);
-            }
-        }
         int gpuCopied = 0;
         if (useGfx) {
             if (gpuGuestDir_.empty()) {
@@ -1972,6 +2123,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         if (winSnap) {
             GfxstreamBridge::Instance().SetWindow(winSnap, winWSnap, winHSnap);
         }
+        GfxstreamBridge::Instance().SetRefreshRate(targetHz);
         const SvboxGfxMode gfxMode = useVk ? SVBOX_GFX_MODE_VULKAN : SVBOX_GFX_MODE_GLES;
         if (!GfxstreamBridge::Instance().Start(ipcDir + "/gfxstream.sock", width, height, gfxMode)) {
             const std::string err = GfxstreamBridge::Instance().LastError();
@@ -1981,7 +2133,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             return;
         }
         logLine("GfxstreamBridge started: " + GfxstreamBridge::Instance().RendererName() +
-                " (mode=" + gpuModeSnap + ")");
+                " (mode=" + gpuModeSnap + ", " + std::to_string(width) + "x" + std::to_string(height) +
+                "@" + std::to_string(targetHz) + "Hz)");
     } else {
         GfxstreamBridge::Instance().ClearWindow();
         if (winSnap) {
@@ -2005,6 +2158,25 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         return Spawn(args, nullStdio, nullStdio ? "" : (logDir + "/" + tag + ".log"), keepFds);
     };
 
+    // 2.5 Generate Android 14 /linkerconfig/ld.config.txt into ephemeral runBase_/linkerconfig
+    {
+        SetStatus("Generating Android 14 linkerconfig...");
+        pid_t lcPid = runSvbox("linkerconfig",
+                               { "apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig" });
+        if (lcPid > 0) {
+            int st = 0;
+            waitpid(lcPid, &st, 0);
+        }
+        const std::string lcDir = runBase_ + "/linkerconfig";
+        const std::string lcFile = lcDir + "/ld.config.txt";
+        chmod(lcDir.c_str(), 0755);
+        chmod(lcFile.c_str(), 0644);
+        struct stat lcSt = {};
+        int r = stat(lcFile.c_str(), &lcSt);
+        logLine("Android 14 linkerconfig generated: stat=" + std::to_string(r) +
+                " size=" + std::to_string(lcSt.st_size) + " mode=" + std::to_string(lcSt.st_mode));
+    }
+
     SetStatus("Starting servicemanager & graphics HALs...");
     runSvbox("servicemanager", { "system/bin/servicemanager" });
     if (!SleepCancelableMs(80)) return;
@@ -2014,13 +2186,13 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const std::string sfLdPath =
         "LD_LIBRARY_PATH=/system/lib64:/system_ext/lib64:/product/lib64:"
         "/vendor/lib64:/vendor/lib64/egl:/vendor/lib64/hw:"
-        "/apex/com.android.vndk.v30/lib64:/apex/com.android.vndk.current/lib64:"
+        "/apex/com.android.vndk.v34/lib64:/apex/com.android.vndk.current/lib64:"
         "/apex/com.android.art/lib64:/apex/com.android.adbd/lib64:"
         "/apex/com.android.runtime/lib64:/apex/com.android.runtime/lib64/bionic:"
         "/apex/com.android.os.statsd/lib64:/apex/com.android.conscrypt/lib64:"
         "/apex/com.android.i18n/lib64:/apex/com.android.media/lib64:"
         "/apex/com.android.media.swcodec/lib64:/apex/com.android.neuralnetworks/lib64:"
-        "/apex/com.android.resolv/lib64";
+        "/apex/com.android.resolv/lib64:/apex/com.android.tethering/lib64";
 
     // 4. Graphics HALs
     runSvbox("hidl_alloc", { "-e", sfLdPath, "system/bin/hw/android.hidl.allocator@1.0-service" });
@@ -2036,7 +2208,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     if (!running_.load()) return;
 
     // 5. SurfaceFlinger
-    SetStatus("Starting SurfaceFlinger (" + gpuModeSnap + ")...");
+    SetStatus("Starting SurfaceFlinger (" + gpuModeSnap + " · " +
+              std::to_string(width) + "x" + std::to_string(height) + "@" +
+              std::to_string(targetHz) + "Hz)...");
     runSvbox("surfaceflinger", { "-e", sfLdPath, "system/bin/surfaceflinger" });
     if (useGfx) {
         WaitForConditionMs(3000, []() { return GfxstreamBridge::Instance().IsConnected(); });
@@ -2046,15 +2220,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     if (!running_.load()) return;
 
     if (mode == "bootanim") {
-        SetStatus("Running Android 11 BootAnimation -> XComponent (Async VSync)");
+        SetStatus("Running Android 14 BootAnimation -> XComponent");
         runSvbox("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
     } else {
-        SetStatus("Starting Android 11 services + Zygote64...");
+        SetStatus("Starting Android 14 services + Zygote64...");
         lmkdThread_ = std::thread(&AndroidRuntime::LmkdLoop, this, sockDir + "/lmkd");
-        // Keep /dev/socket/mdns listening so SystemServer's NsdService.awaitConnection() unblocks
-        // immediately on connect(). Do NOT create an unserved /dev/socket/fwmarkd: Android Bionic
-        // libnetd_client.so connects to fwmarkd on accept4()/socket() and blocks forever in
-        // recvfrom() if nothing answers (hanging adbd and any guest TCP server).
         int dnsFd = MakeListenUnix(sockDir + "/dnsproxyd");
         int mdnsFd = MakeListenUnix(sockDir + "/mdns");
         {
@@ -2069,7 +2239,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             dnsThread_ = std::thread(&AndroidRuntime::DnsProxyLoop, this, dnsFd);
         }
         const bool useRealAudio = !audioHalPath_.empty() && FileExists(audioHalPath_) &&
-                                  !audioSvcPath_.empty() && FileExists(audioSvcPath_);
+                                  FileExists(rootfs_ + "/vendor/bin/hw/android.hardware.audio.service");
         if (FileExists(netd)) {
             std::vector<std::string> netdArgs = { netd, sockDir + "/binder.sock" };
             if (!netSockPath_.empty()) {
@@ -2089,25 +2259,19 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             SleepCancelableMs(25);
         };
         if (useRealAudio) {
-            launchPaced("audio_hal", { "-e", sfLdPath, "vendor/bin/hw/svbox-audio-service" });
+            launchPaced("audio_hal", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.audio.service" });
             SleepCancelableMs(150);
             launchPaced("audioserver", { "-e", sfLdPath, "system/bin/audioserver" });
         }
-        if (!cameraSvcPath_.empty() && FileExists(cameraSvcPath_)) {
-            launchPaced("cameraserver", { "-e", sfLdPath, "system/bin/svbox-cameraserver" });
+        if (FileExists(rootfs_ + "/system/bin/cameraserver")) {
+            launchPaced("cameraserver", { "-e", sfLdPath, "system/bin/cameraserver" });
         }
-        // HarmonyOS PC enforces W^X (denies anonymous PROT_EXEC for unsigned HAPs),
-        // so configure Chromium WebView V8 to run --jitless instead of crashing on CodeRange mmap.
         {
             const std::string wvFlags = dataBase_ + "/data/local/tmp/webview-command-line";
             WriteFile(wvFlags, "_ --js-flags=--jitless\n");
             chmod(wvFlags.c_str(), 0644);
         }
-        // Native Android 11 64-bit adbd on TCP 127.0.0.1:5555 (also serves @jdwp-control
-        // before zygote64 starts so apps/system_server never spam JDWP connect errors).
-        // Exec via sh with an absolute path so Bionic linker64 matches
-        // /linkerconfig/com.android.adbd/ld.config.txt (dir.com.android.adbd = /apex/com.android.adbd/bin)
-        // cleanly without polluting LD_LIBRARY_PATH for child adb shell commands.
+        // Native Android 14 64-bit adbd on TCP 127.0.0.1:5555
         if (FileExists(rootfs_ + "/system/apex/com.android.adbd/bin/adbd")) {
             int adbdFd = MakeListenUnix(sockDir + "/adbd", SOCK_SEQPACKET, 0666);
             if (adbdFd >= 0) {
@@ -2127,12 +2291,20 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                      adbdFd >= 0 ? std::vector<int>{ adbdFd } : std::vector<int>{});
             SleepCancelableMs(80);
         }
+        // Android 14 ART Service daemon (artd) for PackageManager / dexopt / pm install
+        if (FileExists(rootfs_ + "/system/apex/com.android.art/bin/artd")) {
+            launchPaced("artd", { "-e", sfLdPath, "apex/com.android.art/bin/artd" });
+        }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
-        launchPaced("keystore", { "-e", sfLdPath, "system/bin/keystore", "/data/misc/keystore" });
-        // Launch vold without /storage/* sub-mounts in its /proc/mounts view so vold's
-        // startup unmountAll() does not waste 5s/mount trying to ForceUnmount them.
+        if (FileExists(rootfs_ + "/system/bin/keystore2")) {
+            launchPaced("keystore2", { "-e", sfLdPath, "system/bin/keystore2", "/data/misc/keystore" });
+        }
+        if (FileExists(rootfs_ + "/system/bin/credstore")) {
+            launchPaced("credstore", { "-e", sfLdPath, "system/bin/credstore", "/data/misc/credstore" });
+        }
+        // Launch vold without /storage/* sub-mounts in its /proc/mounts view
         {
             auto voldArgs = BaseSvboxArgs(/*includeStorageSubmounts=*/false);
             const std::vector<std::string> voldCmd = {
@@ -2146,16 +2318,16 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             Spawn(voldArgs, false, logDir + "/vold.log");
             SleepCancelableMs(25);
         }
-        launchPaced("suspend", { "-e", sfLdPath, "system/bin/hw/android.system.suspend@1.0-service" });
-        launchPaced("power_stats", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.power.stats@1.0-service.mock" });
+        // Note: android.system.suspend.ISystemSuspend/default is served by svbox-netd
+        // (avoids Scudo double-free in stock android.system.suspend-service on virtual /sys/power).
         launchPaced("power", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.power-service.example" });
-        launchPaced("health", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.health@2.1-service" });
+        launchPaced("health", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.health-service.example" });
         launchPaced("gatekeeper", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.gatekeeper@1.0-service.software" });
         launchPaced("gatekeeperd", { "-e", sfLdPath, "system/bin/gatekeeperd", "/data/misc/gatekeeper" });
-        launchPaced("keymaster", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.keymaster@3.0-service" });
-        launchPaced("sensors", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.sensors@2.1-service.mock" });
-        launchPaced("gnss", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.gnss@2.1-service" });
-        launchPaced("wifi", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.wifi@1.0-service" });
+        launchPaced("keymaster", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.keymaster@4.1-service" });
+        if (FileExists(rootfs_ + "/vendor/bin/hw/android.hardware.thermal@2.0-service.mock")) {
+            launchPaced("thermal", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.thermal@2.0-service.mock" });
+        }
         launchPaced("bt", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim" });
         launchPaced("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
         if (!SleepCancelableMs(100)) return;
@@ -2176,7 +2348,24 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "--zygote", "--start-system-server", "--socket-name=zygote"
         };
         runSvbox("zygote64", zygCmd, true, { zfd, ufd });
-        SetStatus("Booting Full Android 11 (Zygote64 -> system_server -> Launcher3)...");
+        SetStatus("Booting Full Android 14 (" + std::to_string(width) + "x" + std::to_string(height) +
+                  "@" + std::to_string(targetHz) + "Hz · Zygote64 -> system_server -> Launcher3)...");
+        // Once Android 14 finishes boot, lock DisplayModeDirector + SurfaceFlinger to targetHz
+        // (DisplayModeDirector otherwise defaults to 60Hz regardless of HWC activeConfig).
+        if (targetHz != 60) {
+            std::thread([this, targetHz]() {
+                for (int i = 0; i < 60 && running_.load(); ++i) {
+                    if (!SleepCancelableMs(500)) return;
+                    if (i >= 18) {
+                        int32_t curHz = refreshRate_.load();
+                        if (curHz == targetHz) {
+                            SetRefreshRate(curHz);
+                        }
+                        break;
+                    }
+                }
+            }).detach();
+        }
     }
 
     size_t procCount = 0;

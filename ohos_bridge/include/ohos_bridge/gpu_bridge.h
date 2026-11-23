@@ -27,6 +27,7 @@ public:
     void SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH);
     void ClearWindow();
     void SetVisible(bool visible);
+    void SetRefreshRate(int32_t hz);
 
     bool IsActive() const { return active_.load(); }
     bool IsConnected() const;
@@ -48,6 +49,7 @@ private:
     void (*fnClearWindow_)(void) = nullptr;
     void (*fnRepaint_)(void) = nullptr;
     void (*fnSetVisible_)(int) = nullptr;
+    void (*fnSetVsyncHz_)(int32_t) = nullptr;
     void (*fnStop_)(void) = nullptr;
     void (*fnGetStats_)(SvboxGfxStats*) = nullptr;
 
@@ -57,5 +59,6 @@ private:
     int32_t pendingH_ = 0;
     int32_t fbW_ = 720;
     int32_t fbH_ = 1280;
+    int32_t targetHz_ = 60;
     std::string lastError_;
 };

@@ -616,6 +616,54 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 * **Alpine 3.21.3 ARM64 真机端到端验收**：原版只读 rootfs 正常启动，`/dev/input/event2`、`/dev/bus/usb/001/002`、`/dev/ttyUSB0`、`/ipc/fb.sock`、`eth0`/`lo` 全通。
 * **Android 11 真机验收（重编打包 HNP+HAP 安装实测）**：Vulkan 模式稳定进桌面，`SurfaceFlinger` 60Hz 正常，`eth0` `VALIDATED (Score 70)`，触控/键盘/手柄全在线；3 轮 `pm install` 耗时由 Step 6.5 的 `0.26–0.29s` 进一步降至 **`0.188–0.220s`（中位数 `0.200s`，↑ ~30%）**，`rootfs/` 保持 0 字节改动。
 
+---
+
+### 十一、Android 14 (`API 34`) 迁移、60 / 90 / 120Hz 高刷切换与常用固定分辨率预设（2026-11-24）
+
+#### A. 架构边界与分层改动
+
+1. **Layer 1 `svbox`（`feat/vdev-binder`，零 Android/OHOS 专用代码，26/26 全量回归通过）**
+   * **标准 Linux `O_PATH` `fchmod`/`fchown` 语义（`src/payload/logic/vfs_ops.c`）**：对 `O_PATH` 文件描述符执行 `fchmod`/`fchown` 返回 `-EBADF`，修复 `fchmodat(..., AT_SYMLINK_NOFOLLOW)` 回退路径，使 Android 14 `linkerconfig` 正常退出 0。
+   * **通用用户态 `bpf(2)` 仿真（`--emulate-bpf`，`bpf_emu.{h,c}` / `dispatch.c` / `options.c` / `test/vfs/test_bpf_emu.py`）**：支持 `BPF_MAP_CREATE`、`BPF_OBJ_PIN`、`BPF_OBJ_GET`、`BPF_OBJ_GET_INFO_BY_FD`、`BPF_MAP_{LOOKUP,UPDATE,DELETE}_ELEM`、`BPF_MAP_GET_NEXT_KEY`、`BPF_PROG_{ATTACH,DETACH}`（容量 `128` maps / `256` fds，栈路径缓冲收敛至 2 KiB）。
+   * **虚拟 POSIX DAC 校验（`owners_check_access()`，`container_state.{h,c}` + `vfs_ops.c` `faccessat`/`faccessat2`）**：对 `W_OK` 及 `owner.db` 记录项严格按虚拟 POSIX 权限判定（满足 Android 14 只读 DEX 安全校验），对未记录项在宿主机剥离 `other` 权限位的挂载（如 `hmdfs` `0660`/`02771`）上保留属主可读/可执行可见性，修复 `SystemConfig` 读取 `/vendor/etc/permissions/*.xml` 失败。
+   * **标准 Linux `AF_NETLINK` 补齐（`net_stack.c` + `tools/net/svbox_net.c`）**：在虚拟 `AF_NETLINK` socket 上实现 `__NR_connect` 与 `__NR_getpeername`；在 `svbox-net` 地址增删时向 `RTMGRP_IPV4_IFADDR`/`RTMGRP_IPV6_IFADDR` 组播 `RTM_NEWADDR`/`RTM_DELADDR`，并补齐标准 Linux `IFA_CACHEINFO (6)` 与 `IFA_FLAGS (8)` 属性，彻底修复 Android 14 `NetlinkMonitor` / `IpClient` `connect failed: EINVAL` 与 `unparsable netlink msg`。
+
+2. **Layer 2 `ohos_bridge/` 与 `libgfxstream_host.so`**
+   * `gpu/ohos_host/svbox_gfxstream_capi.{h,cpp}`：`setAvdInfo(true, 34)`，新增 `svbox_gfx_set_vsync_hz(int hz)` 动态同步宿主渲染器 VSync 周期。
+   * `ohos_bridge/{include/ohos_bridge/gpu_bridge.h,src/gpu_bridge.cpp}`：暴露 `GfxstreamBridge::SetRefreshRate(int hz)`，重编并更新 `hap/entry/libs/arm64-v8a/libgfxstream_host.so`。
+
+3. **Layer 3 `svbox-Android`（Android 14 兼容层 + 高刷与分辨率控制）**
+   * **只读 Android 14 根文件系统**：`rootfs14/` 从 `redroid14-arm64.tar.gz` 解包并严格只读（0 字节改动）；HAP 内置导入镜像 `rootfs14.tar` 直接由 `gzip -dc` 解压重打，确保全量 POSIX 权限为纯净 `0755`/`0644`（导入标记 `.imported_a14_v2`）。
+   * **`propd/svbox_propd.c`**：单属性区扩容至 `1024 KiB`，满足 Android 14 更大属性空间。
+   * **`netd/svbox_netd.c`**：升级至 Android 14 `INetd=12` / `IDnsResolver=9` 接口版本、哈希与事务码；新增 `android.system.suspend.ISystemSuspend/default`（显式写入 `@VintfStability` 标记 `0x3f`、`version=1`）+ `IWakeLock` 及 `suspend_control{,_internal}` AIDL 桩，彻底消除原版 `android.system.suspend-service` 的 Scudo double-free 崩溃与 `PowerManagerService` 阻塞。
+   * **`gpu/android_guest/hwcomposer_ranchu.cpp`**：HWC2 暴露 3 档刷新率配置（`config 0 = 60Hz`、`1 = 90Hz`、`2 = 120Hz`），支持运行时 `setActiveConfig()` 原子切换 `vsyncPeriodNs_` 并唤醒 VSync 线程，同时动态读取 `ro.boot.redroid_dpi`/`ro.sf.lcd_density` 上报 DPI。
+   * **`hap/entry/src/main/cpp/android_runtime.{h,cpp}`**：
+     * 完整迁至 Android 14（`rootfs14`/`userdata14`、`5.15.0-android14`、`--emulate-bpf`、A14 ClassPath、`apex-info-list.xml`、`linkerconfig`、静态 `eth0`、64 位 `audio.service`/`cameraserver`/`keystore2`/`credstore`/`artd`）。
+     * 在 `kAndroid14BpfSpecs` 中补全 `map_gpuMem_gpu_mem_total_map`、`prog_gpuMem_*`、`map_gpuWork_*`、`prog_gpuWork_*` 与 `netd_shared` 描述符，根治 `system_server` 在 `libmeminfo.so` (`BpfMapRO::abortOnMismatch`) 中的静默 `SIGABRT`。
+     * 新增 `ComputeDpiForResolution()`、热切换 `SetRefreshRate(hz)`（联动 `hwcomposer` + `GfxstreamBridge` + Android `DisplayModeDirector` `peak_refresh_rate`/`min_refresh_rate`）及非 60Hz 启动后的刷新率自动同步。
+   * **HAP 交互层（`napi_init.cpp` / `Index.d.ts` / `EntryAbility.ets` / `Index.ets`）**：接入 `OH_NativeXComponent_SetExpectedFrameRateRange`，新增工具栏 `60Hz / 90Hz / 120Hz` 实时热切换按钮、5 组常用固定分辨率预设菜单（竖屏 `720×1280@320dpi`、`1080×1920@420dpi`；横屏 `1280×720@240dpi`、`1600×900@280dpi`、`1920×1080@320dpi`）与等比居中视口自适应，以及 `Want` 参数（`resolution`、`refreshRate`、`setRefreshRate`）。
+
+#### B. 关键排障根因速记
+
+| 现象 | 根因 | 修复 |
+| :--- | :--- | :--- |
+| `system_server` 启动后在 `libmeminfo.so` 无日志 `SIGABRT` | `ReadProcessGpuUsageKb()` 构造 `BpfMapRO("/sys/fs/bpf/map_gpuMem_gpu_mem_total_map")`，缺失时 `abortOnMismatch()` 直接调用 `abort()` | 在 `kAndroid14BpfSpecs` 预置 GPU BPF map/prog，验证 `dumpsys meminfo -s` 退出 0 且 `system_server` 0 崩溃 |
+| `PowerManagerService` 阻塞或 `system_server` `SIGSEGV (0x4)` | 原版 `android.system.suspend-service` 触发 Scudo double-free；初版桩对象未带 `VINTF (0x3f)` 稳定性标记 | 在 `svbox-netd` 中以 `p_binder_stab(..., 0x3f)` 托管 `ISystemSuspend/default` 与 `IWakeLock` |
+| `SystemConfig` 无法读 `/vendor/etc/permissions`，`EthernetService` 未启动 | 宿主机 `hmdfs` 剥离 `other` 权限位（`02771`/`0660`）且 `owners_check_access()` 仅判 `fmode & 7` | Layer 1 `owners_check_access()` 保留未记录文件属主读/执行位 + `rootfs14.tar` 直接由 `gzip -dc` 重打为 `0755`/`0644` |
+| `IpClient/eth0` 报 `connect failed: EINVAL` 及 `unparsable netlink msg` | 虚拟 `AF_NETLINK` 缺 `connect()` 处理；`RTM_NEWADDR` 未广播且缺 `IFA_CACHEINFO (6)`/`IFA_FLAGS (8)` | Layer 1 `net_stack.c` 补 `AF_NETLINK` `connect`/`getpeername`；`svbox_net.c` 组播 `RTM_NEWADDR` 并附标准 `IFA_CACHEINFO`/`IFA_FLAGS` |
+
+#### C. `HAD-W32` 真机端到端验收结果
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **Android 14 启动与稳定性** | `ro.build.version.release=14`、`ro.build.version.sdk=34`，`sys.boot_completed=1`（~15–20s），**`svcs=229`**，`system_server` 0 次 Fatal、`dumpsys meminfo -s` 退出 0 |
+| **Maleoon 916 Vulkan GPU 渲染** | `GLES: Google (HUAWEI), Android Emulator OpenGL ES Translator (Maleoon 916), OpenGL ES 3.1 (OpenGL ES 3.2 B312)`，`vk=1`；竖屏/横屏抓图目视 QuickstepLauncher 清晰无花屏 |
+| **60 / 90 / 120Hz 热切换** | 运行时依次切换 `60Hz → 90Hz → 120Hz`：`hwcomposer_ranchu` 实时打印 `setActiveConfig config=0 (16666666 ns)` → `config=1 (11111111 ns)` → `config=2 (8333333 ns)`，`dumpsys display` `activeMode` 精准命中 `60.00 Hz` / `90.00 Hz` / `120.00 Hz` |
+| **5 组常用固定分辨率预设** | 全部实测启动并校验 `wm size` / `wm density`：`720×1280@320dpi`、`1080×1920@420dpi`、`1280×720@240dpi`、`1600×900@280dpi`、`1920×1080@320dpi` 均 100% 匹配并支持高刷 |
+| **网络 / 音频 / APK 安装** | `Active default network: 100`（`Ethernet CONNECTED`, `eth0 10.0.2.15/24`, `DNS 223.5.5.5, 8.8.8.8`），`ping -c 1 223.5.5.5` `0% packet loss`；`media.audio_flinger` 在线；`pm install` / `am start` / `pm uninstall` 全通 |
+| **Layer 1 回归 & HAP 打包安装** | `svbox` 全量回归 **26/26 PASS**，Layer 1 零 Android/OHOS 词条纯净度通过；`hvigorw assembleHap` + `pack_hnp.py` + `hda install` 全部成功安装至 `HAD-W32`（`org.svbox.android`）；`rootfs/` 与 `rootfs14/` 均 0 字节改动 |
+
+
 
 
 

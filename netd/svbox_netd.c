@@ -39,6 +39,10 @@
 #define NODE_AUDIO_POLICY       0x1004ull
 #define NODE_AUDIO_FLINGER      0x1005ull
 #define NODE_MEDIA_METRICS      0x1006ull
+#define NODE_SYSTEM_SUSPEND     0x1007ull
+#define NODE_WAKELOCK           0x1008ull
+#define NODE_SUSPEND_CTRL       0x1009ull
+#define NODE_SUSPEND_CTRL_INT   0x100aull
 
 /* Android 11 INetd transaction codes (verified from services.jar) */
 #define TX_IS_ALIVE                       1u
@@ -70,9 +74,15 @@
 #define TX_INTERFACE_SET_MTU              86u
 #define TX_REGISTER_UNSOL_LISTENER        90u
 #define TX_GET_OEM_NETD                   94u
+#define TX_GET_FWMARK_FOR_NETWORK         96u
 #define TX_NETWORK_ADD_ROUTE_PARCEL       97u
 #define TX_NETWORK_UPDATE_ROUTE_PARCEL    98u
 #define TX_NETWORK_REMOVE_ROUTE_PARCEL    99u
+/* Android 12/13/14 INetd transaction codes (verified from service-connectivity.jar) */
+#define TX_NETWORK_CREATE                 105u
+#define TX_NETWORK_ADD_UID_RANGES_PARCEL  106u
+#define TX_NETWORK_REMOVE_UID_RANGES_PARCEL 107u
+#define TX_SET_NETWORK_ALLOWLIST          109u
 
 /* Android 11 IDnsResolver transaction codes */
 #define DNS_TX_IS_ALIVE                   1u
@@ -567,7 +577,7 @@ static void p_iface_token(struct parcel *p, const char *iface)
     p_str16(p, iface);
 }
 
-static void p_binder(struct parcel *p, uint64_t node_ptr, uint64_t cookie)
+static void p_binder_stab(struct parcel *p, uint64_t node_ptr, uint64_t cookie, int32_t stability)
 {
     p->offs[p->noffs++] = p->len;
     struct sv_flat_binder_object obj;
@@ -578,7 +588,13 @@ static void p_binder(struct parcel *p, uint64_t node_ptr, uint64_t cookie)
     obj.cookie = cookie;
     memcpy(p->buf + p->len, &obj, sizeof(obj));
     p->len += sizeof(obj);
-    p_i32(p, 0x0c); /* Android 11 Stability::SYSTEM */
+    p_i32(p, stability);
+}
+
+static void p_binder(struct parcel *p, uint64_t node_ptr, uint64_t cookie)
+{
+    p_binder_stab(p, node_ptr, cookie,
+                  (node_ptr == NODE_SYSTEM_SUSPEND || node_ptr == NODE_WAKELOCK) ? 0x3f : 0x0c);
 }
 
 struct preader {
@@ -856,13 +872,34 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         else if (node == NODE_AUDIO_POLICY) p_str16(&reply, "android.media.IAudioPolicyService");
         else if (node == NODE_AUDIO_FLINGER) p_str16(&reply, "android.media.IAudioFlinger");
         else if (node == NODE_MEDIA_METRICS) p_str16(&reply, "android.media.IMediaMetricsService");
+        else if (node == NODE_SYSTEM_SUSPEND) p_str16(&reply, "android.system.suspend.ISystemSuspend");
+        else if (node == NODE_WAKELOCK) p_str16(&reply, "android.system.suspend.IWakeLock");
+        else if (node == NODE_SUSPEND_CTRL) p_str16(&reply, "android.system.suspend.ISuspendControlService");
+        else if (node == NODE_SUSPEND_CTRL_INT) p_str16(&reply, "android.system.suspend.internal.ISuspendControlServiceInternal");
         else p_str16(&reply, "android.net.INetd");
     } else if (code == GET_INTERFACE_VERSION) {
         p_i32(&reply, 0);
-        p_i32(&reply, node == NODE_DNSRESOLVER ? 6 : (node == NODE_OEMNETD ? 1 : 4));
+        p_i32(&reply, node == NODE_DNSRESOLVER ? 9 :
+                      ((node == NODE_OEMNETD || node == NODE_SYSTEM_SUSPEND || node == NODE_WAKELOCK ||
+                        node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT) ? 1 : 12));
     } else if (code == GET_INTERFACE_HASH) {
         p_i32(&reply, 0);
-        p_str16(&reply, "");
+        if (node == NODE_DNSRESOLVER)
+            p_str16(&reply, "8e27594d285ca7c567d87e8cf74766c27647e02b");
+        else if (node == NODE_NETD)
+            p_str16(&reply, "df6b978ed394ebbb7970a8d4110e4b29c9b8736b");
+        else if (node == NODE_SYSTEM_SUSPEND || node == NODE_WAKELOCK)
+            p_str16(&reply, "082a58c2505b703702f34ab8abcb1d1b5e890be4");
+        else
+            p_str16(&reply, "");
+    } else if (node == NODE_SYSTEM_SUSPEND) {
+        p_i32(&reply, 0);
+        if (code == 1u) { /* acquireWakeLock */
+            p_binder_stab(&reply, NODE_WAKELOCK, NODE_WAKELOCK, 0x3f);
+        }
+    } else if (node == NODE_WAKELOCK || node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT) {
+        p_i32(&reply, 0);
+        p_i32(&reply, 0);
     } else if (node == NODE_AUDIO_POLICY || node == NODE_AUDIO_FLINGER || node == NODE_MEDIA_METRICS) {
         p_i32(&reply, 0); p_i32(&reply, 0); p_i32(&reply, 0); p_i32(&reply, 0);
     } else if (node == NODE_NETD) {
@@ -1150,6 +1187,78 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
                 }
             }
             p_i32(&reply, 0);
+        } else if (code == TX_NETWORK_CREATE) {
+            /* Android 12-14 NativeNetworkConfig parcel:
+             * non_null, psize, netId, networkType(0=PHYS,1=VIRTUAL,2=PHYS_LOCAL), permission, secure, vpnType, excludeLocalRoutes */
+            if (pr.buf && pr_skip_iface_token(&pr) == 0) {
+                int32_t non_null = 0, psz = 0, nid = 0, ntype = 0;
+                if (pr_i32(&pr, &non_null) == 0 && non_null &&
+                    pr_i32(&pr, &psz) == 0 &&
+                    pr_i32(&pr, &nid) == 0 &&
+                    pr_i32(&pr, &ntype) == 0) {
+                    if (ntype == 1) {
+                        g_vpn_netid = nid;
+                        g_vpn_iface[0] = '\0';
+                        g_vpn_uid_count = 0;
+                        fprintf(stderr, "[svbox-netd] networkCreate(VIRTUAL netId=%d)\n", nid);
+                        fflush(stderr);
+                    } else {
+                        g_phys_netid = nid;
+                        fprintf(stderr, "[svbox-netd] networkCreate(PHYSICAL type=%d netId=%d)\n", ntype, nid);
+                        fflush(stderr);
+                    }
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == TX_GET_FWMARK_FOR_NETWORK) {
+            int32_t nid = g_default_netid;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0) {
+                (void)pr_i32(&pr, &nid);
+            }
+            p_i32(&reply, 0);
+            p_i32(&reply, 1);      /* non-null MarkMaskParcel */
+            p_i32(&reply, 12);     /* parcelable size: 4 + 4 + 4 */
+            p_i32(&reply, nid & 0xffff);
+            p_i32(&reply, 0xffff);
+        } else if (code == TX_NETWORK_ADD_UID_RANGES_PARCEL || code == TX_NETWORK_REMOVE_UID_RANGES_PARCEL) {
+            /* Android 12-14 NativeUidRangeConfig parcel:
+             * non_null, psize, netId, uidRanges(typedArray of UidRangeParcel), subPriority */
+            if (pr.buf && pr_skip_iface_token(&pr) == 0) {
+                int32_t non_null = 0, psz = 0, nid = 0, cnt = 0;
+                if (pr_i32(&pr, &non_null) == 0 && non_null &&
+                    pr_i32(&pr, &psz) == 0 &&
+                    pr_i32(&pr, &nid) == 0 &&
+                    pr_i32(&pr, &cnt) == 0 && nid == g_vpn_netid && nid != 0) {
+                    for (int i = 0; i < cnt && i < 64; i++) {
+                        int32_t u_nn = 0, u_psz = 0, u0 = 0, u1 = 0;
+                        if (pr_i32(&pr, &u_nn) < 0) break;
+                        if (!u_nn) continue;
+                        size_t start_pos = pr.pos;
+                        if (pr_i32(&pr, &u_psz) < 0 || pr_i32(&pr, &u0) < 0 || pr_i32(&pr, &u1) < 0) break;
+                        if (u_psz > 0 && start_pos + (size_t)u_psz <= pr.len) pr.pos = start_pos + (size_t)u_psz;
+                        if (code == TX_NETWORK_ADD_UID_RANGES_PARCEL) {
+                            if (g_vpn_uid_count < SV_NET_MAX_UID_RULES) {
+                                g_vpn_uids[g_vpn_uid_count].start = (uint32_t)u0;
+                                g_vpn_uids[g_vpn_uid_count].stop = (uint32_t)u1;
+                                g_vpn_uid_count++;
+                            }
+                        } else {
+                            for (uint32_t k = 0; k < g_vpn_uid_count; k++) {
+                                if (g_vpn_uids[k].start == (uint32_t)u0 && g_vpn_uids[k].stop == (uint32_t)u1) {
+                                    g_vpn_uids[k] = g_vpn_uids[--g_vpn_uid_count];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    push_vpn_uid_rules();
+                    fprintf(stderr, "[svbox-netd] vpn uidRangesParcel updated: count=%u\n", g_vpn_uid_count);
+                    fflush(stderr);
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == TX_SET_NETWORK_ALLOWLIST) {
+            p_i32(&reply, 0);
         } else if (code == TX_REGISTER_UNSOL_LISTENER) {
             if (tr->offsets_size >= sizeof(uint64_t) && tr->data.ptr.offsets && pr.buf) {
                 uint64_t obj_off = 0;
@@ -1295,6 +1404,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "[svbox-netd] registered 'dnsresolver'\n");
     if (add_service("media.metrics", NODE_MEDIA_METRICS) == 0)
         fprintf(stderr, "[svbox-netd] registered 'media.metrics'\n");
+    if (add_service("android.system.suspend.ISystemSuspend/default", NODE_SYSTEM_SUSPEND) == 0)
+        fprintf(stderr, "[svbox-netd] registered 'android.system.suspend.ISystemSuspend/default'\n");
+    if (add_service("suspend_control", NODE_SUSPEND_CTRL) == 0)
+        fprintf(stderr, "[svbox-netd] registered 'suspend_control'\n");
+    if (add_service("suspend_control_internal", NODE_SUSPEND_CTRL_INT) == 0)
+        fprintf(stderr, "[svbox-netd] registered 'suspend_control_internal'\n");
     if (register_audio_stubs) {
         add_service("media.audio_policy", NODE_AUDIO_POLICY);
         add_service("media.audio_flinger", NODE_AUDIO_FLINGER);
