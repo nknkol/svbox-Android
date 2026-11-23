@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <functional>
@@ -707,14 +708,33 @@ pid_t AndroidRuntime::Spawn(const std::vector<std::string>& argv,
             }
         }
         // Close extra FDs (except 0..2 and keepFds) so Android Zygote FD whitelist passes.
-        long maxFd = sysconf(_SC_OPEN_MAX);
-        if (maxFd < 0 || maxFd > 1024) maxFd = 1024;
-        for (int fd = 3; fd < static_cast<int>(maxFd); ++fd) {
-            bool keep = false;
-            for (int k : keepFds) {
-                if (k == fd) { keep = true; break; }
+        // HarmonyOS HAPs can allocate FDs > 1024 (e.g. 1402), so iterate /proc/self/fd.
+        DIR* fddir = opendir("/proc/self/fd");
+        if (fddir) {
+            int dirfdNum = dirfd(fddir);
+            std::vector<int> toClose;
+            while (struct dirent* de = readdir(fddir)) {
+                if (de->d_name[0] == '.') continue;
+                int fd = atoi(de->d_name);
+                if (fd <= 2 || fd == dirfdNum) continue;
+                bool keep = false;
+                for (int k : keepFds) {
+                    if (k == fd) { keep = true; break; }
+                }
+                if (!keep) toClose.push_back(fd);
             }
-            if (!keep) close(fd);
+            closedir(fddir);
+            for (int fd : toClose) close(fd);
+        } else {
+            long maxFd = sysconf(_SC_OPEN_MAX);
+            if (maxFd < 0 || maxFd > 4096) maxFd = 4096;
+            for (int fd = 3; fd < static_cast<int>(maxFd); ++fd) {
+                bool keep = false;
+                for (int k : keepFds) {
+                    if (k == fd) { keep = true; break; }
+                }
+                if (!keep) close(fd);
+            }
         }
         execv(cargs[0], cargs.data());
         int err = errno;
@@ -780,6 +800,10 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
         FileExists(hnpBin + "/svbox-audio-service")
             ? (hnpBin + "/svbox-audio-service")
             : (androidDir + "/audio_hal/svbox-audio-service");
+    const std::string cameraSvc =
+        FileExists(hnpBin + "/svbox-cameraserver")
+            ? (hnpBin + "/svbox-cameraserver")
+            : (androidDir + "/camera_stub/svbox-cameraserver");
     const std::string hnpGpuGuest = "/data/app/svbox.org/svbox_0.1.0/gpu_guest/lib64";
     const std::string devGpuGuest = androidDir + "/gpu/build_guest/out/lib64";
     const std::string gpuGuestDir =
@@ -809,6 +833,7 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     svboxPath_ = resolvedSvbox;
     audioHalPath_ = FileExists(audioHal) ? audioHal : "";
     audioSvcPath_ = FileExists(audioSvc) ? audioSvc : "";
+    cameraSvcPath_ = FileExists(cameraSvc) ? cameraSvc : "";
     gpuGuestDir_ = gpuGuestDir;
     androidDir_ = androidDir;
     rootfs_ = rootfs;
@@ -1125,11 +1150,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     const std::string logDir = androidDir_ + "/hap_logs";
     MkdirP(logDir);
-    std::ofstream bootLog(logDir + "/boot.log", std::ios::out | std::ios::trunc);
+    int bootLogFd = open((logDir + "/boot.log").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    struct ScopedFd { int fd; ~ScopedFd() { if (fd >= 0) close(fd); } } bootLogGuard{bootLogFd};
     auto logLine = [&](const std::string& s) {
-        if (bootLog) {
-            bootLog << s << "\n";
-            bootLog.flush();
+        if (bootLogFd >= 0) {
+            std::string line = s + "\n";
+            (void)write(bootLogFd, line.data(), line.size());
         }
         OH_LOG_INFO(LOG_APP, "%{public}s", s.c_str());
     };
@@ -1397,6 +1423,19 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             SleepCancelableMs(150);
             launchPaced("audioserver", { "-e", sfLdPath, "system/bin/audioserver" });
         }
+        if (!cameraSvcPath_.empty() && FileExists(cameraSvcPath_)) {
+            const std::string targetCamSvc = rootfs_ + "/system/bin/svbox-cameraserver";
+            CopyRegularFile(cameraSvcPath_, targetCamSvc);
+            chmod(targetCamSvc.c_str(), 0755);
+            launchPaced("cameraserver", { "-e", sfLdPath, "system/bin/svbox-cameraserver" });
+        }
+        // HarmonyOS PC enforces W^X (denies anonymous PROT_EXEC for unsigned HAPs),
+        // so configure Chromium WebView V8 to run --jitless instead of crashing on CodeRange mmap.
+        {
+            const std::string wvFlags = runBase_ + "/data/local/tmp/webview-command-line";
+            WriteFile(wvFlags, "_ --js-flags=--jitless\n");
+            chmod(wvFlags.c_str(), 0644);
+        }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
@@ -1504,4 +1543,84 @@ std::string AndroidRuntime::Stop() {
     GfxstreamBridge::Instance().Stop();
     SetStatus("Stopped");
     return "Stopped";
+}
+
+bool AndroidRuntime::RunGuestCmd(const std::string& shCmd, const std::string& outPath) {
+    if (!running_.load() || shCmd.empty()) return false;
+    std::vector<std::string> argv = BaseSvboxArgs();
+    argv.push_back("--");
+    argv.push_back("system/bin/sh");
+    argv.push_back("-c");
+    argv.push_back(shCmd);
+    std::string logOut = outPath.empty() ? (androidDir_ + "/hap_logs/guest_cmd.log") : outPath;
+    std::thread([this, argv, logOut]() {
+        pid_t p = Spawn(argv, false, logOut);
+        if (p > 0) {
+            int st = 0;
+            waitpid(p, &st, 0);
+        }
+    }).detach();
+    return true;
+}
+
+bool AndroidRuntime::DumpProcs(const std::string& outPath) {
+    std::string dest = outPath.empty() ? (androidDir_ + "/hap_logs/proc_dump.log") : outPath;
+    int fd = open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    auto writeStr = [&](const std::string& s) {
+        if (!s.empty()) (void)write(fd, s.data(), s.size());
+    };
+    auto readSmall = [](const std::string& p) -> std::string {
+        int rfd = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+        if (rfd < 0) return "";
+        char buf[4096];
+        ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+        close(rfd);
+        if (n <= 0) return "";
+        buf[n] = '\0';
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] == '\0') buf[i] = ' ';
+        }
+        return std::string(buf, static_cast<size_t>(n));
+    };
+
+    uid_t myUid = getuid();
+    DIR* pd = opendir("/proc");
+    if (pd) {
+        while (struct dirent* de = readdir(pd)) {
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            std::string pdir = std::string("/proc/") + de->d_name;
+            struct stat st = {};
+            if (stat(pdir.c_str(), &st) != 0 || st.st_uid != myUid) continue;
+            std::string comm = readSmall(pdir + "/comm");
+            while (!comm.empty() && (comm.back() == '\n' || comm.back() == ' ')) comm.pop_back();
+            std::string cmd = readSmall(pdir + "/cmdline");
+            if (cmd.size() > 160) cmd.resize(160);
+            writeStr("=== PID " + std::string(de->d_name) + " comm=" + comm + " cmd=" + cmd + "\n");
+            DIR* td = opendir((pdir + "/task").c_str());
+            if (td) {
+                while (struct dirent* te = readdir(td)) {
+                    if (te->d_name[0] < '0' || te->d_name[0] > '9') continue;
+                    std::string tdir = pdir + "/task/" + te->d_name;
+                    std::string tcomm = readSmall(tdir + "/comm");
+                    while (!tcomm.empty() && (tcomm.back() == '\n' || tcomm.back() == ' ')) tcomm.pop_back();
+                    std::string wchan = readSmall(tdir + "/wchan");
+                    while (!wchan.empty() && (wchan.back() == '\n' || wchan.back() == ' ')) wchan.pop_back();
+                    std::string statStr = readSmall(tdir + "/stat");
+                    char state = '?';
+                    auto rp = statStr.rfind(')');
+                    if (rp != std::string::npos && rp + 2 < statStr.size()) state = statStr[rp + 2];
+                    std::string sysc = readSmall(tdir + "/syscall");
+                    while (!sysc.empty() && (sysc.back() == '\n' || sysc.back() == ' ')) sysc.pop_back();
+                    if (sysc.size() > 96) sysc.resize(96);
+                    writeStr("  TID " + std::string(te->d_name) + " [" + std::string(1, state) + "] " +
+                             tcomm + " wchan=" + wchan + " sys=" + sysc + "\n");
+                }
+                closedir(td);
+            }
+        }
+        closedir(pd);
+    }
+    close(fd);
+    return true;
 }

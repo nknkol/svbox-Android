@@ -11,6 +11,8 @@
 #include <hilog/log.h>
 #include <napi/native_api.h>
 #include <string>
+#include <thread>
+#include <unistd.h>
 
 #undef LOG_TAG
 #define LOG_TAG "SvboxNapi"
@@ -289,6 +291,45 @@ napi_value SetVisibleNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value RunGuestCmdNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string cmd = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string outPath = argc > 1 ? GetStringArg(env, args[1]) : "";
+    bool ok = AndroidRuntime::Instance().RunGuestCmd(cmd, outPath);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+napi_value DumpProcsNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string outPath = argc > 0 ? GetStringArg(env, args[0]) : "";
+    bool ok = AndroidRuntime::Instance().DumpProcs(outPath);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+napi_value InjectTapNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    float x = argc > 0 ? static_cast<float>(GetDoubleArg(env, args[0], 0.0)) : 0.0f;
+    float y = argc > 1 ? static_cast<float>(GetDoubleArg(env, args[1], 0.0)) : 0.0f;
+    std::thread([x, y]() {
+        InputBridge::Instance().InjectTouch(0, 0, x, y);
+        usleep(45000);
+        InputBridge::Instance().InjectTouch(0, 2, x, y);
+    }).detach();
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
 napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
@@ -365,6 +406,9 @@ napi_value Init(napi_env env, napi_value exports) {
         { "setPaused", nullptr, SetPausedNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "runGuestCmd", nullptr, RunGuestCmdNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "dumpProcs", nullptr, DumpProcsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "injectTap", nullptr, InjectTapNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

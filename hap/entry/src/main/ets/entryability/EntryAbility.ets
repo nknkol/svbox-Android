@@ -14,9 +14,37 @@ export default class EntryAbility extends UIAbility {
     const rawAuto: Object | undefined = want.parameters ? want.parameters['autoStart'] : undefined;
     const rawGpu: Object | undefined = want.parameters ? want.parameters['gpuMode'] : undefined;
     const rawSnap: Object | undefined = want.parameters ? want.parameters['snapPath'] : undefined;
+    const rawCmd: Object | undefined = want.parameters ? want.parameters['guestCmd'] : undefined;
+    const rawCmdOut: Object | undefined = want.parameters ? want.parameters['guestCmdOut'] : undefined;
+    const rawDump: Object | undefined = want.parameters ? want.parameters['dumpProcs'] : undefined;
+    const rawTap: Object | undefined = want.parameters ? want.parameters['injectTap'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
     const snapStr: string = typeof rawSnap === 'string' ? rawSnap : '';
+    const cmdStr: string = typeof rawCmd === 'string' ? rawCmd : '';
+    const cmdOutStr: string = typeof rawCmdOut === 'string' ? rawCmdOut : '';
+    const dumpStr: string = typeof rawDump === 'string' ? rawDump : '';
+    const tapStr: string = typeof rawTap === 'string' ? rawTap : '';
+
+    if (cmdStr.length > 0 && autoStr.length === 0) {
+      native.runGuestCmd(cmdStr, cmdOutStr);
+      return;
+    }
+    if (dumpStr.length > 0 && autoStr.length === 0) {
+      native.dumpProcs(dumpStr);
+      return;
+    }
+    if (tapStr.length > 0 && autoStr.length === 0) {
+      const parts: string[] = tapStr.split(',');
+      if (parts.length === 2) {
+        const x: number = Number(parts[0]);
+        const y: number = Number(parts[1]);
+        if (!Number.isNaN(x) && !Number.isNaN(y)) {
+          native.injectTap(x, y);
+        }
+      }
+      return;
+    }
 
     if (snapStr.length > 0 && autoStr.length === 0) {
       this.captureWindowSnapshot(snapStr);

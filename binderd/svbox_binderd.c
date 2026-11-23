@@ -32,21 +32,37 @@
 #define MFD_CLOEXEC 0x0001U
 #endif
 
-#define MAX_PROCS     128
-#define MAX_NODES     4096
-#define MAX_HANDLES   1024
-#define MAX_THREADS   1024
-#define MAX_CONNS     1024
-#define PROC_MEM_SIZE (2u * 1024u * 1024u) /* 2 MiB per process */
-#define MAX_ALLOCS    512
+#define MAX_PROCS          256
+#define INIT_NODES         4096
+#define INIT_PROC_HANDLES  512
+#define MAX_THREADS        4096
+#define MAX_CONNS          4096
+#define PROC_MEM_SIZE      (2u * 1024u * 1024u) /* 2 MiB per process */
+#define MAX_ALLOCS         1024
+#define INLINE_BLK_HANDLES 16
+
+/* Linux 64-bit uapi/linux/android/binder.h declares struct binder_handle_cookie
+ * as __packed (12 bytes: __u32 handle + __u64 cookie), so real Android userspace
+ * sends 0x400c630e / 0x400c630f rather than padded 16-byte 0x4010630e / 0x4010630f. */
+#define REAL_BC_REQUEST_DEATH_NOTIFICATION 0x400c630eu
+#define REAL_BC_CLEAR_DEATH_NOTIFICATION   0x400c630fu
+
+struct binder_handle_cookie_packed {
+    uint32_t handle;
+    uint64_t cookie;
+} __attribute__((packed));
 
 static bool g_verbose = false;
 #define DLOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[binderd] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 struct mem_block {
-    uint32_t off;
-    uint32_t len;
-    bool used;
+    uint32_t  off;
+    uint32_t  len;
+    bool      used;
+    uint32_t  handle_count;
+    uint32_t  handles[INLINE_BLK_HANDLES];
+    uint32_t *extra_handles;
+    uint32_t  extra_cap;
 };
 
 struct bhandle {
@@ -54,8 +70,10 @@ struct bhandle {
     uint32_t node_id;
     int32_t  strong_refs;
     int32_t  weak_refs;
+    int32_t  in_flight;
     bool     released_strong;
     bool     has_death;
+    bool     death_sent;
     uint64_t death_cookie;
     bool     used;
 };
@@ -91,9 +109,10 @@ struct bproc {
     uint32_t requested_threads;
     uint32_t requested_threads_started;
     struct mem_block allocs[MAX_ALLOCS];
-    struct bhandle handles[MAX_HANDLES];
-    struct bmsg *inbox_head;
-    struct bmsg *inbox_tail;
+    struct bhandle  *handles;
+    int              handles_cap;
+    struct bmsg     *inbox_head;
+    struct bmsg     *inbox_tail;
 };
 
 struct bnode {
@@ -132,7 +151,8 @@ struct bthread {
 };
 
 static struct bproc   g_procs[MAX_PROCS];
-static struct bnode   g_nodes[MAX_NODES];
+static struct bnode  *g_nodes = NULL;
+static int            g_nodes_cap = 0;
 static struct bthread g_threads[MAX_THREADS];
 static uint32_t g_next_proc_id   = 1;
 static uint32_t g_next_node_id   = 1;
@@ -264,11 +284,13 @@ static struct bthread *find_thread(uint32_t thread_id)
     return NULL;
 }
 
+static void node_check_release(struct bnode *node);
+
 static struct bnode *find_node(uint32_t node_id)
 {
     if (!node_id)
         return NULL;
-    for (int i = 0; i < MAX_NODES; i++)
+    for (int i = 0; i < g_nodes_cap; i++)
         if (g_nodes[i].used && g_nodes[i].node_id == node_id)
             return &g_nodes[i];
     return NULL;
@@ -276,11 +298,11 @@ static struct bnode *find_node(uint32_t node_id)
 
 static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, uint64_t cookie)
 {
-    for (int i = 0; i < MAX_NODES; i++) {
+    for (int i = 0; i < g_nodes_cap; i++) {
         if (g_nodes[i].used && g_nodes[i].owner_proc_id == owner_proc_id && g_nodes[i].ptr == ptr)
             return &g_nodes[i];
     }
-    for (int i = 0; i < MAX_NODES; i++) {
+    for (int i = 0; i < g_nodes_cap; i++) {
         if (!g_nodes[i].used) {
             memset(&g_nodes[i], 0, sizeof(g_nodes[i]));
             g_nodes[i].used = true;
@@ -291,12 +313,27 @@ static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, ui
             return &g_nodes[i];
         }
     }
-    return NULL;
+    int new_cap = g_nodes_cap > 0 ? g_nodes_cap * 2 : INIT_NODES;
+    struct bnode *grown = (struct bnode *)realloc(g_nodes, (size_t)new_cap * sizeof(struct bnode));
+    if (!grown)
+        return NULL;
+    memset(grown + g_nodes_cap, 0, (size_t)(new_cap - g_nodes_cap) * sizeof(struct bnode));
+    int idx = g_nodes_cap;
+    g_nodes = grown;
+    g_nodes_cap = new_cap;
+    g_nodes[idx].used = true;
+    g_nodes[idx].node_id = g_next_node_id++;
+    g_nodes[idx].owner_proc_id = owner_proc_id;
+    g_nodes[idx].ptr = ptr;
+    g_nodes[idx].cookie = cookie;
+    return &g_nodes[idx];
 }
 
 static struct bhandle *find_handle_entry(struct bproc *proc, uint32_t handle)
 {
-    for (int i = 0; i < MAX_HANDLES; i++) {
+    if (!proc || !proc->handles)
+        return NULL;
+    for (int i = 0; i < proc->handles_cap; i++) {
         if (proc->handles[i].used && proc->handles[i].handle == handle)
             return &proc->handles[i];
     }
@@ -311,28 +348,98 @@ static struct bnode *lookup_handle_node(struct bproc *proc, uint32_t handle)
     return he ? find_node(he->node_id) : NULL;
 }
 
-static uint32_t get_or_create_handle(struct bproc *proc, uint32_t node_id)
+static struct bhandle *get_or_create_handle_entry(struct bproc *proc, uint32_t node_id)
 {
-    if (node_id == g_ctx_mgr_node_id)
-        return 0;
-    for (int i = 0; i < MAX_HANDLES; i++) {
+    if (!proc || node_id == 0 || node_id == g_ctx_mgr_node_id)
+        return NULL;
+    for (int i = 0; i < proc->handles_cap; i++) {
         if (proc->handles[i].used && proc->handles[i].node_id == node_id)
-            return proc->handles[i].handle;
+            return &proc->handles[i];
     }
-    for (int i = 0; i < MAX_HANDLES; i++) {
+    for (int i = 0; i < proc->handles_cap; i++) {
         if (!proc->handles[i].used) {
             memset(&proc->handles[i], 0, sizeof(proc->handles[i]));
             proc->handles[i].used = true;
             proc->handles[i].handle = proc->next_handle++;
+            if (proc->next_handle == 0) proc->next_handle = 1;
             proc->handles[i].node_id = node_id;
-            return proc->handles[i].handle;
+            return &proc->handles[i];
         }
     }
-    return 0;
+    int new_cap = proc->handles_cap > 0 ? proc->handles_cap * 2 : INIT_PROC_HANDLES;
+    struct bhandle *grown = (struct bhandle *)realloc(proc->handles, (size_t)new_cap * sizeof(struct bhandle));
+    if (!grown)
+        return NULL;
+    memset(grown + proc->handles_cap, 0, (size_t)(new_cap - proc->handles_cap) * sizeof(struct bhandle));
+    int idx = proc->handles_cap;
+    proc->handles = grown;
+    proc->handles_cap = new_cap;
+    proc->handles[idx].used = true;
+    proc->handles[idx].handle = proc->next_handle++;
+    if (proc->next_handle == 0) proc->next_handle = 1;
+    proc->handles[idx].node_id = node_id;
+    return &proc->handles[idx];
+}
+
+static void maybe_reclaim_handle(struct bproc *proc, struct bhandle *he)
+{
+    (void)proc;
+    if (!he || !he->used)
+        return;
+    if (he->strong_refs > 0 || he->weak_refs > 0 || he->in_flight > 0 ||
+        he->has_death || he->death_sent)
+        return;
+    uint32_t nid = he->node_id;
+    he->used = false;
+    he->node_id = 0;
+    if (nid != 0)
+        node_check_release(find_node(nid));
+}
+
+static void mem_block_add_handle(struct mem_block *blk, uint32_t handle)
+{
+    if (!blk || handle == 0)
+        return;
+    if (blk->handle_count < INLINE_BLK_HANDLES) {
+        blk->handles[blk->handle_count++] = handle;
+        return;
+    }
+    uint32_t eidx = blk->handle_count - INLINE_BLK_HANDLES;
+    if (eidx >= blk->extra_cap) {
+        uint32_t ncap = blk->extra_cap > 0 ? blk->extra_cap * 2 : 32;
+        uint32_t *ng = (uint32_t *)realloc(blk->extra_handles, ncap * sizeof(uint32_t));
+        if (!ng)
+            return;
+        blk->extra_handles = ng;
+        blk->extra_cap = ncap;
+    }
+    blk->extra_handles[eidx] = handle;
+    blk->handle_count++;
+}
+
+static void mem_block_release_handles(struct bproc *proc, struct mem_block *blk)
+{
+    if (!blk)
+        return;
+    for (uint32_t i = 0; i < blk->handle_count; i++) {
+        uint32_t h = (i < INLINE_BLK_HANDLES) ? blk->handles[i] : blk->extra_handles[i - INLINE_BLK_HANDLES];
+        struct bhandle *he = find_handle_entry(proc, h);
+        if (he) {
+            if (he->in_flight > 0)
+                he->in_flight--;
+            maybe_reclaim_handle(proc, he);
+        }
+    }
+    blk->handle_count = 0;
+    if (blk->extra_handles) {
+        free(blk->extra_handles);
+        blk->extra_handles = NULL;
+        blk->extra_cap = 0;
+    }
 }
 
 /* Simple first-fit allocator inside proc->mem_base[0..mem_size). */
-static int proc_mem_alloc(struct bproc *proc, uint32_t size, uint32_t *out_off)
+static int proc_mem_alloc(struct bproc *proc, uint32_t size, uint32_t *out_off, int *out_idx)
 {
     uint32_t need = align8(size < 8 ? 8 : size);
     /* Find lowest free gap [cand, cand+need) not overlapping any used block. */
@@ -360,7 +467,11 @@ static int proc_mem_alloc(struct bproc *proc, uint32_t size, uint32_t *out_off)
             proc->allocs[i].used = true;
             proc->allocs[i].off = cand;
             proc->allocs[i].len = need;
+            proc->allocs[i].handle_count = 0;
+            proc->allocs[i].extra_handles = NULL;
+            proc->allocs[i].extra_cap = 0;
             *out_off = cand;
+            if (out_idx) *out_idx = i;
             return 0;
         }
     }
@@ -375,6 +486,7 @@ static void proc_mem_free(struct bproc *proc, uint64_t guest_ptr)
     for (int i = 0; i < MAX_ALLOCS; i++) {
         if (proc->allocs[i].used && proc->allocs[i].off == off) {
             proc->allocs[i].used = false;
+            mem_block_release_handles(proc, &proc->allocs[i]);
             return;
         }
     }
@@ -595,20 +707,39 @@ static void node_check_release(struct bnode *node)
     struct bproc *owner = find_proc(node->owner_proc_id);
     if (!owner)
         return;
+    bool any_strong = false;
+    bool any_weak = false;
+    uint32_t nid = node->node_id;
     for (int pi = 0; pi < MAX_PROCS; pi++) {
-        if (!g_procs[pi].used)
+        if (!g_procs[pi].used || !g_procs[pi].handles)
             continue;
-        for (int hi = 0; hi < MAX_HANDLES; hi++) {
+        for (int hi = 0; hi < g_procs[pi].handles_cap; hi++) {
             struct bhandle *he = &g_procs[pi].handles[hi];
-            if (he->used && he->node_id == node->node_id)
-                return;
+            if (he->used && he->node_id == nid) {
+                any_weak = true;
+                if (he->strong_refs > 0 || he->in_flight > 0) {
+                    any_strong = true;
+                    break;
+                }
+            }
         }
+        if (any_strong)
+            break;
     }
-    if (node->has_strong_ref) {
-        uint64_t pc[2] = { node->ptr, node->cookie };
+    uint64_t pc[2] = { node->ptr, node->cookie };
+    if (!any_strong && node->has_strong_ref) {
         node->has_strong_ref = false;
         push_inbox(owner, make_simple_br(SV_BR_RELEASE, pc, sizeof(pc)));
         wake_proc_waiters(owner);
+    }
+    if (!any_weak) {
+        if (node->has_weak_ref) {
+            node->has_weak_ref = false;
+            push_inbox(owner, make_simple_br(SV_BR_DECREFS, pc, sizeof(pc)));
+            wake_proc_waiters(owner);
+        }
+        if (!node->has_async_txn)
+            node->used = false;
     }
 }
 
@@ -669,6 +800,7 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
     struct bproc *target_p = NULL;
     struct bthread *reply_t = NULL;
     struct bnode *target_node = NULL;
+    uint32_t target_node_id = 0;
 
     if (is_reply) {
         if (sender_t->reply_top <= 0) {
@@ -697,6 +829,7 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
                 push_direct(sender_t, make_simple_br(SV_BR_DEAD_REPLY, NULL, 0));
             return;
         }
+        target_node_id = target_node->node_id;
         target_p = find_proc(target_node->owner_proc_id);
         if (!target_p) {
             push_direct(sender_t, make_simple_br(SV_BR_DEAD_REPLY, NULL, 0));
@@ -726,7 +859,8 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
     uint32_t offs_aligned = align8((uint32_t)in_txn->offsets_size);
     uint32_t total_alloc = data_aligned + offs_aligned + sg_alloc_bytes;
     uint32_t mem_off = 0;
-    if (proc_mem_alloc(target_p, total_alloc, &mem_off) < 0) {
+    int alloc_idx = -1;
+    if (proc_mem_alloc(target_p, total_alloc, &mem_off, &alloc_idx) < 0) {
         DLOG("target proc=%u memfd OOM (need=%u)", target_p->proc_id, total_alloc);
         push_direct(sender_t, make_simple_br(SV_BR_FAILED_REPLY, NULL, 0));
         return;
@@ -814,24 +948,52 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
             bool is_strong = (obj.type == SV_BINDER_TYPE_BINDER);
             struct bnode *node = get_or_create_node(sender_p->proc_id, obj.binder, obj.cookie);
             if (node && target_p->proc_id != sender_p->proc_id) {
-                uint32_t h = get_or_create_handle(target_p, node->node_id);
-                node_inc_refs(node, is_strong, sender_t);
+                uint32_t nid = node->node_id;
+                uint32_t h = 0;
+                if (nid != g_ctx_mgr_node_id) {
+                    struct bhandle *he = get_or_create_handle_entry(target_p, nid);
+                    if (he) {
+                        h = he->handle;
+                        he->in_flight++;
+                        if (alloc_idx >= 0)
+                            mem_block_add_handle(&target_p->allocs[alloc_idx], h);
+                    } else {
+                        fprintf(stderr, "[binderd] ERROR: failed to allocate handle for proc=%u\n", target_p->proc_id);
+                        h = UINT32_MAX;
+                    }
+                }
+                node_inc_refs(find_node(nid), is_strong, sender_t);
                 obj.type = is_strong ? SV_BINDER_TYPE_HANDLE : SV_BINDER_TYPE_WEAK_HANDLE;
                 obj.handle = h;
                 obj.cookie = 0;
                 memcpy(dst_data + o, &obj, sizeof(obj));
                 DLOG("  obj BINDER(proc=%u ptr=0x%llx) -> HANDLE(%u) in proc=%u",
-                     sender_p->proc_id, (unsigned long long)node->ptr, h, target_p->proc_id);
+                     sender_p->proc_id, (unsigned long long)obj.binder, h, target_p->proc_id);
             }
         } else if (obj.type == SV_BINDER_TYPE_HANDLE || obj.type == SV_BINDER_TYPE_WEAK_HANDLE) {
+            bool is_strong = (obj.type == SV_BINDER_TYPE_HANDLE);
             struct bnode *node = lookup_handle_node(sender_p, obj.handle);
             if (node) {
+                uint32_t nid = node->node_id;
                 if (node->owner_proc_id == target_p->proc_id) {
-                    obj.type = (obj.type == SV_BINDER_TYPE_HANDLE) ? SV_BINDER_TYPE_BINDER : SV_BINDER_TYPE_WEAK_BINDER;
+                    obj.type = is_strong ? SV_BINDER_TYPE_BINDER : SV_BINDER_TYPE_WEAK_BINDER;
                     obj.binder = node->ptr;
                     obj.cookie = node->cookie;
                 } else {
-                    uint32_t h = get_or_create_handle(target_p, node->node_id);
+                    uint32_t h = 0;
+                    if (nid != g_ctx_mgr_node_id) {
+                        struct bhandle *he = get_or_create_handle_entry(target_p, nid);
+                        if (he) {
+                            h = he->handle;
+                            he->in_flight++;
+                            if (alloc_idx >= 0)
+                                mem_block_add_handle(&target_p->allocs[alloc_idx], h);
+                        } else {
+                            fprintf(stderr, "[binderd] ERROR: failed to forward handle for proc=%u\n", target_p->proc_id);
+                            h = UINT32_MAX;
+                        }
+                        node_inc_refs(find_node(nid), is_strong, NULL);
+                    }
                     obj.handle = h;
                     obj.cookie = 0;
                 }
@@ -852,6 +1014,9 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
             }
         }
     }
+
+    /* Re-resolve target_node in case get_or_create_node() reallocated g_nodes. */
+    target_node = target_node_id ? find_node(target_node_id) : NULL;
 
     struct sv_binder_transaction_data out_txn;
     memset(&out_txn, 0, sizeof(out_txn));
@@ -992,7 +1157,7 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             memcpy(&ptr, arg, 8);
             proc_mem_free(proc, ptr);
             /* Advance serialized TF_ONE_WAY queue on any node whose active async buffer was freed. */
-            for (int ni = 0; ni < MAX_NODES; ni++) {
+            for (int ni = 0; ni < g_nodes_cap; ni++) {
                 struct bnode *nd = &g_nodes[ni];
                 if (nd->used && nd->owner_proc_id == proc->proc_id &&
                     nd->has_async_txn && nd->async_buf_ptr == ptr) {
@@ -1007,6 +1172,7 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
                     } else {
                         nd->has_async_txn = false;
                         nd->async_buf_ptr = 0;
+                        node_check_release(nd);
                     }
                     break;
                 }
@@ -1052,41 +1218,93 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             memcpy(&h, arg, 4);
             struct bhandle *he = find_handle_entry(proc, h);
             if (he) {
+                uint32_t nid = he->node_id;
                 if (cmd == SV_BC_RELEASE) {
                     if (he->strong_refs > 0) he->strong_refs--;
-                    if (he->strong_refs == 0) he->released_strong = true;
+                    if (he->strong_refs == 0) {
+                        he->released_strong = true;
+                        if (nid != 0)
+                            node_check_release(find_node(nid));
+                    }
                 } else if (cmd == SV_BC_DECREFS && he->weak_refs > 0) {
                     he->weak_refs--;
                 }
+                maybe_reclaim_handle(proc, he);
             }
             break;
         }
         case SV_BC_INCREFS_DONE:
         case SV_BC_ACQUIRE_DONE:
-        case SV_BC_DEAD_BINDER_DONE:
             break;
-        case SV_BC_REQUEST_DEATH_NOTIFICATION: {
-            struct sv_binder_handle_cookie hc;
-            memcpy(&hc, arg, sizeof(hc));
-            struct bhandle *he = find_handle_entry(proc, hc.handle);
-            if (he) {
-                struct bnode *n = find_node(he->node_id);
-                if (!n || !n->used) {
-                    push_direct(t, make_simple_br(SV_BR_DEAD_BINDER, &hc.cookie, 8));
-                } else {
-                    he->has_death = true;
-                    he->death_cookie = hc.cookie;
+        case SV_BC_DEAD_BINDER_DONE: {
+            uint64_t cookie = 0;
+            if (asz >= 8)
+                memcpy(&cookie, arg, 8);
+            if (proc->handles) {
+                for (int hi = 0; hi < proc->handles_cap; hi++) {
+                    struct bhandle *he = &proc->handles[hi];
+                    if (he->used && he->death_sent && he->death_cookie == cookie) {
+                        he->death_sent = false;
+                        maybe_reclaim_handle(proc, he);
+                        break;
+                    }
                 }
             }
             break;
         }
+        case REAL_BC_REQUEST_DEATH_NOTIFICATION:
+        case SV_BC_REQUEST_DEATH_NOTIFICATION: {
+            uint32_t handle = 0;
+            uint64_t cookie = 0;
+            if (cmd == REAL_BC_REQUEST_DEATH_NOTIFICATION && asz >= sizeof(struct binder_handle_cookie_packed)) {
+                struct binder_handle_cookie_packed hc;
+                memcpy(&hc, arg, sizeof(hc));
+                handle = hc.handle;
+                cookie = hc.cookie;
+            } else if (asz >= sizeof(struct sv_binder_handle_cookie)) {
+                struct sv_binder_handle_cookie hc;
+                memcpy(&hc, arg, sizeof(hc));
+                handle = hc.handle;
+                cookie = hc.cookie;
+            }
+            struct bhandle *he = find_handle_entry(proc, handle);
+            if (he) {
+                struct bnode *n = find_node(he->node_id);
+                if (!n || !n->used) {
+                    he->death_sent = true;
+                    he->death_cookie = cookie;
+                    push_direct(t, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
+                } else {
+                    he->has_death = true;
+                    he->death_cookie = cookie;
+                }
+            } else if (handle != 0) {
+                /* Unknown/already-reclaimed handle: notify caller immediately that target is dead. */
+                push_direct(t, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
+            }
+            break;
+        }
+        case REAL_BC_CLEAR_DEATH_NOTIFICATION:
         case SV_BC_CLEAR_DEATH_NOTIFICATION: {
-            struct sv_binder_handle_cookie hc;
-            memcpy(&hc, arg, sizeof(hc));
-            struct bhandle *he = find_handle_entry(proc, hc.handle);
-            if (he)
+            uint32_t handle = 0;
+            uint64_t cookie = 0;
+            if (cmd == REAL_BC_CLEAR_DEATH_NOTIFICATION && asz >= sizeof(struct binder_handle_cookie_packed)) {
+                struct binder_handle_cookie_packed hc;
+                memcpy(&hc, arg, sizeof(hc));
+                handle = hc.handle;
+                cookie = hc.cookie;
+            } else if (asz >= sizeof(struct sv_binder_handle_cookie)) {
+                struct sv_binder_handle_cookie hc;
+                memcpy(&hc, arg, sizeof(hc));
+                handle = hc.handle;
+                cookie = hc.cookie;
+            }
+            struct bhandle *he = find_handle_entry(proc, handle);
+            if (he) {
                 he->has_death = false;
-            push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &hc.cookie, 8));
+                maybe_reclaim_handle(proc, he);
+            }
+            push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &cookie, 8));
             break;
         }
         default:
@@ -1158,36 +1376,63 @@ static void drop_conn(struct conn_entry *ce)
                 }
                 free_bmsg(m);
             }
-            /* Release all handles held by this dying process so target owners get BR_RELEASE/BR_DECREFS. */
-            uint32_t rel_nodes[MAX_HANDLES];
-            int rel_count = 0;
-            for (int hi = 0; hi < MAX_HANDLES; hi++) {
-                if (p->handles[hi].used) {
-                    rel_nodes[rel_count++] = p->handles[hi].node_id;
-                    p->handles[hi].used = false;
-                    p->handles[hi].strong_refs = 0;
-                    p->handles[hi].weak_refs = 0;
-                    p->handles[hi].has_death = false;
+            /* Free any overflow handle arrays tracked in pending mem_blocks. */
+            for (int ai = 0; ai < MAX_ALLOCS; ai++) {
+                if (p->allocs[ai].extra_handles) {
+                    free(p->allocs[ai].extra_handles);
+                    p->allocs[ai].extra_handles = NULL;
+                    p->allocs[ai].extra_cap = 0;
                 }
+                p->allocs[ai].handle_count = 0;
+                p->allocs[ai].used = false;
+            }
+            /* Release all handles held by this dying process so target owners get BR_RELEASE/BR_DECREFS. */
+            uint32_t *rel_nodes = NULL;
+            int rel_count = 0;
+            if (p->handles && p->handles_cap > 0) {
+                rel_nodes = (uint32_t *)malloc((size_t)p->handles_cap * sizeof(uint32_t));
+                for (int hi = 0; hi < p->handles_cap; hi++) {
+                    if (p->handles[hi].used) {
+                        if (rel_nodes && p->handles[hi].node_id != 0)
+                            rel_nodes[rel_count++] = p->handles[hi].node_id;
+                        p->handles[hi].used = false;
+                        p->handles[hi].node_id = 0;
+                        p->handles[hi].strong_refs = 0;
+                        p->handles[hi].weak_refs = 0;
+                        p->handles[hi].in_flight = 0;
+                        p->handles[hi].has_death = false;
+                        p->handles[hi].death_sent = false;
+                    }
+                }
+                free(p->handles);
+                p->handles = NULL;
+                p->handles_cap = 0;
             }
             for (int ri = 0; ri < rel_count; ri++)
                 node_check_release(find_node(rel_nodes[ri]));
+            free(rel_nodes);
 
-            for (int i = 0; i < MAX_NODES; i++) {
+            for (int i = 0; i < g_nodes_cap; i++) {
                 if (g_nodes[i].used && g_nodes[i].owner_proc_id == p->proc_id) {
                     uint32_t dead_nid = g_nodes[i].node_id;
-                    /* Deliver BR_DEAD_BINDER to any live process watching this node. */
+                    /* Deliver BR_DEAD_BINDER to any live process watching this node,
+                     * and detach dead_nid from every handle referencing it so slots reclaim. */
                     for (int pi = 0; pi < MAX_PROCS; pi++) {
                         struct bproc *op = &g_procs[pi];
-                        if (!op->used || op->proc_id == p->proc_id)
+                        if (!op->used || op->proc_id == p->proc_id || !op->handles)
                             continue;
-                        for (int hi = 0; hi < MAX_HANDLES; hi++) {
+                        for (int hi = 0; hi < op->handles_cap; hi++) {
                             struct bhandle *oh = &op->handles[hi];
-                            if (oh->used && oh->node_id == dead_nid && oh->has_death) {
-                                uint64_t cookie = oh->death_cookie;
-                                oh->has_death = false;
-                                push_inbox(op, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
-                                wake_proc_waiters(op);
+                            if (oh->used && oh->node_id == dead_nid) {
+                                if (oh->has_death) {
+                                    uint64_t cookie = oh->death_cookie;
+                                    oh->has_death = false;
+                                    oh->death_sent = true;
+                                    push_inbox(op, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
+                                    wake_proc_waiters(op);
+                                }
+                                oh->node_id = 0;
+                                maybe_reclaim_handle(op, oh);
                             }
                         }
                     }
@@ -1212,10 +1457,12 @@ static void drop_conn(struct conn_entry *ce)
 static void handle_conn_event(struct conn_entry *ce)
 {
     if (ce->kind == CONN_NOTIFY) {
-        /* Notify FD only exists to detect EOF/close from guest. */
+        /* Notify FD only exists to detect EOF/close from guest.
+         * Note: recv()==0 does NOT touch errno, so check n==0 explicitly! */
         char tmp[16];
+        errno = 0;
         ssize_t n = recv(ce->fd, tmp, sizeof(tmp), MSG_DONTWAIT);
-        if (n <= 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
             drop_conn(ce);
         return;
     }
@@ -1274,6 +1521,13 @@ static void handle_conn_event(struct conn_entry *ce)
             send_reply(ce->fd, VDEV_OP_OPEN, 0, -ENOMEM, NULL, 0, NULL, 0);
             break;
         }
+        struct bhandle *harr = (struct bhandle *)calloc(INIT_PROC_HANDLES, sizeof(struct bhandle));
+        if (!harr) {
+            munmap(base, PROC_MEM_SIZE);
+            close(mfd);
+            send_reply(ce->fd, VDEV_OP_OPEN, 0, -ENOMEM, NULL, 0, NULL, 0);
+            break;
+        }
         memset(p, 0, sizeof(*p));
         p->used = true;
         p->proc_id = g_next_proc_id++;
@@ -1285,6 +1539,8 @@ static void handle_conn_event(struct conn_entry *ce)
         p->mem_base = (uint8_t *)base;
         p->mem_size = PROC_MEM_SIZE;
         p->next_handle = 1;
+        p->handles = harr;
+        p->handles_cap = INIT_PROC_HANDLES;
 
         ce->kind = CONN_NOTIFY;
         ce->owner_id = p->proc_id;
@@ -1412,6 +1668,13 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
+    g_nodes = (struct bnode *)calloc(INIT_NODES, sizeof(struct bnode));
+    if (!g_nodes) {
+        fprintf(stderr, "binderd: OOM allocating g_nodes\n");
+        return 1;
+    }
+    g_nodes_cap = INIT_NODES;
+
     unlink(sock_path);
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (g_listen_fd < 0) {
@@ -1457,6 +1720,7 @@ int main(int argc, char **argv)
                     }
                 }
                 if (!ce) {
+                    fprintf(stderr, "[binderd] ERROR: MAX_CONNS (%d) exhausted\n", MAX_CONNS);
                     close(cfd);
                     continue;
                 }
@@ -1464,7 +1728,7 @@ int main(int argc, char **argv)
                 ce->used = true;
                 ce->fd = cfd;
                 ce->kind = CONN_NEW;
-                struct epoll_event cev = { .events = EPOLLIN, .data.ptr = ce };
+                struct epoll_event cev = { .events = EPOLLIN | EPOLLRDHUP, .data.ptr = ce };
                 epoll_ctl(g_epfd, EPOLL_CTL_ADD, cfd, &cev);
             } else {
                 handle_conn_event((struct conn_entry *)events[i].data.ptr);

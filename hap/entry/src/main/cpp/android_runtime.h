@@ -36,6 +36,8 @@ public:
     void OnSurfaceDestroyed(OHNativeWindow* window = nullptr);
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
+    bool RunGuestCmd(const std::string& shCmd, const std::string& outPath);
+    bool DumpProcs(const std::string& outPath);
 
     bool IsRunning() const { return running_.load(); }
     bool IsPaused() const { return paused_.load(); }
@@ -90,6 +92,7 @@ private:
     std::string svboxPath_;
     std::string audioHalPath_;
     std::string audioSvcPath_;
+    std::string cameraSvcPath_;
     std::string gpuGuestDir_;
     std::string androidDir_;
     std::string rootfs_;

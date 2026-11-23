@@ -33,6 +33,7 @@ def main() -> None:
         (os.path.join(repo, "netd", "svbox-netd"), "svbox_0.1.0/bin/svbox-netd"),
         (os.path.join(repo, "audio_hal", "audio.primary.svbox.so"), "svbox_0.1.0/bin/audio.primary.svbox.so"),
         (os.path.join(repo, "audio_hal", "svbox-audio-service"), "svbox_0.1.0/bin/svbox-audio-service"),
+        (os.path.join(repo, "camera_stub", "svbox-cameraserver"), "svbox_0.1.0/bin/svbox-cameraserver"),
     ]
 
     guest_gpu_dir = os.path.join(repo, "gpu", "build_guest", "out", "lib64")

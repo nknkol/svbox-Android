@@ -10,6 +10,7 @@ propd/svbox-propd
 netd/svbox-netd
 audio_hal/audio.primary.svbox.so
 audio_hal/svbox-audio-service
+camera_stub/svbox-cameraserver
 *.png
 *.log
 hap_logs/
