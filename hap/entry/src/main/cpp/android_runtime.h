@@ -96,6 +96,7 @@ private:
     std::string injectLayer_;
     std::string shareHostDir_;
     std::string svboxPath_;
+    std::string netSockPath_;
     std::string audioHalPath_;
     std::string audioSvcPath_;
     std::string cameraSvcPath_;

@@ -9,6 +9,7 @@ import zipfile
 def main() -> None:
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     svbox_bin = sys.argv[1] if len(sys.argv) > 1 else "/storage/Users/currentUser/Workspace/svbox/build/svbox"
+    svbox_net_bin = os.path.join(os.path.dirname(os.path.abspath(svbox_bin)), "svbox-net")
     out_path = os.path.join(repo, "hap", "hnp", "arm64-v8a", "svbox.hnp")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -19,6 +20,7 @@ def main() -> None:
         "install": {
             "links": [
                 {"source": "bin/svbox", "target": "svbox"},
+                {"source": "bin/svbox-net", "target": "svbox-net"},
                 {"source": "bin/svbox-binderd", "target": "svbox-binderd"},
                 {"source": "bin/svbox-propd", "target": "svbox-propd"},
                 {"source": "bin/svbox-netd", "target": "svbox-netd"},
@@ -28,6 +30,7 @@ def main() -> None:
 
     bins = [
         (svbox_bin, "svbox_0.1.0/bin/svbox"),
+        (svbox_net_bin, "svbox_0.1.0/bin/svbox-net"),
         (os.path.join(repo, "binderd", "svbox-binderd"), "svbox_0.1.0/bin/svbox-binderd"),
         (os.path.join(repo, "propd", "svbox-propd"), "svbox_0.1.0/bin/svbox-propd"),
         (os.path.join(repo, "netd", "svbox-netd"), "svbox_0.1.0/bin/svbox-netd"),

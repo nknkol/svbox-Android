@@ -10,8 +10,8 @@ binderd/svbox-binderd: binderd/svbox_binderd.c $(SVBOX_DIR)/src/payload/include/
 propd/svbox-propd: propd/svbox_propd.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-netd/svbox-netd: netd/svbox_netd.c $(SVBOX_DIR)/src/payload/include/vdev_proto.h
-	$(CC) $(CFLAGS) -I$(SVBOX_DIR)/src/payload/include -o $@ $<
+netd/svbox-netd: netd/svbox_netd.c $(SVBOX_DIR)/src/payload/include/vdev_proto.h $(SVBOX_DIR)/src/payload/include/net_proto.h
+	$(CC) $(CFLAGS) -pthread -I$(SVBOX_DIR)/src/payload/include -o $@ $<
 
 audio_hal/audio.primary.svbox.so: audio_hal/audio_primary_svbox.c
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -nostdlib -fno-stack-protector -fno-builtin -Wl,-soname,audio.primary.default.so -o $@ $<

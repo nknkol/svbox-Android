@@ -16,6 +16,7 @@ add_library(entry SHARED
 
 target_include_directories(entry PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../gpu/ohos_host
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../svbox/src/payload/include
 )
 
 target_link_libraries(entry PUBLIC

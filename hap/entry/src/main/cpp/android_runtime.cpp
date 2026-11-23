@@ -9,6 +9,7 @@
 #include "hwc_renderer.h"
 #include "input_bridge.h"
 #include "sched_qos.h"
+#include "net_proto.h"
 
 #include <arpa/inet.h>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sstream>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -97,6 +99,38 @@ void WriteFile(const std::string& path, const std::string& content) {
     std::ofstream f(path, std::ios::out | std::ios::trunc);
     if (f) {
         f << content;
+    }
+}
+
+void WriteEthernetStaticIpConfig(const std::string& path) {
+    // Standard AOSP IpConfigStore v3 binary format (DataOutputStream big-endian)
+    // configuring emulator-style static eth0 (10.0.2.15/24, gw 10.0.2.2, dns 223.5.5.5 & 8.8.8.8).
+    std::vector<uint8_t> out;
+    auto putBe32 = [&](uint32_t v) {
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xffu));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xffu));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xffu));
+        out.push_back(static_cast<uint8_t>(v & 0xffu));
+    };
+    auto putUtf = [&](const char* s) {
+        uint16_t n = static_cast<uint16_t>(std::strlen(s));
+        out.push_back(static_cast<uint8_t>((n >> 8) & 0xffu));
+        out.push_back(static_cast<uint8_t>(n & 0xffu));
+        out.insert(out.end(), s, s + n);
+    };
+    putBe32(3); // IPCONFIG_FILE_VERSION = 3
+    putUtf("ipAssignment"); putUtf("STATIC");
+    putUtf("linkAddress");  putUtf("10.0.2.15"); putBe32(24);
+    putUtf("gateway");      putBe32(0); putBe32(1); putUtf("10.0.2.2");
+    putUtf("dns");          putUtf("223.5.5.5");
+    putUtf("dns");          putUtf("8.8.8.8");
+    putUtf("proxySettings"); putUtf("NONE");
+    putUtf("id");           putUtf("eth0");
+    putUtf("eos");
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, out.data(), out.size());
+        close(fd);
     }
 }
 
@@ -705,7 +739,16 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--vdev", "/dev/vndbinder:" + sockDir + "/vndbinder.sock:binder",
         "--vdev", "/dev/input/event0:" + sockDir + "/input_touch.sock:chr",
         "--vdev", "/dev/input/event1:" + sockDir + "/input_kbd.sock:chr",
-        "-e", "ANDROID_DNS_MODE=local",
+    };
+    if (!netSockPath_.empty()) {
+        vdevsAndEnv.push_back("--net-sock");
+        vdevsAndEnv.push_back(netSockPath_);
+        vdevsAndEnv.push_back("--vdev");
+        vdevsAndEnv.push_back("/dev/tun:" + netSockPath_ + ":tun");
+        vdevsAndEnv.push_back("--vdev");
+        vdevsAndEnv.push_back("/dev/net/tun:" + netSockPath_ + ":tun");
+    }
+    std::vector<std::string> envArgs = {
         "-e", "ANDROID_BOOTLOGO=1",
         "-e", "ANDROID_ROOT=/system",
         "-e", "ANDROID_ASSETS=/system/app",
@@ -723,6 +766,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-e", "PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/vendor/bin",
     };
     args.insert(args.end(), vdevsAndEnv.begin(), vdevsAndEnv.end());
+    args.insert(args.end(), envArgs.begin(), envArgs.end());
     return args;
 }
 
@@ -936,12 +980,238 @@ void AndroidRuntime::DnsProxyLoop(int listenFd) {
         return true;
     };
 
-    while (running_.load()) {
-        struct pollfd pfd = { listenFd, POLLIN, 0 };
-        if (poll(&pfd, 1, 150) <= 0) continue;
-        int cfd = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
-        if (cfd < 0) continue;
+    auto recvAll = [](int fd, void* p, size_t n) -> bool {
+        uint8_t* b = static_cast<uint8_t*>(p);
+        while (n > 0) {
+            ssize_t r = recv(fd, b, n, 0);
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR) continue;
+                return false;
+            }
+            b += r;
+            n -= static_cast<size_t>(r);
+        }
+        return true;
+    };
 
+    // Map svbox-net shared state (read-only) so we can detect active TUN routes
+    // and check UID bypass rules without per-query IPC overhead.
+    std::mutex stateMu;
+    std::atomic<int> activeWorkers{0};
+    const sv_net_state* netState = nullptr;
+    size_t netStateSize = 0;
+    auto ensureNetState = [&]() -> const sv_net_state* {
+        std::lock_guard<std::mutex> lk(stateMu);
+        if (netState || netSockPath_.empty()) return netState;
+        int nfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (nfd < 0) return nullptr;
+        struct sockaddr_un sa = {};
+        sa.sun_family = AF_UNIX;
+        std::strncpy(sa.sun_path, netSockPath_.c_str(), sizeof(sa.sun_path) - 1);
+        if (connect(nfd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
+            close(nfd);
+            return nullptr;
+        }
+        struct vdev_hdr req = {};
+        req.magic = VDEV_PROTO_MAGIC;
+        req.op = NET_OP_GET_STATE;
+        if (!sendAll(nfd, &req, sizeof(req))) { close(nfd); return nullptr; }
+        struct vdev_hdr rep = {};
+        struct iovec iov = { &rep, sizeof(rep) };
+        union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int) * 2)]; } cbuf = {};
+        struct msghdr msg = {};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.data;
+        msg.msg_controllen = sizeof(cbuf.data);
+        ssize_t rn = recvmsg(nfd, &msg, MSG_CMSG_CLOEXEC);
+        close(nfd);
+        int mfd = -1;
+        if (rn == static_cast<ssize_t>(sizeof(rep)) && rep.magic == VDEV_PROTO_MAGIC && rep.status == 0) {
+            for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
+                    c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+                    std::memcpy(&mfd, CMSG_DATA(c), sizeof(int));
+                    break;
+                }
+            }
+        }
+        if (mfd >= 0) {
+            size_t sz = rep.arg0 >= sizeof(sv_net_state) ? static_cast<size_t>(rep.arg0) : sizeof(sv_net_state);
+            void* p = mmap(nullptr, sz, PROT_READ, MAP_SHARED, mfd, 0);
+            close(mfd);
+            if (p != MAP_FAILED) {
+                const auto* st = static_cast<const sv_net_state*>(p);
+                if (st->magic == SV_NET_STATE_MAGIC && st->version == SV_NET_STATE_VERSION) {
+                    netState = st;
+                    netStateSize = sz;
+                } else {
+                    munmap(p, sz);
+                }
+            }
+        }
+        return netState;
+    };
+
+    auto callerRoutedToTun = [&](int clientFd, const sv_net_state* st) -> bool {
+        if (!st || !st->tun_active) return false;
+        if (st->uid_mode == 0) return true;
+        struct ucred uc = {};
+        socklen_t ulen = sizeof(uc);
+        if (getsockopt(clientFd, SOL_SOCKET, SO_PEERCRED, &uc, &ulen) != 0 || uc.pid <= 0)
+            return true;
+        uint32_t fakeUid = 0;
+        std::string ppath = runBase_ + "/tmpfs/.pid_ids/" + std::to_string(uc.pid);
+        int pfd = open(ppath.c_str(), O_RDONLY | O_CLOEXEC);
+        if (pfd >= 0) {
+            uint32_t ids[8] = {};
+            if (read(pfd, ids, sizeof(ids)) == static_cast<ssize_t>(sizeof(ids))) {
+                fakeUid = ids[1]; // effective fake UID
+            }
+            close(pfd);
+        }
+        uint32_t cnt = st->uid_rule_count > SV_NET_MAX_UID_RULES ? SV_NET_MAX_UID_RULES : st->uid_rule_count;
+        bool matched = false;
+        for (uint32_t i = 0; i < cnt; ++i) {
+            if (fakeUid >= st->uid_ranges[i].start && fakeUid <= st->uid_ranges[i].stop) {
+                matched = true;
+                break;
+            }
+        }
+        return (st->uid_mode == 1) ? matched : !matched;
+    };
+
+    auto queryRawDnsOverTun = [&](const uint8_t* wire, size_t wlen, std::vector<uint8_t>& ansOut) -> bool {
+        if (netSockPath_.empty() || !wire || wlen < 12 || wlen > 4096) return false;
+        int nfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (nfd < 0) return false;
+        struct timeval tv = { 3, 0 };
+        setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(nfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        struct sockaddr_un sa = {};
+        sa.sun_family = AF_UNIX;
+        std::strncpy(sa.sun_path, netSockPath_.c_str(), sizeof(sa.sun_path) - 1);
+        if (connect(nfd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
+            close(nfd);
+            return false;
+        }
+        struct sv_net_dns_query_req qreq = {};
+        qreq.server_v4 = 0; // use svbox-net configured TUN DNS or 8.8.8.8
+        qreq.port = 53;
+        qreq.timeout_ms = 2500;
+        struct vdev_hdr hdr = {};
+        hdr.magic = VDEV_PROTO_MAGIC;
+        hdr.op = NET_OP_DNS_QUERY;
+        hdr.payload_len = static_cast<uint32_t>(sizeof(qreq) + wlen);
+        bool ok = sendAll(nfd, &hdr, sizeof(hdr)) &&
+                  sendAll(nfd, &qreq, sizeof(qreq)) &&
+                  sendAll(nfd, wire, wlen);
+        struct vdev_hdr rep = {};
+        if (ok && recvAll(nfd, &rep, sizeof(rep)) &&
+            rep.magic == VDEV_PROTO_MAGIC && rep.status == 0 &&
+            rep.payload_len >= 12 && rep.payload_len <= 4096) {
+            ansOut.resize(rep.payload_len);
+            ok = recvAll(nfd, ansOut.data(), ansOut.size());
+        } else {
+            ok = false;
+        }
+        close(nfd);
+        return ok;
+    };
+
+    auto queryRawDnsDirectUdp = [&](const uint8_t* wire, size_t wlen, std::vector<uint8_t>& ansOut) -> bool {
+        if (!wire || wlen < 12 || wlen > 4096) return false;
+        const char* servers[] = { "223.5.5.5", "8.8.8.8" };
+        for (const char* srv : servers) {
+            int ufd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            if (ufd < 0) continue;
+            struct timeval tv = { 2, 0 };
+            setsockopt(ufd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            struct sockaddr_in sin = {};
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(53);
+            inet_pton(AF_INET, srv, &sin.sin_addr);
+            if (sendto(ufd, wire, wlen, 0, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) == static_cast<ssize_t>(wlen)) {
+                uint8_t rbuf[4096];
+                ssize_t r = recv(ufd, rbuf, sizeof(rbuf), 0);
+                if (r >= 12) {
+                    ansOut.assign(rbuf, rbuf + r);
+                    close(ufd);
+                    return true;
+                }
+            }
+            close(ufd);
+        }
+        return false;
+    };
+
+    auto queryDnsOverTun = [&](const std::string& host, std::vector<uint32_t>& ipsOut) -> bool {
+        if (netSockPath_.empty() || host.empty() || host.size() > 250) return false;
+        static std::atomic<uint16_t> sTxId{0x1000};
+        uint16_t txid = sTxId.fetch_add(1);
+        std::vector<uint8_t> q;
+        q.reserve(64 + host.size());
+        q.push_back(static_cast<uint8_t>(txid >> 8));
+        q.push_back(static_cast<uint8_t>(txid & 0xff));
+        q.push_back(0x01); q.push_back(0x00); // RD=1
+        q.push_back(0x00); q.push_back(0x01); // QDCOUNT=1
+        q.push_back(0x00); q.push_back(0x00);
+        q.push_back(0x00); q.push_back(0x00);
+        q.push_back(0x00); q.push_back(0x00);
+        size_t pos = 0;
+        while (pos < host.size()) {
+            size_t dot = host.find('.', pos);
+            if (dot == std::string::npos) dot = host.size();
+            size_t llen = dot - pos;
+            if (llen == 0 || llen > 63) return false;
+            q.push_back(static_cast<uint8_t>(llen));
+            q.insert(q.end(), host.begin() + static_cast<ptrdiff_t>(pos),
+                     host.begin() + static_cast<ptrdiff_t>(dot));
+            pos = dot + 1;
+        }
+        q.push_back(0x00);
+        q.push_back(0x00); q.push_back(0x01); // QTYPE=A
+        q.push_back(0x00); q.push_back(0x01); // QCLASS=IN
+
+        std::vector<uint8_t> ans;
+        if (!queryRawDnsOverTun(q.data(), q.size(), ans)) return false;
+
+        auto skipName = [&](size_t off) -> size_t {
+            int hops = 0;
+            while (off < ans.size() && hops++ < 64) {
+                uint8_t b = ans[off];
+                if (b == 0) return off + 1;
+                if ((b & 0xc0u) == 0xc0u) return off + 2;
+                off += 1u + b;
+            }
+            return ans.size() + 1;
+        };
+        uint16_t qdc = static_cast<uint16_t>((ans[4] << 8) | ans[5]);
+        uint16_t anc = static_cast<uint16_t>((ans[6] << 8) | ans[7]);
+        size_t off = 12;
+        for (uint16_t i = 0; i < qdc; ++i) {
+            off = skipName(off);
+            if (off + 4 > ans.size()) return false;
+            off += 4;
+        }
+        for (uint16_t i = 0; i < anc; ++i) {
+            off = skipName(off);
+            if (off + 10 > ans.size()) break;
+            uint16_t rtype = static_cast<uint16_t>((ans[off] << 8) | ans[off + 1]);
+            uint16_t rdlen = static_cast<uint16_t>((ans[off + 8] << 8) | ans[off + 9]);
+            off += 10;
+            if (off + rdlen > ans.size()) break;
+            if (rtype == 1 && rdlen == 4) {
+                uint32_t ip4 = 0;
+                std::memcpy(&ip4, ans.data() + off, 4);
+                ipsOut.push_back(ip4);
+            }
+            off += rdlen;
+        }
+        return !ipsOut.empty();
+    };
+
+    auto handleClient = [&](int cfd) {
         char reqBuf[1024] = {};
         ssize_t rn = recv(cfd, reqBuf, sizeof(reqBuf) - 1, 0);
         if (rn > 0) {
@@ -951,23 +1221,88 @@ void AndroidRuntime::DnsProxyLoop(int listenFd) {
             iss >> cmd;
             if (cmd == "getaddrinfo") {
                 std::string host, serv;
-                int hFlags = 0, hFam = 0, hSock = 0, hProto = 0;
+                int hFlags = -1, hFam = -1, hSock = -1, hProto = -1;
                 iss >> host >> serv >> hFlags >> hFam >> hSock >> hProto;
+                if (hFlags < 0) hFlags = 0;
+                if (hFam < 0) hFam = 0;
+                if (hSock < 0) hSock = 0;
+                if (hProto < 0) hProto = 0;
                 const char* node = (host.empty() || host == "^") ? nullptr : host.c_str();
                 const char* service = (serv.empty() || serv == "^") ? nullptr : serv.c_str();
+
+                // Check if this lookup should go through the active container TUN DNS
+                // (enabling FakeIP & domain routing while preventing loops for VPN apps).
+                bool isNumeric = false;
+                if (node) {
+                    struct in_addr a4;
+                    struct in6_addr a6;
+                    isNumeric = (inet_pton(AF_INET, node, &a4) == 1 || inet_pton(AF_INET6, node, &a6) == 1);
+                }
+                const sv_net_state* nst = ensureNetState();
+                std::vector<uint32_t> tunIps;
+                if (node && !isNumeric && hFam != AF_INET6 &&
+                    callerRoutedToTun(cfd, nst) && queryDnsOverTun(host, tunIps)) {
+                    uint16_t portBe = 0;
+                    if (service) {
+                        struct addrinfo ph = {}, *pr = nullptr;
+                        ph.ai_family = AF_INET;
+                        ph.ai_socktype = hSock;
+                        ph.ai_protocol = hProto;
+                        if (getaddrinfo("127.0.0.1", service, &ph, &pr) == 0 && pr) {
+                            portBe = reinterpret_cast<const struct sockaddr_in*>(pr->ai_addr)->sin_port;
+                            freeaddrinfo(pr);
+                        }
+                    }
+                    int outSock = hSock ? hSock : SOCK_STREAM;
+                    int outProto = hProto ? hProto : (outSock == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
+                    const char okHdr[4] = "222";
+                    sendAll(cfd, okHdr, 4);
+                    for (uint32_t ip4 : tunIps) {
+                        struct sockaddr_in sin = {};
+                        sin.sin_family = AF_INET;
+                        sin.sin_port = portBe;
+                        sin.sin_addr.s_addr = ip4;
+                        uint32_t rec[5] = {
+                            htonl(0),
+                            htonl(AF_INET),
+                            htonl(static_cast<uint32_t>(outSock)),
+                            htonl(static_cast<uint32_t>(outProto)),
+                            htonl(static_cast<uint32_t>(sizeof(sin))),
+                        };
+                        uint32_t mark = htonl(1);
+                        uint32_t clen = 0;
+                        sendAll(cfd, &mark, 4);
+                        sendAll(cfd, rec, sizeof(rec));
+                        sendAll(cfd, &sin, sizeof(sin));
+                        sendAll(cfd, &clen, 4);
+                    }
+                    uint32_t endMark = 0;
+                    sendAll(cfd, &endMark, 4);
+                    close(cfd);
+                    return;
+                }
+
+                // Translate Android Bionic AI_* flags to HarmonyOS musl AI_* flags
+                // (Bionic AI_NUMERICSERV=0x08 vs musl 0x400; Bionic AI_ADDRCONFIG=0x400 vs musl 0x20).
+                int muslFlags = 0;
+                if (hFlags & 0x01) muslFlags |= AI_PASSIVE;
+                if (hFlags & 0x02) muslFlags |= AI_CANONNAME;
+                if (hFlags & 0x04) muslFlags |= AI_NUMERICHOST;
+                if (hFlags & 0x08) muslFlags |= AI_NUMERICSERV;
+
                 struct addrinfo hints = {};
-                hints.ai_flags = hFlags;
+                hints.ai_flags = muslFlags;
                 hints.ai_family = hFam;
                 hints.ai_socktype = hSock;
                 hints.ai_protocol = hProto;
                 struct addrinfo* res = nullptr;
                 int gai = getaddrinfo(node, service, &hints, &res);
                 if (gai == 0 && res) {
-                    const char okHdr[] = "222 0 ok";
-                    sendAll(cfd, okHdr, sizeof(okHdr)); // includes NUL
+                    const char okHdr[4] = "222";
+                    sendAll(cfd, okHdr, 4); // exact 4 bytes: "222\0"
                     for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
                         uint32_t rec[5] = {
-                            htonl(static_cast<uint32_t>(ai->ai_flags)),
+                            htonl(0u),
                             htonl(static_cast<uint32_t>(ai->ai_family)),
                             htonl(static_cast<uint32_t>(ai->ai_socktype)),
                             htonl(static_cast<uint32_t>(ai->ai_protocol)),
@@ -988,15 +1323,168 @@ void AndroidRuntime::DnsProxyLoop(int listenFd) {
                     sendAll(cfd, &endMark, 4);
                     freeaddrinfo(res);
                 } else {
-                    const char errHdr[] = "401 0 fail";
-                    sendAll(cfd, errHdr, sizeof(errHdr));
+                    const char errHdr[4] = "401";
+                    uint32_t errCode = htonl(7u);
+                    sendAll(cfd, errHdr, 4);
+                    sendAll(cfd, &errCode, 4);
                 }
+            } else if (cmd == "resnsend") {
+                uint32_t netId = 0, flags = 0;
+                std::string b64;
+                iss >> netId >> flags >> b64;
+                auto b64Dec = [](const std::string& in) -> std::vector<uint8_t> {
+                    static const int8_t T[128] = {
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+                    };
+                    std::vector<uint8_t> out;
+                    uint32_t val = 0;
+                    int valb = -8;
+                    for (unsigned char c : in) {
+                        if (c == '=') break;
+                        if (c >= 128 || T[c] < 0) continue;
+                        val = (val << 6) | static_cast<uint32_t>(T[c]);
+                        valb += 6;
+                        if (valb >= 0) {
+                            out.push_back(static_cast<uint8_t>((val >> valb) & 0xffu));
+                            valb -= 8;
+                        }
+                    }
+                    return out;
+                };
+                std::vector<uint8_t> qwire = b64Dec(b64);
+                std::vector<uint8_t> awire;
+                const sv_net_state* nst = ensureNetState();
+                bool ok = false;
+                if (callerRoutedToTun(cfd, nst)) {
+                    ok = queryRawDnsOverTun(qwire.data(), qwire.size(), awire);
+                }
+                if (!ok) {
+                    ok = queryRawDnsDirectUdp(qwire.data(), qwire.size(), awire);
+                }
+                if (ok && awire.size() >= 12) {
+                    uint32_t rcodeBe = htonl(static_cast<uint32_t>(awire[3] & 0x0fu));
+                    uint32_t lenBe = htonl(static_cast<uint32_t>(awire.size()));
+                    sendAll(cfd, &rcodeBe, 4);
+                    sendAll(cfd, &lenBe, 4);
+                    sendAll(cfd, awire.data(), awire.size());
+                } else {
+                    int32_t errBe = static_cast<int32_t>(htonl(static_cast<uint32_t>(-ETIMEDOUT)));
+                    sendAll(cfd, &errBe, 4);
+                }
+            } else if (cmd == "gethostbyname") {
+                uint32_t netId = 0;
+                std::string host;
+                int af = AF_INET;
+                iss >> netId >> host >> af;
+                (void)netId;
+                std::vector<std::vector<uint8_t>> addrs;
+                const uint32_t addrLen = (af == AF_INET6) ? 16u : 4u;
+                if (!host.empty() && host != "^" && (af == AF_INET || af == AF_INET6)) {
+                    uint8_t numBuf[16] = {};
+                    if (inet_pton(af, host.c_str(), numBuf) == 1) {
+                        addrs.emplace_back(numBuf, numBuf + addrLen);
+                    } else {
+                        const sv_net_state* nst = ensureNetState();
+                        std::vector<uint32_t> tunIps;
+                        if (af == AF_INET && callerRoutedToTun(cfd, nst) && queryDnsOverTun(host, tunIps)) {
+                            for (uint32_t ip4 : tunIps) {
+                                uint8_t b[4];
+                                std::memcpy(b, &ip4, 4);
+                                addrs.emplace_back(b, b + 4);
+                            }
+                        } else {
+                            struct addrinfo hints = {};
+                            hints.ai_family = af;
+                            hints.ai_socktype = SOCK_STREAM;
+                            struct addrinfo* res = nullptr;
+                            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
+                                for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+                                    const uint8_t* ptr = nullptr;
+                                    if (af == AF_INET && ai->ai_family == AF_INET && ai->ai_addrlen >= sizeof(struct sockaddr_in)) {
+                                        ptr = reinterpret_cast<const uint8_t*>(&reinterpret_cast<const struct sockaddr_in*>(ai->ai_addr)->sin_addr);
+                                    } else if (af == AF_INET6 && ai->ai_family == AF_INET6 && ai->ai_addrlen >= sizeof(struct sockaddr_in6)) {
+                                        ptr = reinterpret_cast<const uint8_t*>(&reinterpret_cast<const struct sockaddr_in6*>(ai->ai_addr)->sin6_addr);
+                                    }
+                                    if (ptr) {
+                                        std::vector<uint8_t> a(ptr, ptr + addrLen);
+                                        bool dup = false;
+                                        for (const auto& ex : addrs) {
+                                            if (ex == a) { dup = true; break; }
+                                        }
+                                        if (!dup) addrs.push_back(std::move(a));
+                                    }
+                                }
+                                freeaddrinfo(res);
+                            }
+                        }
+                    }
+                }
+                if (!addrs.empty()) {
+                    const char okHdr[4] = "222";
+                    uint32_t nameLen = static_cast<uint32_t>(host.size() + 1);
+                    uint32_t nNameLen = htonl(nameLen);
+                    uint32_t zero = 0;
+                    uint32_t nAf = htonl(static_cast<uint32_t>(af));
+                    uint32_t nAlen = htonl(addrLen);
+                    sendAll(cfd, okHdr, 4);
+                    sendAll(cfd, &nNameLen, 4);
+                    sendAll(cfd, host.c_str(), nameLen);
+                    sendAll(cfd, &zero, 4); // 0 aliases
+                    sendAll(cfd, &nAf, 4);
+                    sendAll(cfd, &nAlen, 4);
+                    for (const auto& a : addrs) {
+                        sendAll(cfd, &nAlen, 4);
+                        sendAll(cfd, a.data(), a.size());
+                    }
+                    sendAll(cfd, &zero, 4); // end of addresses
+                } else {
+                    const char errHdr[4] = "401";
+                    uint32_t errCode = htonl(1u);
+                    sendAll(cfd, errHdr, 4);
+                    sendAll(cfd, &errCode, 4);
+                }
+            } else if (cmd == "getdnsnetid") {
+                const char okHdr[4] = "222";
+                uint32_t nidBe = htonl(100u);
+                sendAll(cfd, okHdr, 4);
+                sendAll(cfd, &nidBe, 4);
             } else {
-                const char errHdr[] = "401 0 unsupported";
-                sendAll(cfd, errHdr, sizeof(errHdr));
+                const char errHdr[4] = "401";
+                uint32_t errCode = htonl(7u);
+                sendAll(cfd, errHdr, 4);
+                sendAll(cfd, &errCode, 4);
             }
         }
         close(cfd);
+    };
+
+    while (running_.load()) {
+        struct pollfd pfd = { listenFd, POLLIN, 0 };
+        if (poll(&pfd, 1, 150) <= 0) continue;
+        int cfd = accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) continue;
+        if (activeWorkers.load() < 32) {
+            activeWorkers.fetch_add(1);
+            std::thread([&, cfd]() {
+                handleClient(cfd);
+                activeWorkers.fetch_sub(1);
+            }).detach();
+        } else {
+            handleClient(cfd);
+        }
+    }
+    for (int i = 0; i < 300 && activeWorkers.load() > 0; ++i) {
+        usleep(10000);
+    }
+    if (netState && netStateSize > 0) {
+        munmap(const_cast<sv_net_state*>(netState), netStateSize);
     }
 }
 
@@ -1096,6 +1584,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const std::string netd =
         FileExists(hnpBin + "/svbox-netd") ? (hnpBin + "/svbox-netd")
                                            : (androidDir_ + "/netd/svbox-netd");
+    const std::string svboxNet =
+        FileExists(hnpBin + "/svbox-net") ? (hnpBin + "/svbox-net")
+                                          : "/storage/Users/currentUser/Workspace/svbox/build/svbox-net";
     const std::string sockDir = runBase_ + "/sockets";
     const std::string propDir = runBase_ + "/__properties__";
     const std::string ipcDir = runBase_ + "/ipc";
@@ -1130,7 +1621,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/data/system_de/0", "/data/system_ce/0", "/data/misc/profiles/cur/0",
         "/data/misc/profiles/ref", "/data/misc/apexdata", "/data/misc/keystore",
         "/data/misc/gatekeeper", "/data/misc/installd", "/data/misc/user/0",
-        "/data/misc/media", "/data/misc/credstore",
+        "/data/misc/media", "/data/misc/credstore", "/data/misc/ethernet",
         "/data/misc_ce/0", "/data/misc_de/0", "/data/vendor_ce/0", "/data/vendor_de/0",
         "/data/media/0", "/data/media/0/Download", "/data/media/0/Download/HarmonyShare",
         "/data/media/0/Pictures", "/data/media/0/DCIM", "/data/media/0/DCIM/Camera",
@@ -1152,6 +1643,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
 
     EnsureOwnerDb(dataBase_ + "/owner.db");
+    WriteEthernetStaticIpConfig(dataBase_ + "/data/misc/ethernet/ipconfig.txt");
 
     WriteFile(runBase_ + "/sys_power/wake_lock", "");
     WriteFile(runBase_ + "/sys_power/wake_unlock", "");
@@ -1237,6 +1729,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     unlink((sockDir + "/property_service").c_str());
     unlink((sockDir + "/adbd").c_str());
     unlink((sockDir + "/fwmarkd").c_str());
+    unlink((sockDir + "/net.sock").c_str());
     unlink((sockDir + "/mdns").c_str());
     unlink((sockDir + "/input_touch.sock").c_str());
     unlink((sockDir + "/input_kbd.sock").c_str());
@@ -1355,17 +1848,30 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     pid_t pidPropd = Spawn(propArgs, false, logDir + "/propd.log");
 
-    // 2. Start userspace Binder routers
+    // 2. Start userspace Binder routers & generic virtual network stack (svbox-net)
     pid_t pidBinder = Spawn({ binderd, sockDir + "/binder.sock" }, false, logDir + "/binderd.log");
     Spawn({ binderd, sockDir + "/hwbinder.sock" }, false, logDir + "/hwbinderd.log");
     Spawn({ binderd, sockDir + "/vndbinder.sock" }, false, logDir + "/vndbinderd.log");
+    netSockPath_.clear();
+    if (FileExists(svboxNet)) {
+        Spawn({ svboxNet,
+                "--sock", sockDir + "/net.sock",
+                "--iface", "eth0:10.0.2.15/24:10.0.2.2:02:00:00:00:00:01",
+                "--dns", "223.5.5.5",
+                "--log-level", "2" },
+              false, logDir + "/svbox_net.log");
+        if (WaitForFile(sockDir + "/net.sock", 2000)) {
+            netSockPath_ = sockDir + "/net.sock";
+        }
+    }
 
     bool okBinder = WaitForFile(sockDir + "/binder.sock", 2000);
     bool okHwBinder = WaitForFile(sockDir + "/hwbinder.sock", 2000);
     bool okProp = WaitForFile(sockDir + "/property_service", 2000);
     logLine("Sockets ready: binder=" + std::to_string(okBinder) +
             " hwbinder=" + std::to_string(okHwBinder) +
-            " prop=" + std::to_string(okProp));
+            " prop=" + std::to_string(okProp) +
+            " net=" + std::to_string(!netSockPath_.empty()));
     if (!running_.load()) return;
 
     if (!okBinder || !okProp) {
@@ -1554,8 +2060,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                                   !audioSvcPath_.empty() && FileExists(audioSvcPath_);
         if (FileExists(netd)) {
             std::vector<std::string> netdArgs = { netd, sockDir + "/binder.sock" };
+            if (!netSockPath_.empty()) {
+                netdArgs.push_back("--net-sock");
+                netdArgs.push_back(netSockPath_);
+                netdArgs.push_back("--fwmark-sock");
+                netdArgs.push_back(sockDir + "/fwmarkd");
+            }
             if (useRealAudio) netdArgs.push_back("--no-audio-stubs");
             Spawn(netdArgs, false, logDir + "/netd.log");
+            if (!netSockPath_.empty()) {
+                WaitForFile(sockDir + "/fwmarkd", 1000);
+            }
         }
         auto launchPaced = [&](const std::string& tag, const std::vector<std::string>& cmd) {
             runSvbox(tag, cmd);

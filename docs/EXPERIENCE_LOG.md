@@ -466,6 +466,59 @@ Step 5 严格遵循“**容器通用兼容性沉淀进 `svbox`，Android 镜像�
 | **零改只读 `rootfs` 校验** | 切至 SwiftShader 后 `inject_layer` `gpuLibs=0`，容器内 `/vendor/lib64/egl` 与 `/vendor/lib64/hw` 中 **`ranchu_count=0`**（零 `emulation`/`ranchu` 残留），证明 `rootfs/` 零写入污染 |
 | **跨重启持久化 + 三 GPU 模式全回归** | 依次完成 `Vulkan → GLES → SwiftShader → Vulkan` 完整停启切换：`/data/local/tmp`、`/sdcard/Documents` 与 `settings global` 三项持久化数据 100% 保留，三种 GPU 模式均正常抵达 `BOOT_COMPLETED` |
 
+---
+
+### 5.5 Step 6 实机落地与验证记录（2026-11-23）
+
+Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心层（零 Android/OHOS 代码），模拟器 `eth0` 与 `INetd`/`fwmarkd`/`dnsproxyd` 胶水归属 `svbox-Android` 薄层，原版 `rootfs/` 零字节修改**”架构原则，在 `svbox`（`feat/vdev-binder`）落地 **2 个核心提交**（`d894c41`、`569cd1e`），并在鸿蒙 PC（`HAD-W32`）完成从 Android 11 `VALIDATED` 网络状态到容器内 Go TUN 代理 + FakeIP DNS + Chromium WebView 透明接管的全链路实机验证。
+
+#### A. `svbox` 核心层通用用户态网络与虚拟 TUN 栈（`feat/vdev-binder`，100% 纯 Linux 通用）
+
+1. **`d894c41` — 通用用户态虚拟网络协议栈与 TUN 代理（`--net-sock` + `--vdev GUEST:SOCK:tun` + `svbox-net`）**
+   * **内核级真 FD 虚拟 TUN**（[`vdev.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vdev.c)、[`vdev_proto.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/vdev_proto.h)）：新增 `VDEV_TYPE_TUN`，`open("/dev/net/tun" | "/dev/tun")` 通过控制通道 `SCM_RIGHTS` 返回真实内核 `AF_UNIX SOCK_SEQPACKET` FD（天然保留 IP 报文边界、完整支持 `epoll`/`poll`/`O_NONBLOCK`/`dup`/`fork`/跨进程 `SCM_RIGHTS` 传递），最后一个持有者关闭时 `svbox-net` 通过 `EPOLLHUP` 自动拆毁虚拟网卡与关联路由。
+   * **独立零依赖 C11 网络守护进程 `svbox-net`**（[`tools/net/svbox_net.c`](file:///storage/Users/currentUser/Workspace/svbox/tools/net/svbox_net.c)、[`tools/net/tcp_stack.c`](file:///storage/Users/currentUser/Workspace/svbox/tools/net/tcp_stack.c)、[`tools/net/net_internal.h`](file:///storage/Users/currentUser/Workspace/svbox/tools/net/net_internal.h)）：
+     * 单写者只读共享内存 `struct sv_net_state`（`memfd` + `PROT_READ` 映射，0 常驻连接），维护虚拟接口表、IPv4/IPv6 路由表、UID 策略规则与受保护 socket inode 表；
+     * 内置 RFC 793/7323 用户态 IPv4/IPv6 + TCP/UDP/ICMPv4 协议栈（256 KiB 环形收发缓冲、Window Scale=6、乱序重组、快速重传与指数退避 RTO、半关闭 `FIN`/`RST`）；
+     * 完整实现 `AF_NETLINK NETLINK_ROUTE`（`GET/NEW/DEL LINK/ADDR/ROUTE/RULE`）、`SIOC*` ioctl、`/proc/net/{dev,route,if_inet6}` 与 `/sys/class/net/<iface>/*` 虚拟视图（同时解决鸿蒙 HAP 沙箱读宿主 `/proc/net/*` 报 SELinux `EACCES` 与宿主网卡泄露问题）；
+     * 透明接管容器内 IPv4、双栈 IPv6 `::ffff:` 与纯 IPv6 的 TCP/UDP 流量：无活跃 TUN 时 0 开销直连快路径；有活跃 TUN 时按最长前缀匹配路由注入 TUN，并通过 `getpeername`/`getsockname`/`recvfrom`/`recvmsg` 透明还原原始对端与虚拟网卡地址；
+     * 提供四种防回环直连豁免机制：`SO_MARK`、`SO_BINDTODEVICE`、跨进程 socket inode 豁免（`NET_OP_PROTECT_INO`）与 UID 范围策略规则（`NET_OP_UID_RULES`），并暴露通用 `NET_OP_DNS_QUERY` RPC 供外部解析器透传 TUN FakeIP DNS。
+2. **`569cd1e` — 修复实机 `iproute2` 暴露的两处通用 RTNetlink 兼容性问题（坑 6-3）**
+   * **现象**：容器内执行 Android 原生 `ip addr add` / `ip route add` 时地址与路由均成功生效，但 `ip` 进程随后卡死超时。
+   * **双根因**：
+     1. `iproute2`（及 Go `netlink`）发包时设置 `req.nlmsg_pid = 0`，但校验内核返回的 `NLMSG_ERROR` ACK 必须满足 `reply.nlmsg_pid == local.nl_pid`；此前 `nl_send_ack()` 误填了 `req->pid`（`0`）而非已绑定的 `nc->pid`。
+     2. `AF_UNIX SOCK_SEQPACKET` 在内核 `recvmsg()`/`recvfrom()` 返回时会把 `msg_namelen` 覆盖为 `0`，导致在 `post_syscall` 中 `m->msg_namelen > 0` 恒假、未写回内核 `sockaddr_nl (nl_pid = 0)`。
+   * **解法**：`svbox-net` 统一用解析后的 `pid` 填充 `NLMSG_ERROR` 并在 `NET_OP_NL_BIND` 同步客户端 `nl_pid`；[`net_stack.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/net_stack.c) 改为在 `pre_syscall` 直接拦截虚拟 Netlink FD 的 `recvfrom`/`recvmsg`，在内核改写前记录调用方缓冲区容量并完整回填 `sockaddr_nl`。
+3. **通用 Linux 回归与纯净度校验**：
+   * `grep -rniE "android|ohos|harmony"` 扫描全部新增网络源码与测试 **0 命中**；
+   * [`test/vfs/test_tun_netstack.py`](file:///storage/Users/currentUser/Workspace/svbox/test/vfs/test_tun_netstack.py)（含 256 KiB 乱序 TCP + SHA-256、双栈 IPv6、FakeIP→`tun0`→`SO_MARK` 代理环路、多对端无连接 UDP、四种绕过机制、`NET_OP_DNS_QUERY`、ICMPv4、`SCM_RIGHTS` 跨进程传递与自动拆毁、`iproute2` 风格 Netlink ACK）及 Go `net.Interfaces()`、`test_net.py`（4/4）、`test_resource_limits.py`、`test_union.py`（8/8）、`test_mounts.py`（4/4）、`test_owners.py`（4/4）、`test_paths.py`（57/57）、`check_dispatch.py`（170 slow syscalls）、`check_payload_abi.py`（5/5）**全部 PASS**。
+
+#### B. `svbox-Android` 模拟器网络接入与踩坑实录
+
+* **HNP 打包与守护进程编排**（[`scripts/pack_hnp.py`](file:///storage/Users/currentUser/Workspace/svbox-Android/scripts/pack_hnp.py)、[`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)）：
+  * 将 `svbox-net` 打入 `svbox.hnp`，启动时拉起 `svbox-net --iface eth0:10.0.2.15/24:10.0.2.2:02:00:00:00:00:01 --dns 223.5.5.5`，为所有容器进程统一传递 `--net-sock` 与 `--vdev /dev/tun:...:tun` + `--vdev /dev/net/tun:...:tun`；预置 AOSP `IpConfigStore` v3 格式 `/data/misc/ethernet/ipconfig.txt`，使 `EthernetService` 自动完成静态 IP 配置。
+* **完整 `svbox-netd`（`INetd` + `IDnsResolver` + `INetdUnsolicitedEventListener` + `/dev/socket/fwmarkd`）**（[`netd/svbox_netd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/netd/svbox_netd.c)）：
+  * 基于 `svbox-net` 实时驱动 `interfaceGetList/GetCfg/SetCfg/AddAddress/DelAddress/ClearAddrs/SetMtu`、`networkCreatePhysical/CreateVpn/Destroy/AddInterface/RemoveInterface/AddRoute/AddRouteParcel/AddUidRanges/RemoveUidRanges/SetDefault` 与 `IDnsResolver.setResolverConfiguration`，并启动独立线程服务 `/dev/socket/fwmarkd`：收到 `PROTECT_FROM_VPN (cmd=3)` 或物理网 `SELECT_NETWORK (cmd=2)` 时提取 `SCM_RIGHTS` socket 的 `fstat().st_ino` 注册至 `svbox-net` `NET_OP_PROTECT_INO`，立即返回 `0`（既彻底杜绝 Step 5 遇到的 `adbd` `accept4` 死锁，又完整打通 `VpnService.protect(fd)`）。
+* **多坑排障记录**：
+  * **坑 6-1：`TUNSETIFF` 的 `_IOC_SIZE` 陷阱**：Linux 头文件定义 `TUNSETIFF = _IOW('T', 202, int) = 0x400454ca`（编码长度仅 4B），实际读写 40B `struct ifreq`。在 `vdev.c` `tun_ioctl()` 中对 `TUNSETIFF`/`TUNGETIFF`/`TUNSETQUEUE` 显式做 40B 双向序列化，并放行 `FIONBIO`/`FIONREAD`。
+  * **坑 6-2：鸿蒙内核 `accept4()` 从 `listen_fd` 继承 `O_NONBLOCK`**：标准 Linux 上 `accept4(..., SOCK_CLOEXEC)` 返回的新连接始终为阻塞模式，但鸿蒙内核会继承非阻塞监听 socket 的 `O_NONBLOCK`，导致 `svbox-net` 接收短控制 RPC 时偶发 `EAGAIN`/`BrokenPipeError`。在 `svbox_net.c` 对所有接受的控制连接显式清除 `O_NONBLOCK` 并设置 2s 超时后彻底根除。
+  * **坑 6-4：Android 11 `NetworkMonitor` 校验失败与 `dnsproxyd` 协议三重差异**：
+    1. 旧启动参数 `-e ANDROID_DNS_MODE=local` 会令 `libnetd_client.so` 直接拒绝 `resnsend`（返回 `ENOSYS`），导致 `NetworkMonitor` 一直 `everValidated=false`；移除该环境变量并实现 `resnsend`（直接回写 `[be32 rcode][be32 len][dns_wire]`）后，`PROBE_DNS` 8–12ms 通过。
+    2. 反汇编原版 `libc.so`（`android_getaddrinfo_proxy` / `android_read_hostent`）与 `libnetd_client.so`（`getNetworkForDnsInternal`）确认：`getaddrinfo`、`gethostbyname` 与 `getdnsnetid` 严格只读 **4 字节** `"222\0"` 头（此前发送 9 字节 `"222 0 ok\0"` 导致后续二进制流整体错位 5 字节）；同时 Bionic `AI_NUMERICSERV (0x08)` / `AI_ADDRCONFIG (0x400)` 与鸿蒙 musl 定义正好互换，且 `hints==NULL` 时 Bionic 发送 `-1`。全部按字节对齐修正并改为多 worker 并发处理（避免容器内 TUN 代理查询上游 DNS 时与被代理应用产生单线程死锁），同时支持活跃 TUN 时按调用方 fake UID 路由 `NET_OP_DNS_QUERY` 获取 FakeIP。
+  * **坑 6-5（附带发现，留待后续专题修复）**：实测 `pm install` 时，`PackageInstallerSession.validateApkInstallLocked()` 内非 Binder 线程池线程向 `servicemanager` 查询同进程自持服务（`platform_compat`）会阻塞在 `svbox-binderd` `af_unix_recvmsg`（而独立进程执行 `service check platform_compat` 5ms 返回），系既有 `svbox-binderd` 同进程多线程 `BR_REPLY` 路由边界问题，与本次网络栈无关，后续可针对性修复以打通热装第三方 APK。
+
+#### C. `HAD-W32` 真机 Step 6 全项验收结果
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **模拟器风格 `eth0` 与 Android 联网认证** | `dumpsys connectivity`：`Active default network: 100`（`Ethernet`，`eth0 10.0.2.15/24`，gw `10.0.2.2`，DNS `223.5.5.5, 8.8.8.8`），**`Capabilities: ...&VALIDATED`**、`Score{70}`、`everValidated{true}`、`lastValidated{true}`；`PROBE_DNS` 10–12ms、`PROBE_HTTP` 140ms `204`、`PROBE_HTTPS` 830ms `204` |
+| **容器网络视图隔离 & 无 SELinux 报错** | 容器内 `ip addr` / `ip route` / `/proc/net/{dev,route}` 与 Go `net.Interfaces()` 仅见 `lo` 与 `eth0`，无任何 `Permission denied` 与宿主网卡泄露；`/dev/tun`、`/dev/net/tun` 均呈 `crw-rw-rw- 10, 200` |
+| **Bionic 全协议 DNS（含 `ping`）** | `getaddrinfo`、`resnsend`、`getdnsnetid`、`gethostbyname` 全通；`adb shell ping -c 1 www.baidu.com` 正常解析并 `0% packet loss (5.86 ms)` |
+| **容器内 Go TUN 代理全链路（10/10 PASS）** | 静态 ARM64 Go TUN 代理打开 `/dev/tun` 创建 `tun0 (10.200.0.1/24)` + `ip route add default dev tun0`：<br>① **FakeIP DNS → TUN TCP → `fwmarkd PROTECT_FROM_VPN` → 宿主机 HTTP**：`200 OK`（`netd.log` 记录 `fwmarkd cmd=3 protected socket ino=...`）；<br>② **FakeIP DNS → TUN TCP → `SO_MARK` 绕过 → 宿主机 HTTP**：`200 OK`；<br>③ **直返 TUN TCP & UDP 回显 (`198.19.1.44:5353`)**：均通过；<br>④ **真实互联网 `connectivitycheck.gstatic.com:80` 经 `tun0` → `fwmarkd` 代理**：返回 `HTTP/1.1 204 No Content`；<br>⑤ **真机 Android Chromium WebView（`Chrome/125.0.6422.113`）打开 `http://fwmark-test.svbox.local/from-android-webview`**：真实 App 流量无缝命中 FakeIP DNS、经 `tun0` 与 `fwmarkd` 抵达宿主机服务端（连带 `/favicon.ico` 均成功，`/proc/net/dev` 实时统计 `tun0: RX 3445B/46pkts, TX 3149B/40pkts`） |
+| **宿主机零污染 & 自动拆毁恢复** | TUN 代理运行期间宿主机 `/proc/net/dev` 完全无 `tun0`；退出 TUN 代理后 `svbox-net` 自动拆毁 `tun0` 与默认路由，容器恢复至 `lo` + `eth0` 且直连外网 `HTTP/1.1 204 No Content` 立即恢复 |
+| **`svbox-netd` VPN 控制面 RPC** | `service call netd 5`（`networkCreateVpn(101)`）与 `service call netd 6`（`networkDestroy(101)`）均返回 `Parcel(00000000)` 零异常 |
+| **零改只读 `rootfs/` 校验** | `rootfs/` 0 字节改动，`adbd` (`127.0.0.1:5555`) 响应流畅无卡死 |
+
+
 
 
 
