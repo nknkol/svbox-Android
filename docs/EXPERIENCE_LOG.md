@@ -562,6 +562,61 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **Alpine 鸿蒙 `OHAudio` & 通用 RGBA 帧缓冲** | Alpine 经 `/ipc/audio.sock` 推送 35,280B 440Hz PCM，真机拉起 `libohaudio.so` 播放（`audio_backend=1, audio_rx=audio_played=35280`）；经 `/ipc/fb.sock` 推送 320×240 RGBA 帧获 `"ok"` ACK，宿主机像素校验 100% 一致 |
 | **Android 11 零回归 + 手柄/USB 原生识别** | 解耦后的 `org.svbox.android` 真机启动流畅：`dumpsys input` 识别 **`svbox-touchscreen` (`event0`)、`svbox-keyboard` (`event1`)、`svbox-gamepad` (`event2`, `Classes: 0x80000141 EXTERNAL\|JOYSTICK\|GAMEPAD\|KEYBOARD`, `Sources: 0x01000511`)**；`/dev/bus/usb/001/002` 返回 50B 描述符；`dumpsys connectivity` `VALIDATED (Score 70)`；`pm install` **0.26s** / `pm uninstall` **0.30s**；`SurfaceFlinger` 正常渲染，`rootfs/` 0 字节改动 |
 
+---
+
+### 十、Step 8：全链路性能优化、桩岛 100% 兜底、高并发网络与 VFS 模块化重构
+
+#### A. 核心工程落地项
+
+1. **桩岛 100% 兜底 + 共享区域页级复用池（`stub_island.h` / `hook_runtime.c` / `dispatch.c` / `syscall_disp.c`）**
+   * 修正末尾指令越界检查（`slot + 31 * 4`），避免近边界截断。
+   * 升级三阶段空洞探测（`1 MiB → 64 KiB → 4 KiB` 边缘扫描）并将临时 `small_list[256]` 移至栈上（消除临时堆/映射开销）。
+   * 新增 **Shared Region Stub Pool**（64 区域 × 256 KiB，64 页/区位图管理，严格 W^X `PROT_NONE → RW → RX → PROT_NONE`）及 `hook_on_munmap()` 自动回收机制，消除 JIT 代码高频映射下的页泄漏与反复 `mmap/munmap` 抖动。
+   * 对超大（>256 MiB）或 ±128 MiB 虚拟地址空间被占满的极端场景，在 `--seccomp-backstop` 开启时 **100% 自动降级至 `SIGSYS` 兜底拦截**（未开启 backstop 时严格 fail-closed 返回 `-ENOMEM`）。
+   * 新增通用单测 `test/vfs/test_stub_island_fallback.py`（5,000 次 JIT 池循环、64 KiB 窄缝探测、0 字节空闲空间的 `--seccomp-backstop` 100% 兜底、无 backstop fail-closed 全通）。
+
+2. **高并发用户态虚拟网络（`net_proto.h` / `net_internal.h` / `tcp_stack.c` / `svbox_net.c` / `net_stack.c`）**
+   * 并发容量整体提升 **8×**：`NET_MAX_TCP_CONNS` / `NET_MAX_UDP_PORTS` / `SV_NET_FLOW_CAP` / `SV_NET_PROTECT_CAP` 由 `256 → 2048`，`SV_NET_UDP_REP_CAP` 升至 `1024`，`NET_MAX_NLS` 升至 `256`，`NET_MAX_DNS_REQS` 升至 `128`。
+   * `tcp_stack.c` 引入 **O(1) 四元组 TCP 哈希表**（`tcp_buckets[4096]` + 轮转槽位分配游标 + `active_conns == 0` 跳过定时扫描）；`svbox_net.c` 引入单槽 `net_sync_flow_slot()`（避免每次建连/断连拷贝整张 2048 槽流表）、`listen(512)`、`epoll_wait(256)` 及 TUN 单轮 64 包公平限流。
+   * `net_stack.c`：`g_mark_fds` 改为按需 `mmap` 动态扩容（64 静态内联 → 256 → 4096），并加入原子活跃计数快路径（`g_nl_active_count` / `g_mark_active_count == 0` 时零加锁零扫描）与 `/proc`/`/sys` 首字节快速剪枝。
+   * 新增高并发压测 `test/vfs/test_net_high_concurrency.py`：**320 路并发 TCP 经虚拟 TUN 全双工回显 + 128 路并发 `SO_MARK` 旁路 socket 在 0.28s 内全部通过**。
+
+3. **零 `mmap` Binder 热路径 & `svbox-binderd` O(1) 索引（`vdev.c` / `svbox_binderd.c`）**
+   * `vdev.c`：`binder_write_read()` 彻底消除每次调用 `mmap(256 KiB)` + `munmap(256 KiB)`——常规事务（≤ 8 KiB）直接使用栈上 8 KiB 缓冲区（零 `mmap`、零缺页、零 TLB shootdown），超大事务复用每线程懒分配缓存的 256 KiB 缓冲区并在线程退出/关槽时回收；`find_slot_by_fd()` 增加 `g_vdev_open_count` 原子快路径跳过普通 FD 的 `getpid()`。
+   * `svbox-Android/binderd/svbox_binderd.c`：为 `find_thread()`、`find_node()` 与 `get_or_create_node()` 引入 8192 桶整数索引 O(1) 哈希表（天然兼容 `realloc`），`listen(512)` + `epoll_wait(256)`。
+
+4. **VFS 模块化拆分 + 5 项热路径优化（`vfs_*.c` / `union_view.c` / `container_state.c`）**
+   * 将原 2,513 行（107 KB）的 `vfs_bridge.c` 清晰拆分为 5 个职责单一的模块（均控制在 10–34 KB）：
+     * `vfs_bridge.c`（656 行 / 24 KB）：`Bridge` 池化、`mounts_version()` 挂载/绑定/视图表跨调用复用、隔离模式乐观重试与公开 `proot_*` 接口
+     * `vfs_ops.c`（810 行 / 35 KB）：系统调用分发、路径变更、R5 属主、socket 地址改写与恒等根（`--root /` 无绑定）零遍历直通快路径
+     * `vfs_walk.c`（718 行 / 26 KB）：路径解析、单次调用 `last_map` 去重、`union_map` 复传 `struct stat` 消除二次 `lstat`、受保护目录遍历与 `union_prepare`
+     * `vfs_cache.c`（514 行 / 17 KB）：只读 `--lower` 不可变 stat/空目录/readlink 缓存 + 带 8 次稳态门限及 `(dev, ino, mtime, ctime, size, nlink, mut_gen)` 强校验的 `upper` 目录 256-bit Bloom 过滤与白化摘要缓存
+     * `vfs_glue.c`（242 行 / 10 KB）：绑定挂载合成父目录（glue）树管理
+   * `union_view.c`：跳过底层无效 `.wh.` 检查；`walk()` 直接回填 `hit->st`；结合只读空目录裁剪 `child_mask` 与稳态 `upper` 目录摘要避免冗余 `hmdfs` / `f2fs` 系统调用。
+   * 同步清理了 `svbox-Android/` 根目录 36 个历史遗留 `hdc-*.log` 与 `__pycache__/` 杂物，保持三层架构目录清爽。
+
+#### B. 5 轮前后性能对比（`HAD-W32` 大核 `12–19`，5 轮中位数 `[min..max]`）
+
+> 同口径基线（`HOST` 本地 f2fs 5 轮前后完全一致：`stat_rw 3.114 vs 3.115 µs`、`open_rw 5.402 vs 5.461 µs`、`small300 24.64 vs 24.97 ms`），原始 JSON 留档于 scratch 目录 `before_baseline.json` / `after_baseline.json`。
+
+| 指标 | `SVBOX_BARE` 优化前 | `SVBOX_BARE` 优化后 | 提速 | `ALPINE_OVERLAY` 优化前 | `ALPINE_OVERLAY` 优化后 | 提速 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`stat_rw`（可写文件）** | `19.61 µs` `[19.55..19.91]` | **`3.75 µs`** `[3.74..4.43]` | **5.23×** | `33.96 µs` `[33.81..34.10]` | **`11.59 µs`** `[11.53..11.61]` | **2.93×** |
+| **`stat_ro`（只读底层）** | `19.56 µs` `[19.53..19.70]` | **`3.68 µs`** `[3.66..3.73]` | **5.32×** | `141.38 µs` `[140.75..141.84]` | **`21.72 µs`** `[21.60..21.77]` | **6.51×** |
+| **`stat_miss`（不存在路径）** | `20.47 µs` `[20.45..20.55]` | **`4.00 µs`** `[3.98..4.04]` | **5.12×** | `105.09 µs` `[104.88..106.18]` | **`9.14 µs`** `[9.10..9.24]` | **11.50×** |
+| **`open+close_rw`** | `21.76 µs` `[21.46..22.13]` | **`6.82 µs`** `[6.74..6.92]` | **3.19×** | `38.61 µs` `[38.44..38.94]` | **`16.34 µs`** `[16.21..17.01]` | **2.36×** |
+| **`open+close_ro`** | `21.93 µs` `[21.74..22.01]` | **`6.73 µs`** `[6.66..7.39]` | **3.26×** | `219.79 µs` `[219.17..220.53]` | **`38.62 µs`** `[38.54..38.84]` | **5.69×** |
+| **`small300`（300 小文件全周期）** | `44.97 ms` `[44.59..57.01]` | **`26.94 ms`** `[25.97..30.52]` | **1.67×** | `127.75 ms` `[126.28..130.19]` | **`52.82 ms`** `[52.34..53.22]` | **2.42×** |
+| **`jit`（RW→RX 桩岛周期）** | `101.04 µs` `[76.25..127.81]` | **`42.77 µs`** `[40.87..46.44]` | **2.36×** | `87.61 µs` `[70.14..101.26]` | **`42.58 µs`** `[28.57..42.74]` | **2.06×** |
+| **`exec`（fork+exec `/bin/true`）** | `38.44 ms` `[37.59..39.36]` | **`36.37 ms`** `[35.71..37.23]` | **1.06×** | `9.01 ms` `[8.44..9.09]` | **`8.68 ms`** `[8.35..8.86]` | **1.04×** |
+
+#### C. 全量回归与双系统真机验收
+
+* **`svbox` 全量回归**：25/25 测试全部 PASS（含 `test_union.py`、`test_mounts.py`、`test_owners.py`、`test_paths.py`、`test_svc.py` 84 项、`test_go_abi.py`、`test_many_blocked.py`、`test_fd_table`、`test_fs_policy`、`test_stub_island_fallback.py`、`test_net_high_concurrency.py`、`test_tun_netstack.py`、`test_vdev_threads.py`、`test_vdev_chr_ioctls.py`），Layer 1 零 Android/OHOS 新增代码纯净度检查通过。
+* **Alpine 3.21.3 ARM64 真机端到端验收**：原版只读 rootfs 正常启动，`/dev/input/event2`、`/dev/bus/usb/001/002`、`/dev/ttyUSB0`、`/ipc/fb.sock`、`eth0`/`lo` 全通。
+* **Android 11 真机验收（重编打包 HNP+HAP 安装实测）**：Vulkan 模式稳定进桌面，`SurfaceFlinger` 60Hz 正常，`eth0` `VALIDATED (Score 70)`，触控/键盘/手柄全在线；3 轮 `pm install` 耗时由 Step 6.5 的 `0.26–0.29s` 进一步降至 **`0.188–0.220s`（中位数 `0.200s`，↑ ~30%）**，`rootfs/` 保持 0 字节改动。
+
+
 
 
 

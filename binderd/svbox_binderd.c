@@ -37,6 +37,7 @@
 #define INIT_PROC_HANDLES  512
 #define MAX_THREADS        4096
 #define MAX_CONNS          4096
+#define HASH_BUCKETS       8192
 #define PROC_MEM_SIZE      (2u * 1024u * 1024u) /* 2 MiB per process */
 #define MAX_ALLOCS         1024
 #define INLINE_BLK_HANDLES 16
@@ -117,6 +118,8 @@ struct bnode {
     uint64_t async_buf_ptr;
     struct bmsg *async_head;
     struct bmsg *async_tail;
+    int      id_hash_next;
+    int      ptr_hash_next;
 };
 
 struct bthread {
@@ -137,12 +140,16 @@ struct bthread {
     int      reply_top;
     struct bmsg *direct_head;
     struct bmsg *direct_tail;
+    int      hash_next;
 };
 
 static struct bproc   g_procs[MAX_PROCS];
 static struct bnode  *g_nodes = NULL;
 static int            g_nodes_cap = 0;
 static struct bthread g_threads[MAX_THREADS];
+static int            g_thread_buckets[HASH_BUCKETS];
+static int            g_node_id_buckets[HASH_BUCKETS];
+static int            g_node_ptr_buckets[HASH_BUCKETS];
 static uint32_t g_next_proc_id   = 1;
 static uint32_t g_next_node_id   = 1;
 static uint32_t g_next_thread_id = 1;
@@ -257,6 +264,83 @@ static int send_reply(int fd, uint32_t op, uint32_t proc_id, int32_t status,
 }
 
 /* ---- Process / Node / Handle / Memory helpers ---- */
+static inline uint32_t hash_u32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x & (HASH_BUCKETS - 1u);
+}
+
+static inline uint32_t hash_node_ptr(uint32_t owner_proc_id, uint64_t ptr)
+{
+    uint64_t h = ptr ^ ((uint64_t)owner_proc_id * 0x9e3779b97f4a7c15ULL);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (uint32_t)h & (HASH_BUCKETS - 1u);
+}
+
+static void thread_hash_insert(int idx)
+{
+    uint32_t b = hash_u32(g_threads[idx].thread_id);
+    g_threads[idx].hash_next = g_thread_buckets[b];
+    g_thread_buckets[b] = idx;
+}
+
+static void thread_hash_remove(int idx)
+{
+    uint32_t b = hash_u32(g_threads[idx].thread_id);
+    int *pp = &g_thread_buckets[b];
+    while (*pp >= 0) {
+        if (*pp == idx) {
+            *pp = g_threads[idx].hash_next;
+            g_threads[idx].hash_next = -1;
+            return;
+        }
+        pp = &g_threads[*pp].hash_next;
+    }
+    g_threads[idx].hash_next = -1;
+}
+
+static void node_hash_insert(int idx)
+{
+    uint32_t bid = hash_u32(g_nodes[idx].node_id);
+    g_nodes[idx].id_hash_next = g_node_id_buckets[bid];
+    g_node_id_buckets[bid] = idx;
+
+    uint32_t bptr = hash_node_ptr(g_nodes[idx].owner_proc_id, g_nodes[idx].ptr);
+    g_nodes[idx].ptr_hash_next = g_node_ptr_buckets[bptr];
+    g_node_ptr_buckets[bptr] = idx;
+}
+
+static void node_hash_remove(int idx)
+{
+    uint32_t bid = hash_u32(g_nodes[idx].node_id);
+    int *pp = &g_node_id_buckets[bid];
+    while (*pp >= 0) {
+        if (*pp == idx) {
+            *pp = g_nodes[idx].id_hash_next;
+            g_nodes[idx].id_hash_next = -1;
+            break;
+        }
+        pp = &g_nodes[*pp].id_hash_next;
+    }
+    g_nodes[idx].id_hash_next = -1;
+
+    uint32_t bptr = hash_node_ptr(g_nodes[idx].owner_proc_id, g_nodes[idx].ptr);
+    pp = &g_node_ptr_buckets[bptr];
+    while (*pp >= 0) {
+        if (*pp == idx) {
+            *pp = g_nodes[idx].ptr_hash_next;
+            g_nodes[idx].ptr_hash_next = -1;
+            break;
+        }
+        pp = &g_nodes[*pp].ptr_hash_next;
+    }
+    g_nodes[idx].ptr_hash_next = -1;
+}
+
 static struct bproc *find_proc(uint32_t proc_id)
 {
     for (int i = 0; i < MAX_PROCS; i++)
@@ -267,9 +351,13 @@ static struct bproc *find_proc(uint32_t proc_id)
 
 static struct bthread *find_thread(uint32_t thread_id)
 {
-    for (int i = 0; i < MAX_THREADS; i++)
-        if (g_threads[i].used && g_threads[i].thread_id == thread_id)
-            return &g_threads[i];
+    if (!thread_id)
+        return NULL;
+    uint32_t b = hash_u32(thread_id);
+    for (int idx = g_thread_buckets[b]; idx >= 0; idx = g_threads[idx].hash_next) {
+        if (g_threads[idx].used && g_threads[idx].thread_id == thread_id)
+            return &g_threads[idx];
+    }
     return NULL;
 }
 
@@ -279,17 +367,20 @@ static struct bnode *find_node(uint32_t node_id)
 {
     if (!node_id)
         return NULL;
-    for (int i = 0; i < g_nodes_cap; i++)
-        if (g_nodes[i].used && g_nodes[i].node_id == node_id)
-            return &g_nodes[i];
+    uint32_t b = hash_u32(node_id);
+    for (int idx = g_node_id_buckets[b]; idx >= 0; idx = g_nodes[idx].id_hash_next) {
+        if (g_nodes[idx].used && g_nodes[idx].node_id == node_id)
+            return &g_nodes[idx];
+    }
     return NULL;
 }
 
 static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, uint64_t cookie)
 {
-    for (int i = 0; i < g_nodes_cap; i++) {
-        if (g_nodes[i].used && g_nodes[i].owner_proc_id == owner_proc_id && g_nodes[i].ptr == ptr)
-            return &g_nodes[i];
+    uint32_t bptr = hash_node_ptr(owner_proc_id, ptr);
+    for (int idx = g_node_ptr_buckets[bptr]; idx >= 0; idx = g_nodes[idx].ptr_hash_next) {
+        if (g_nodes[idx].used && g_nodes[idx].owner_proc_id == owner_proc_id && g_nodes[idx].ptr == ptr)
+            return &g_nodes[idx];
     }
     for (int i = 0; i < g_nodes_cap; i++) {
         if (!g_nodes[i].used) {
@@ -299,6 +390,9 @@ static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, ui
             g_nodes[i].owner_proc_id = owner_proc_id;
             g_nodes[i].ptr = ptr;
             g_nodes[i].cookie = cookie;
+            g_nodes[i].id_hash_next = -1;
+            g_nodes[i].ptr_hash_next = -1;
+            node_hash_insert(i);
             return &g_nodes[i];
         }
     }
@@ -315,6 +409,9 @@ static struct bnode *get_or_create_node(uint32_t owner_proc_id, uint64_t ptr, ui
     g_nodes[idx].owner_proc_id = owner_proc_id;
     g_nodes[idx].ptr = ptr;
     g_nodes[idx].cookie = cookie;
+    g_nodes[idx].id_hash_next = -1;
+    g_nodes[idx].ptr_hash_next = -1;
+    node_hash_insert(idx);
     return &g_nodes[idx];
 }
 
@@ -727,8 +824,10 @@ static void node_check_release(struct bnode *node)
             push_inbox(owner, make_simple_br(SV_BR_DECREFS, pc, sizeof(pc)));
             wake_proc_waiters(owner);
         }
-        if (!node->has_async_txn)
+        if (!node->has_async_txn) {
+            node_hash_remove((int)(node - g_nodes));
             node->used = false;
+        }
     }
 }
 
@@ -1332,6 +1431,7 @@ static void drop_conn(struct conn_entry *ce)
                 if (tp && tp->requested_threads_started > 0)
                     tp->requested_threads_started--;
             }
+            thread_hash_remove((int)(t - g_threads));
             t->used = false;
         }
     } else if (ce->kind == CONN_NOTIFY) {
@@ -1422,6 +1522,7 @@ static void drop_conn(struct conn_entry *ce)
                     }
                     g_nodes[i].async_tail = NULL;
                     g_nodes[i].has_async_txn = false;
+                    node_hash_remove(i);
                     g_nodes[i].used = false;
                 }
             }
@@ -1553,6 +1654,8 @@ static void handle_conn_event(struct conn_entry *ce)
         t->pid = req.pid;
         t->tid = req.tid;
         t->rpc_fd = ce->fd;
+        t->hash_next = -1;
+        thread_hash_insert((int)(t - g_threads));
         ce->kind = CONN_THREAD;
         ce->owner_id = t->thread_id;
         send_reply(ce->fd, VDEV_OP_ATTACH_THREAD, req.proc_id, 0, NULL, 0, NULL, 0);
@@ -1645,12 +1748,24 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
+    for (int i = 0; i < HASH_BUCKETS; i++) {
+        g_thread_buckets[i] = -1;
+        g_node_id_buckets[i] = -1;
+        g_node_ptr_buckets[i] = -1;
+    }
+    for (int i = 0; i < MAX_THREADS; i++)
+        g_threads[i].hash_next = -1;
+
     g_nodes = (struct bnode *)calloc(INIT_NODES, sizeof(struct bnode));
     if (!g_nodes) {
         fprintf(stderr, "binderd: OOM allocating g_nodes\n");
         return 1;
     }
     g_nodes_cap = INIT_NODES;
+    for (int i = 0; i < INIT_NODES; i++) {
+        g_nodes[i].id_hash_next = -1;
+        g_nodes[i].ptr_hash_next = -1;
+    }
 
     unlink(sock_path);
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1666,7 +1781,7 @@ int main(int argc, char **argv)
         perror("bind");
         return 1;
     }
-    if (listen(g_listen_fd, 256) < 0) {
+    if (listen(g_listen_fd, 512) < 0) {
         perror("listen");
         return 1;
     }
@@ -1676,9 +1791,9 @@ int main(int argc, char **argv)
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_listen_fd, &ev);
 
     DLOG("listening on %s", sock_path);
-    struct epoll_event events[64];
+    struct epoll_event events[256];
     for (;;) {
-        int n = epoll_wait(g_epfd, events, 64, -1);
+        int n = epoll_wait(g_epfd, events, 256, -1);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
