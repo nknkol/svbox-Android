@@ -416,5 +416,56 @@
 | **Step 7** | **OHOS 通用桥接层解耦 + 手柄 / USB + 跨 Linux 复用验证** | 如有通用 `evdev`/`tty`/USB `ioctl` 缺口反哺 `svbox` | 从 HAP 抽离独立 `ohos_bridge/`（显示/GPU/输入/音频/USB/共享目录），补齐 Gamepad `evdev` 与 USB 桥接 | Android 游戏识别手柄；**用同一套 `svbox` + `ohos_bridge/` 直接拉起一个标准 Linux 发行版（如 Debian/Alpine 图形/终端）**证明通用复用 |
 | **Step 8** | **跨宿主机移植验证 & 用户态 Root 管理** | 验证 `svbox` 在无 Root Android（Termux）/ 标准受限 Linux 宿主机上的可移植性 | 可选用户态 `su` 按 UID 授权管理 + 多容器实例/快照 | 同一套 `svbox` 源码在鸿蒙 PC 与无 Root Linux/Android 宿主机均通过核心回归测试 |
 
+---
+
+### 5.4 Step 5 实机落地与验证记录（2026-11-23）
+
+Step 5 严格遵循“**容器通用兼容性沉淀进 `svbox`，Android 镜像零修改**”原则，在 `svbox`（`feat/vdev-binder`）上连续落地 **3 个通用核心提交**（`b927a58`、`39a6e42`、`ac81b86`），并在 `svbox-Android` 上完成零改只读 `rootfs`、持久化 `/data` + 鸿蒙双向共享目录与原生 64 位 `adbd` 调试闭环。
+
+#### A. 反哺 `svbox` 核心层（`feat/vdev-binder`，100% 通用 Linux，零 Android 专属代码）
+
+1. **`b927a58` — Binder ABI 修复 + `memfd` `fstat/statx` SELinux 兜底 + 通用 `--disk-mb` 配额**
+   * [`vdev_proto.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/vdev_proto.h)：修正 `SV_BC_REQUEST_DEATH_NOTIFICATION`（`0x400c630eu`）、`SV_BC_CLEAR_DEATH_NOTIFICATION`（`0x400c630fu`）与 `__attribute__((packed))` 12 字节 `struct sv_binder_handle_cookie`。
+   * [`syscall_disp.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/syscall_disp.c)：针对鸿蒙等 SELinux 强约束宿主机对 `memfd` inode 拒绝 `fstat`（`-EACCES`）与空路径 `statx(AT_EMPTY_PATH)`（`-EFAULT`）的问题，通过 `fcntl(fd, F_GET_SEALS) >= 0` 精确识别真实 `memfd` 并以 `lseek(SEEK_END)` 合成标准 POSIX `stat`/`statx`（彻底消灭 `/proc/meminfo: fstat failed: EACCES` 与 guest `memfd` 元数据失败）。
+   * [`config.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/config.h) / [`options.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/options.c) / [`syscall_disp.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/syscall_disp.c)：新增通用 `--disk-mb N` 参数，对非伪文件系统 `statfs`/`fstatfs` 统一钳位虚拟总容量与可用空间。
+2. **`39a6e42` — 修复 `--lower` 子目录绑定挂载下的 `/proc/self/fd` 反向映射与 `union_alias` 缓冲重叠 Bug（坑 5-1）**
+   * **现象**：切到 `--root <root_upper> --lower <inject_layer> --lower <rootfs>` 后，`zygote64` 启动即中止：`Not whitelisted (4): /system/apex/com.android.art.debug/javalib/core-oj.jar`（而非绑定后的 `/apex/com.android.art/javalib/core-oj.jar`）。
+   * **双根因**：
+     1. [`union_view.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/union_view.c) `union_alias()` 在被 [`vfs_bridge.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_bridge.c) `host_map()` 以 `pb_bridge_alias(b, b->mapped, b->mapped)` 原地调用时，当 `strlen(upper) > strlen(lower)` 时 `memcpy` 覆盖了重叠的 `rel` 尾部，导致路径损坏、所有命中 `--lower` 子目录的 bind mount 反向校验返回 `-EXDEV`；
+     2. `observed_guest_path` / `preferred_guest_path` 之前先强制做 lower→upper 别名再比对 `host_prefix`，且按 `strlen(upper)` 而非**宿主真实匹配前缀长度**排序。
+   * **解法**：`union_alias()` 改为 `memmove` 原地安全实现、`host_map()` 直接原地别名；`observed_guest_path_len()` / `preferred_guest_path()` / `visible_guest_path()` 优先直匹配真实宿主 bind 前缀并按宿主实际消费前缀长度排序。
+3. **`ac81b86` — 修复无特权容器 `getsockopt(SOL_SOCKET, SO_PEERCRED)` 返回宿主机真实 UID（坑 5-2）**
+   * **现象**：`adbd` 启动并监听 `@jdwp-control` 后，全系统 Android 进程仍高频报 `untrusted uid 20020422 on other end of socket`，导致 `adbd.log` 每分钟膨胀近 1 MB（`received data of incorrect size from JDWP client: read 0, expected 4`）且 `adb jdwp` 为空。
+   * **根因**：Linux/鸿蒙内核对 `AF_UNIX` `SO_PEERCRED` 始终返回宿主真实 UID/GID（`20020422`），而 `svbox` 此前未将 `__NR_getsockopt` 纳入 `slow_syscalls.inc` 做容器 ID 还原（同样影响 `dbus-daemon`/`systemd`/`polkit`/`sshd` 等所有通用 Linux 守护进程）。
+   * **解法**：在 [`slow_syscalls.inc`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/slow_syscalls.inc) 拦截 `__NR_getsockopt`，在 [`fake_ids.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/fake_ids.c) 新增 `fake_ids_peercred()`：优先读取 `mount_scratch/.pid_ids/<ucred.pid>` 精确还原对端容器的 fake `euid`/`egid`，找不到时对宿主自有 UID/GID 回退为容器默认 fake ID。
+4. **回归测试**：新增 [`test/vfs/test_resource_limits.py`](file:///storage/Users/currentUser/Workspace/svbox/test/vfs/test_resource_limits.py)（覆盖 `--mem-mb`、`--disk-mb`、`memfd` `fstat/fstatat/statx`、只读 `--lower`、`--lower` 子目录 bind `/proc/self/fd` 反向映射、`SO_PEERCRED`），并与 `test_union.py`（8/8 含 `--isolate` 与 EROFS）、`test_paths.py`（57/57）、`test_mounts.py`（4/4）、`test_owners.py`（4/4）、`check_payload_abi.py`（5/5）全部通过。
+
+#### B. `svbox-Android` 零改只读镜像、持久化存储与原生 `adbd` 踩坑实录
+
+* **多层只读 Overlay 架构**（[`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)）：
+  * 启动命令切换为 `--root <temp/root_upper> --lower <temp/inject_layer> --lower <files/rootfs>`，每次启动重建空的 `root_upper` 与 `inject_layer`（按需放入 `svbox-touchscreen.idc`、Audio HAL/服务、Camera Stub，仅在 GLES/Vulkan 模式下放入 14 个 `gpu_guest` 库），**原版 `rootfs` 0 字节写入**；首次升级自动清理历史版本遗留在 `rootfs/` 中的 16 个旧注入文件（由 `files/.rootfs_clean_v1` 标记）。
+  * `binderd/svbox_binderd.c` 清理临时兼容宏，直接复用 `svbox` 修正后的标准 `SV_BC_REQUEST_DEATH_NOTIFICATION` / `struct sv_binder_handle_cookie`。
+* **持久化 `/data` + 鸿蒙共享目录 + `--disk-mb 32768`**：
+  * Android `/data` 与 `owner.db` 从易失 `temp/` 迁至持久化 `files/userdata/`；`EnsureOwnerDb()` 在保留历史伪 UID/GID 记录的同时，自动清除因上次强杀（`SIGKILL`）可能残留的 `lock` 或奇数 `version`，杜绝重启死锁。
+  * 预建标准用户目录并挂载 `/sdcard`、`/storage/emulated/0`、`/storage/self/primary` 指向 `files/userdata/data/media/0`，同时自动创建宿主机 `/storage/Users/currentUser/Download/svbox-share` 双向绑定至 `/sdcard/Download/HarmonyShare`。
+  * **坑 5-3：`vold` 启动扫描 `/proc/mounts` 对 `/storage/*` 子挂载执行 `ForceUnmount` 拖慢开机 20 秒**：`vold` 对每个 `/storage/` 下的已有挂载重试 `umount2()` 5 次（每次 1 秒）。通过 `BaseSvboxArgs(/*includeStorageSubmounts=*/false)` 仅在启动 `vold` 自身时隐藏 `/storage/*` 子挂载，零侵入 `svbox` 即把 `VoldNativeService::start()` 恢复至 `<10ms`，`vold_stale=0`。
+  * **坑 5-4：`Settings -> Storage` 显示 `93.64 GB Used of 128 GB` 的原理解析**：`df -h /data` 与 `dumpsys diskstats` 均准确报告 `32G`（`33554432K total, 100% free`），而 Android 11 `StorageStatsService.getTotalBytes()` 在无真实 `/sys/block/*` 设备时会把 `/`（32 GiB）+ `/data`（32 GiB）相加为 `68.72 GB`，经 `FileUtils.roundStorageSize()` 向上取整至商业闪存档位 `128 GB` 再减去 `/data` 可用 `34.36 GB` 得出 `93.64 GB`。属 AOSP 既有启发式行为，不影响任何应用配额与 `StatFs` 实际判断。
+* **原生 64 位 `adbd`（`127.0.0.1:5555`）连踩两坑与根治**：
+  * **坑 5-5：相对路径执行 `apex/com.android.adbd/bin/adbd` 错过 Bionic `linkerconfig` 命名空间**：`/linkerconfig/com.android.adbd/ld.config.txt` 匹配 `dir.com.android.adbd = /apex/com.android.adbd/bin`（必须带前导 `/`），直接传相对路径会导致 `libadb_protos.so not found`。改为 `system/bin/sh -c "exec /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0"` 后原生命中命名空间，且不污染子 shell 的 `LD_LIBRARY_PATH`。
+  * **坑 5-6：空监听 `/dev/socket/fwmarkd` 导致 `adbd`（及一切容器内 TCP 服务端）在 `accept4()` 永久死锁**：旧代码创建了 `/dev/socket/fwmarkd` 与 `/dev/socket/mdns` 监听却未运行处理线程；Android Bionic `libnetd_client.so` 会在 `accept4()` 后连接 `fwmarkd` 并永远阻塞在 `af_unix_recvfrom`。保留 `/dev/socket/mdns`（`SystemServer` 的 `NsdService.awaitConnection()` 需要 `connect()` 成功以免 Watchdog 超时）并移除无服务的 `/dev/socket/fwmarkd` 后，`adbd` TCP 5555 毫秒级响应。
+
+#### C. `HAD-W32` 真机 Step 5 全项验收结果
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **`adbd` 与日志洁净度** | `adbd.log` 仅 **`3.9 KB`**（修 `SO_PEERCRED` 前为 749 KB/min）；`jdwp_refused=0`、`untrusted_uid=0`、`meminfo_fstat_err=0`、`vold_stale=0` |
+| **原生 `adb` 调试链** | `adb connect 127.0.0.1:5555` 成功；`adb shell id` → `uid=0(root)`；`pm list packages` → `142`；**`adb jdwp` 列出 26 个活跃 Android 进程 PID** |
+| **`adb push` / `pull` 吞吐与完整性** | 256 KiB 随机二进制往返 **`96.6 MB/s` push / `64.6 MB/s` pull**，`cmp` 逐字节一致 |
+| **虚拟磁盘配额 (`--disk-mb 32768`)** | `df -h / /data /sdcard` 与 `dumpsys diskstats` 均准确返回 **`32G`**；`Settings -> Storage` Vulkan 真机截图 [`snap_step5_storage.png`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap_logs/snap_step5_storage.png) 渲染清晰 |
+| **鸿蒙双向共享目录** | `/storage/Users/currentUser/Download/svbox-share` ↔ `/sdcard/Download/HarmonyShare` 双向读写即时同步通过 |
+| **零改只读 `rootfs` 校验** | 切至 SwiftShader 后 `inject_layer` `gpuLibs=0`，容器内 `/vendor/lib64/egl` 与 `/vendor/lib64/hw` 中 **`ranchu_count=0`**（零 `emulation`/`ranchu` 残留），证明 `rootfs/` 零写入污染 |
+| **跨重启持久化 + 三 GPU 模式全回归** | 依次完成 `Vulkan → GLES → SwiftShader → Vulkan` 完整停启切换：`/data/local/tmp`、`/sdcard/Documents` 与 `settings global` 三项持久化数据 100% 保留，三种 GPU 模式均正常抵达 `BOOT_COMPLETED` |
+
+
 
 

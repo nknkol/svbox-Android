@@ -41,17 +41,6 @@
 #define MAX_ALLOCS         1024
 #define INLINE_BLK_HANDLES 16
 
-/* Linux 64-bit uapi/linux/android/binder.h declares struct binder_handle_cookie
- * as __packed (12 bytes: __u32 handle + __u64 cookie), so real Android userspace
- * sends 0x400c630e / 0x400c630f rather than padded 16-byte 0x4010630e / 0x4010630f. */
-#define REAL_BC_REQUEST_DEATH_NOTIFICATION 0x400c630eu
-#define REAL_BC_CLEAR_DEATH_NOTIFICATION   0x400c630fu
-
-struct binder_handle_cookie_packed {
-    uint32_t handle;
-    uint64_t cookie;
-} __attribute__((packed));
-
 static bool g_verbose = false;
 #define DLOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[binderd] " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -1252,16 +1241,10 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             }
             break;
         }
-        case REAL_BC_REQUEST_DEATH_NOTIFICATION:
         case SV_BC_REQUEST_DEATH_NOTIFICATION: {
             uint32_t handle = 0;
             uint64_t cookie = 0;
-            if (cmd == REAL_BC_REQUEST_DEATH_NOTIFICATION && asz >= sizeof(struct binder_handle_cookie_packed)) {
-                struct binder_handle_cookie_packed hc;
-                memcpy(&hc, arg, sizeof(hc));
-                handle = hc.handle;
-                cookie = hc.cookie;
-            } else if (asz >= sizeof(struct sv_binder_handle_cookie)) {
+            if (asz >= sizeof(struct sv_binder_handle_cookie)) {
                 struct sv_binder_handle_cookie hc;
                 memcpy(&hc, arg, sizeof(hc));
                 handle = hc.handle;
@@ -1284,16 +1267,10 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             }
             break;
         }
-        case REAL_BC_CLEAR_DEATH_NOTIFICATION:
         case SV_BC_CLEAR_DEATH_NOTIFICATION: {
             uint32_t handle = 0;
             uint64_t cookie = 0;
-            if (cmd == REAL_BC_CLEAR_DEATH_NOTIFICATION && asz >= sizeof(struct binder_handle_cookie_packed)) {
-                struct binder_handle_cookie_packed hc;
-                memcpy(&hc, arg, sizeof(hc));
-                handle = hc.handle;
-                cookie = hc.cookie;
-            } else if (asz >= sizeof(struct sv_binder_handle_cookie)) {
+            if (asz >= sizeof(struct sv_binder_handle_cookie)) {
                 struct sv_binder_handle_cookie hc;
                 memcpy(&hc, arg, sizeof(hc));
                 handle = hc.handle;

@@ -60,7 +60,7 @@ private:
                 bool nullStdio,
                 const std::string& logPath = "",
                 const std::vector<int>& keepFds = {});
-    std::vector<std::string> BaseSvboxArgs() const;
+    std::vector<std::string> BaseSvboxArgs(bool includeStorageSubmounts = true) const;
 
     mutable std::mutex mu_;
     std::mutex procMu_;
@@ -75,6 +75,7 @@ private:
     int32_t activeNice_ = 0x7fffffff;
     std::string activeSched_;
     std::atomic<uint32_t> memLimitMb_{4096};
+    std::atomic<uint32_t> diskLimitMb_{32768};
 
     OHNativeWindow* surfaceWindow_ = nullptr;
     int32_t surfaceW_ = 0;
@@ -88,7 +89,12 @@ private:
     std::thread dnsThread_;
     int dnsListenFd_ = -1;
 
+    std::string sandboxFiles_;
     std::string runBase_;
+    std::string dataBase_;
+    std::string rootUpper_;
+    std::string injectLayer_;
+    std::string shareHostDir_;
     std::string svboxPath_;
     std::string audioHalPath_;
     std::string audioSvcPath_;

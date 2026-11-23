@@ -100,28 +100,69 @@ void WriteFile(const std::string& path, const std::string& content) {
     }
 }
 
-void InitOwnerDb(const std::string& path) {
-    unlink(path.c_str());
-    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-    struct {
+void RemoveDirRecursive(const std::string& path) {
+    struct stat st = {};
+    if (lstat(path.c_str(), &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path.c_str());
+        return;
+    }
+    DIR* d = opendir(path.c_str());
+    if (d) {
+        while (struct dirent* de = readdir(d)) {
+            if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) {
+                continue;
+            }
+            RemoveDirRecursive(path + "/" + de->d_name);
+        }
+        closedir(d);
+    }
+    rmdir(path.c_str());
+}
+
+void EnsureOwnerDb(const std::string& path) {
+    struct OwnerHdr {
         char magic[8];
         uint32_t capacity;
         uint32_t count;
         uint32_t lock;
         uint32_t version;
         uint8_t pad[40];
-    } hdr = {};
+    };
+    const off_t kExpectedSize = static_cast<off_t>(sizeof(OwnerHdr) + 65536u * 32u);
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd >= 0) {
+        struct stat st = {};
+        OwnerHdr hdr = {};
+        if (fstat(fd, &st) == 0 && st.st_size >= kExpectedSize &&
+            pread(fd, &hdr, sizeof(hdr), 0) == static_cast<ssize_t>(sizeof(hdr)) &&
+            std::memcmp(hdr.magic, "ELFOWN1\0", 8) == 0 && hdr.capacity >= 65536u) {
+            // Preserve persistent fake UID/GID records across restarts, while clearing any
+            // lock or odd seqlock version left behind if a previous container was SIGKILLed.
+            if (hdr.lock != 0 || (hdr.version & 1u) != 0) {
+                hdr.lock = 0;
+                if (hdr.version & 1u) hdr.version += 1u;
+                (void)pwrite(fd, &hdr, sizeof(hdr), 0);
+            }
+            close(fd);
+            return;
+        }
+        close(fd);
+    }
+    unlink(path.c_str());
+    fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    OwnerHdr hdr = {};
     std::memcpy(hdr.magic, "ELFOWN1\0", 8);
     hdr.capacity = 65536u;
     (void)write(fd, &hdr, sizeof(hdr));
-    (void)ftruncate(fd, static_cast<off_t>(sizeof(hdr) + 65536u * 32u));
+    (void)ftruncate(fd, kExpectedSize);
     close(fd);
 }
 
-int MakeListenUnix(const std::string& path) {
+int MakeListenUnix(const std::string& path, int sockType = SOCK_STREAM, mode_t mode = 0666) {
     unlink(path.c_str());
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0); // NOT SOCK_CLOEXEC so child inherits it
+    int fd = socket(AF_UNIX, sockType, 0); // NOT SOCK_CLOEXEC so child inherits it
     if (fd < 0) return -1;
     struct sockaddr_un sa = {};
     sa.sun_family = AF_UNIX;
@@ -130,6 +171,7 @@ int MakeListenUnix(const std::string& path) {
         close(fd);
         return -1;
     }
+    chmod(path.c_str(), mode);
     return fd;
 }
 
@@ -332,7 +374,7 @@ bool ExtractTarToDir(const std::string& tarPath,
 
         if (type == '5') {
             MkdirP(full);
-            if (mode) chmod(full.c_str(), mode | 0700);
+            if (mode) chmod(full.c_str(), (mode | 0700) & ~static_cast<mode_t>(0022));
             if (!skipExact(padded)) { close(fd); return false; }
         } else if (type == '2') {
             unlink(full.c_str());
@@ -551,7 +593,7 @@ bool AndroidRuntime::WaitForConditionMs(int maxMs, const std::function<bool()>& 
     return running_.load() && pred();
 }
 
-std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
+std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmounts) const {
     const std::string sockDir = runBase_ + "/sockets";
     std::string cpuset;
     int32_t niceVal = 0x7fffffff;
@@ -563,10 +605,13 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         schedPol = activeSched_;
     }
     uint32_t memMb = memLimitMb_.load();
+    uint32_t diskMb = diskLimitMb_.load();
 
     std::vector<std::string> args = {
         svboxPath_,
-        "--root", rootfs_,
+        "--root", rootUpper_,
+        "--lower", injectLayer_,
+        "--lower", rootfs_,
         "-u", "0:0",
         "--cap-add", "ALL",
         "--trap-sigsys",
@@ -575,7 +620,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "--hostname", "localhost",
         "--emulate-mounts",
         "--mount-scratch", runBase_ + "/tmpfs",
-        "--owner-db", runBase_ + "/owner.db",
+        "--owner-db", dataBase_ + "/owner.db",
     };
     if (!cpuset.empty()) {
         args.push_back("--cpuset");
@@ -584,6 +629,10 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
     if (memMb > 0) {
         args.push_back("--mem-mb");
         args.push_back(std::to_string(memMb));
+    }
+    if (diskMb > 0) {
+        args.push_back("--disk-mb");
+        args.push_back(std::to_string(diskMb));
     }
     if (niceVal != 0x7fffffff) {
         args.push_back("--nice");
@@ -612,13 +661,13 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-v", sockDir + ":/dev/socket",
         "-v", runBase_ + "/dev_input:/dev/input",
         "-v", runBase_ + "/ipc:/ipc",
-        "-v", runBase_ + "/data:/data",
-        "-v", runBase_ + "/data/data:/data/user/0",
-        "-v", runBase_ + "/data/user:/data_mirror/data_ce/null",
-        "-v", runBase_ + "/data/data:/data_mirror/data_ce/null/0",
-        "-v", runBase_ + "/data/user_de:/data_mirror/data_de/null",
-        "-v", runBase_ + "/data/misc/profiles/cur:/data_mirror/cur_profiles",
-        "-v", runBase_ + "/data/misc/profiles/ref:/data_mirror/ref_profiles",
+        "-v", dataBase_ + "/data:/data",
+        "-v", dataBase_ + "/data/data:/data/user/0",
+        "-v", dataBase_ + "/data/user:/data_mirror/data_ce/null",
+        "-v", dataBase_ + "/data/data:/data_mirror/data_ce/null/0",
+        "-v", dataBase_ + "/data/user_de:/data_mirror/data_de/null",
+        "-v", dataBase_ + "/data/misc/profiles/cur:/data_mirror/cur_profiles",
+        "-v", dataBase_ + "/data/misc/profiles/ref:/data_mirror/ref_profiles",
         "-v", runBase_ + "/cache:/cache",
         "-v", runBase_ + "/acct:/acct",
         "-v", runBase_ + "/cgroup:/sys/fs/cgroup",
@@ -628,16 +677,26 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs() const {
         "-v", runBase_ + "/mnt:/mnt",
         "-v", runBase_ + "/storage:/storage",
     };
-    if (!audioHalPath_.empty() && FileExists(audioHalPath_)) {
+    if (includeStorageSubmounts) {
         mounts.push_back("-v");
-        mounts.push_back(audioHalPath_ + ":/vendor/lib64/hw/audio.primary.default.so");
-    }
-    if (!audioSvcPath_.empty() && FileExists(audioSvcPath_)) {
+        mounts.push_back(dataBase_ + "/data/media/0:/sdcard");
         mounts.push_back("-v");
-        mounts.push_back(audioSvcPath_ + ":/vendor/bin/hw/android.hardware.audio.service");
+        mounts.push_back(dataBase_ + "/data/media/0:/storage/emulated/0");
+        mounts.push_back("-v");
+        mounts.push_back(dataBase_ + "/data/media/0:/storage/self/primary");
     }
-    mounts.push_back("-v");
-    mounts.push_back(runBase_ + "/svbox-touchscreen.idc:/system/usr/idc/svbox-touchscreen.idc");
+    if (!shareHostDir_.empty() && FileExists(shareHostDir_)) {
+        mounts.push_back("-v");
+        mounts.push_back(shareHostDir_ + ":/data/media/0/Download/HarmonyShare");
+        if (includeStorageSubmounts) {
+            mounts.push_back("-v");
+            mounts.push_back(shareHostDir_ + ":/sdcard/Download/HarmonyShare");
+            mounts.push_back("-v");
+            mounts.push_back(shareHostDir_ + ":/storage/emulated/0/Download/HarmonyShare");
+            mounts.push_back("-v");
+            mounts.push_back(shareHostDir_ + ":/storage/self/primary/Download/HarmonyShare");
+        }
+    }
     args.insert(args.end(), mounts.begin(), mounts.end());
 
     std::vector<std::string> vdevsAndEnv = {
@@ -829,7 +888,12 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
         return "Missing Android 11 rootfs or rootfs.tar at: " + androidDir;
     }
 
+    sandboxFiles_ = sandboxFiles;
     runBase_ = sandboxTempDir + "/svbox-android-hap";
+    dataBase_ = sandboxFiles + "/userdata";
+    rootUpper_ = runBase_ + "/root_upper";
+    injectLayer_ = runBase_ + "/inject_layer";
+    shareHostDir_ = "/storage/Users/currentUser/Download/svbox-share";
     svboxPath_ = resolvedSvbox;
     audioHalPath_ = FileExists(audioHal) ? audioHal : "";
     audioSvcPath_ = FileExists(audioSvc) ? audioSvc : "";
@@ -1036,7 +1100,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const std::string propDir = runBase_ + "/__properties__";
     const std::string ipcDir = runBase_ + "/ipc";
 
-    const char* dirs[] = {
+    // Ephemeral per-boot runtime directories (under sandboxTempDir)
+    const char* runDirs[] = {
         "", "/sockets", "/__properties__", "/ipc", "/cache", "/acct", "/cgroup",
         "/sys_power", "/dev_input", "/cpuset", "/cpuset/foreground", "/cpuset/background",
         "/cpuset/system-background", "/cpuset/top-app", "/stune", "/stune/foreground",
@@ -1044,14 +1109,34 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/mnt/runtime/default/emulated/0", "/mnt/runtime/read/emulated/0",
         "/mnt/runtime/write/emulated/0", "/mnt/runtime/full/emulated/0",
         "/mnt/pass_through/0/emulated/0", "/mnt/installer/0/emulated/0",
-        "/mnt/androidwritable/0/emulated/0", "/storage/emulated/0",
-        "/tmpfs", "/data/system/users/0", "/data/system/dropbox", "/data/system/usagestats",
+        "/mnt/androidwritable/0/emulated/0",
+        "/storage/emulated/0", "/storage/self/primary",
+        "/tmpfs"
+    };
+    for (const char* sub : runDirs) {
+        MkdirP(runBase_ + sub);
+    }
+
+    // Rebuild ephemeral overlay upper + injection layer cleanly on every boot
+    // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
+    RemoveDirRecursive(rootUpper_);
+    MkdirP(rootUpper_);
+    RemoveDirRecursive(injectLayer_);
+    MkdirP(injectLayer_);
+
+    // Persistent Android /data partition (under sandboxFilesDir/userdata)
+    const char* dataDirs[] = {
+        "", "/data", "/data/system/users/0", "/data/system/dropbox", "/data/system/usagestats",
         "/data/system_de/0", "/data/system_ce/0", "/data/misc/profiles/cur/0",
         "/data/misc/profiles/ref", "/data/misc/apexdata", "/data/misc/keystore",
         "/data/misc/gatekeeper", "/data/misc/installd", "/data/misc/user/0",
         "/data/misc/media", "/data/misc/credstore",
         "/data/misc_ce/0", "/data/misc_de/0", "/data/vendor_ce/0", "/data/vendor_de/0",
-        "/data/media/0", "/data/user/0", "/data/user_de/0", "/data/app", "/data/app-private",
+        "/data/media/0", "/data/media/0/Download", "/data/media/0/Download/HarmonyShare",
+        "/data/media/0/Pictures", "/data/media/0/DCIM", "/data/media/0/DCIM/Camera",
+        "/data/media/0/Documents", "/data/media/0/Movies", "/data/media/0/Music",
+        "/data/media/0/Android/data", "/data/media/0/Android/obb",
+        "/data/user/0", "/data/user_de/0", "/data/app", "/data/app-private",
         "/data/app-ephemeral", "/data/app-asec", "/data/app-lib", "/data/app-staging",
         "/data/data", "/data/dalvik-cache/arm64", "/data/dalvik-cache/profiles",
         "/data/resource-cache", "/data/anr", "/data/tombstones", "/data/local/tmp",
@@ -1059,11 +1144,14 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/data/backup", "/data/cache", "/data/incremental", "/data/ota", "/data/preloads",
         "/data/ss", "/data/vendor"
     };
-    for (const char* sub : dirs) {
-        MkdirP(runBase_ + sub);
+    for (const char* sub : dataDirs) {
+        MkdirP(dataBase_ + sub);
+    }
+    if (!shareHostDir_.empty()) {
+        MkdirP(shareHostDir_);
     }
 
-    InitOwnerDb(runBase_ + "/owner.db");
+    EnsureOwnerDb(dataBase_ + "/owner.db");
 
     WriteFile(runBase_ + "/sys_power/wake_lock", "");
     WriteFile(runBase_ + "/sys_power/wake_unlock", "");
@@ -1080,10 +1168,6 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     WriteFile(runBase_ + "/dev_input/event0", "");
     WriteFile(runBase_ + "/dev_input/event1", "");
-    WriteFile(runBase_ + "/svbox-touchscreen.idc",
-        "touch.deviceType = touchScreen\n"
-        "touch.orientationAware = 1\n"
-        "device.internal = 1\n");
     WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
 
     std::string gpuModeSnap;
@@ -1136,7 +1220,13 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "log.tag.libprocessgroup=F\n"
         "sys.use_memfd=false\n"
         "persist.zygote.app_data_isolation=0\n"
-        "persist.sys.vold_app_data_isolation_enabled=false\n");
+        "persist.sys.vold_app_data_isolation_enabled=false\n"
+        "ro.secure=0\n"
+        "ro.adb.secure=0\n"
+        "ro.debuggable=1\n"
+        "service.adb.root=1\n"
+        "service.adb.tcp.port=5555\n"
+        "persist.adb.tcp.port=5555\n");
 
     unlink((ipcDir + "/hwcomposer.sock").c_str());
     unlink((ipcDir + "/gfxstream.sock").c_str());
@@ -1145,6 +1235,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     unlink((sockDir + "/hwbinder.sock").c_str());
     unlink((sockDir + "/vndbinder.sock").c_str());
     unlink((sockDir + "/property_service").c_str());
+    unlink((sockDir + "/adbd").c_str());
+    unlink((sockDir + "/fwmarkd").c_str());
+    unlink((sockDir + "/mdns").c_str());
     unlink((sockDir + "/input_touch.sock").c_str());
     unlink((sockDir + "/input_kbd.sock").c_str());
 
@@ -1159,9 +1252,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         OH_LOG_INFO(LOG_APP, "%{public}s", s.c_str());
     };
-    logLine("BootWorker start: runBase=" + runBase_ + " mode=" + mode + " gpu=" + gpuModeSnap +
+    logLine("BootWorker start: runBase=" + runBase_ + " dataBase=" + dataBase_ +
+            " mode=" + mode + " gpu=" + gpuModeSnap +
             " svbox=" + svboxPath_ + " binderd=" + binderd + " rootfs=" + rootfs_ +
-            " gpuGuest=" + gpuGuestDir_);
+            " gpuGuest=" + gpuGuestDir_ + " shareHost=" + shareHostDir_);
     const std::string rootfsTar = androidDir_ + "/rootfs.tar";
     if (!FileExists(rootfs_ + "/.imported_v2") && FileExists(rootfsTar)) {
         logLine("Importing Android 11 rootfs into sandbox from " + rootfsTar + " ...");
@@ -1182,14 +1276,50 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         WriteFile(rootfs_ + "/.imported_v2", "ok\n");
         logLine("Rootfs import complete -> " + rootfs_ + " (" + diagMsg + ")");
     }
-    // Android 11 Bionic linker64 rejects group/world-writable ld.config.txt (mode & 0022)
-    chmod((rootfs_ + "/linkerconfig").c_str(), 0755);
-    chmod((rootfs_ + "/linkerconfig/ld.config.txt").c_str(), 0644);
+    // One-time cleanup of stale injected files left in sandbox rootfs by pre-Step-5 builds.
+    // Afterwards rootfs_ is treated as strictly read-only and never modified again.
+    static const char* kGuestGpuLibs[] = {
+        "libandroidemu.so",
+        "libOpenglCodecCommon.so",
+        "lib_renderControl_enc.so",
+        "libGLESv1_enc.so",
+        "libGLESv2_enc.so",
+        "libvulkan_enc.so",
+        "libOpenglSystemCommon.so",
+        "libGoldfishProfiler.so",
+        "egl/libEGL_emulation.so",
+        "egl/libGLESv1_CM_emulation.so",
+        "egl/libGLESv2_emulation.so",
+        "hw/gralloc.ranchu.so",
+        "hw/hwcomposer.ranchu.so",
+        "hw/vulkan.ranchu.so",
+    };
+    const std::string cleanMarker = sandboxFiles_ + "/.rootfs_clean_v1";
+    if (!FileExists(cleanMarker)) {
+        int removed = 0;
+        for (const char* rel : kGuestGpuLibs) {
+            if (unlink((rootfs_ + "/vendor/lib64/" + rel).c_str()) == 0) ++removed;
+        }
+        if (unlink((rootfs_ + "/vendor/bin/hw/svbox-audio-service").c_str()) == 0) ++removed;
+        if (unlink((rootfs_ + "/system/bin/svbox-cameraserver").c_str()) == 0) ++removed;
+        WriteFile(cleanMarker, "cleaned=" + std::to_string(removed) + "\n");
+        logLine("One-time rootfs cleanup removed " + std::to_string(removed) + " legacy injected files");
+    }
+    // Android 11 Bionic linker64 rejects group/world-writable ld.config.txt (mode & 0022).
+    // Only fix permissions if actually group/world-writable so normal boots do zero writes to rootfs_.
+    auto ensureNotGroupWorldWritable = [](const std::string& p, mode_t targetMode) {
+        struct stat st = {};
+        if (stat(p.c_str(), &st) == 0 && (st.st_mode & 0022) != 0) {
+            chmod(p.c_str(), targetMode);
+        }
+    };
+    ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig", 0755);
+    ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/ld.config.txt", 0644);
     for (const char* sub : { "com.android.adbd", "com.android.art", "com.android.conscrypt",
                              "com.android.media.swcodec", "com.android.os.statsd",
                              "com.android.runtime", "com.android.sdkext" }) {
-        chmod((rootfs_ + "/linkerconfig/" + sub).c_str(), 0755);
-        chmod((rootfs_ + "/linkerconfig/" + sub + "/ld.config.txt").c_str(), 0644);
+        ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/" + sub, 0755);
+        ensureNotGroupWorldWritable(rootfs_ + "/linkerconfig/" + sub + "/ld.config.txt", 0644);
     }
     {
         struct stat st1 = {}, st2 = {};
@@ -1252,45 +1382,57 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         return;
     }
 
-    // Stage Android 11 gfxstream guest libraries into sandbox rootfs /vendor/lib64/{,egl,hw}
-    if (useGfx) {
-        if (gpuGuestDir_.empty()) {
-            logLine("Missing gpu_guest libraries for hardware GPU mode!");
-            SetStatus("Missing gpu_guest libraries in HNP");
-            running_.store(false);
-            return;
+    // Stage all Android-compat injected HALs/services/configs into ephemeral injectLayer_
+    // (mounted as svbox --lower #1 above strictly read-only rootfs_ as --lower #2).
+    {
+        MkdirP(injectLayer_ + "/system/usr/idc");
+        const std::string idcDst = injectLayer_ + "/system/usr/idc/svbox-touchscreen.idc";
+        WriteFile(idcDst,
+            "touch.deviceType = touchScreen\n"
+            "touch.orientationAware = 1\n"
+            "device.internal = 1\n");
+        chmod(idcDst.c_str(), 0644);
+
+        if (!audioHalPath_.empty() && FileExists(audioHalPath_)) {
+            MkdirP(injectLayer_ + "/vendor/lib64/hw");
+            const std::string dst = injectLayer_ + "/vendor/lib64/hw/audio.primary.default.so";
+            if (CopyRegularFile(audioHalPath_, dst)) {
+                chmod(dst.c_str(), 0644);
+            }
         }
-        static const char* kGuestLibs[] = {
-            "libandroidemu.so",
-            "libOpenglCodecCommon.so",
-            "lib_renderControl_enc.so",
-            "libGLESv1_enc.so",
-            "libGLESv2_enc.so",
-            "libvulkan_enc.so",
-            "libOpenglSystemCommon.so",
-            "libGoldfishProfiler.so",
-            "egl/libEGL_emulation.so",
-            "egl/libGLESv1_CM_emulation.so",
-            "egl/libGLESv2_emulation.so",
-            "hw/gralloc.ranchu.so",
-            "hw/hwcomposer.ranchu.so",
-            "hw/vulkan.ranchu.so",
-        };
-        MkdirP(rootfs_ + "/vendor/lib64/egl");
-        MkdirP(rootfs_ + "/vendor/lib64/hw");
-        int copied = 0;
-        for (const char* rel : kGuestLibs) {
-            const std::string src = gpuGuestDir_ + "/" + rel;
-            const std::string dst = rootfs_ + "/vendor/lib64/" + rel;
-            struct stat sSrc = {}, sDst = {};
-            if (stat(src.c_str(), &sSrc) != 0) {
-                logLine("Missing guest GPU lib: " + src);
-                SetStatus("Missing guest GPU lib: " + std::string(rel));
+        if (!audioSvcPath_.empty() && FileExists(audioSvcPath_)) {
+            MkdirP(injectLayer_ + "/vendor/bin/hw");
+            const std::string dst1 = injectLayer_ + "/vendor/bin/hw/svbox-audio-service";
+            const std::string dst2 = injectLayer_ + "/vendor/bin/hw/android.hardware.audio.service";
+            if (CopyRegularFile(audioSvcPath_, dst1)) chmod(dst1.c_str(), 0755);
+            if (CopyRegularFile(audioSvcPath_, dst2)) chmod(dst2.c_str(), 0755);
+        }
+        if (!cameraSvcPath_.empty() && FileExists(cameraSvcPath_)) {
+            MkdirP(injectLayer_ + "/system/bin");
+            const std::string dst = injectLayer_ + "/system/bin/svbox-cameraserver";
+            if (CopyRegularFile(cameraSvcPath_, dst)) {
+                chmod(dst.c_str(), 0755);
+            }
+        }
+        int gpuCopied = 0;
+        if (useGfx) {
+            if (gpuGuestDir_.empty()) {
+                logLine("Missing gpu_guest libraries for hardware GPU mode!");
+                SetStatus("Missing gpu_guest libraries in HNP");
                 running_.store(false);
                 return;
             }
-            if (stat(dst.c_str(), &sDst) != 0 || sDst.st_size != sSrc.st_size ||
-                sDst.st_mtime < sSrc.st_mtime) {
+            MkdirP(injectLayer_ + "/vendor/lib64/egl");
+            MkdirP(injectLayer_ + "/vendor/lib64/hw");
+            for (const char* rel : kGuestGpuLibs) {
+                const std::string src = gpuGuestDir_ + "/" + rel;
+                const std::string dst = injectLayer_ + "/vendor/lib64/" + rel;
+                if (!FileExists(src)) {
+                    logLine("Missing guest GPU lib: " + src);
+                    SetStatus("Missing guest GPU lib: " + std::string(rel));
+                    running_.store(false);
+                    return;
+                }
                 if (!CopyRegularFile(src, dst)) {
                     logLine("Failed copying guest GPU lib: " + src + " -> " + dst);
                     SetStatus("Failed staging guest GPU lib");
@@ -1298,10 +1440,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                     return;
                 }
                 chmod(dst.c_str(), 0644);
-                ++copied;
+                ++gpuCopied;
             }
         }
-        logLine("Staged gfxstream guest libs (copied=" + std::to_string(copied) + "/14)");
+        logLine("Staged injectLayer=" + injectLayer_ + " (gpuLibs=" + std::to_string(gpuCopied) +
+                ", audioHal=" + std::to_string(!audioHalPath_.empty()) +
+                ", cameraStub=" + std::to_string(!cameraSvcPath_.empty()) + ")");
     }
 
     // Start XComponent renderer (gfxstream hardware GPU or HwcRenderer SwiftShader), InputBridge, AudioBridge
@@ -1389,9 +1533,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     } else {
         SetStatus("Starting Android 11 services + Zygote64...");
         lmkdThread_ = std::thread(&AndroidRuntime::LmkdLoop, this, sockDir + "/lmkd");
+        // Keep /dev/socket/mdns listening so SystemServer's NsdService.awaitConnection() unblocks
+        // immediately on connect(). Do NOT create an unserved /dev/socket/fwmarkd: Android Bionic
+        // libnetd_client.so connects to fwmarkd on accept4()/socket() and blocks forever in
+        // recvfrom() if nothing answers (hanging adbd and any guest TCP server).
         int dnsFd = MakeListenUnix(sockDir + "/dnsproxyd");
         int mdnsFd = MakeListenUnix(sockDir + "/mdns");
-        int fwFd = MakeListenUnix(sockDir + "/fwmarkd");
         {
             std::lock_guard<std::mutex> lk(procMu_);
             if (dnsFd >= 0) {
@@ -1399,7 +1546,6 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 dnsListenFd_ = dnsFd;
             }
             if (mdnsFd >= 0) ownedFds_.push_back(mdnsFd);
-            if (fwFd >= 0) ownedFds_.push_back(fwFd);
         }
         if (dnsFd >= 0) {
             dnsThread_ = std::thread(&AndroidRuntime::DnsProxyLoop, this, dnsFd);
@@ -1416,35 +1562,63 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             SleepCancelableMs(25);
         };
         if (useRealAudio) {
-            const std::string targetAudioSvc = rootfs_ + "/vendor/bin/hw/svbox-audio-service";
-            CopyRegularFile(audioSvcPath_, targetAudioSvc);
-            chmod(targetAudioSvc.c_str(), 0755);
             launchPaced("audio_hal", { "-e", sfLdPath, "vendor/bin/hw/svbox-audio-service" });
             SleepCancelableMs(150);
             launchPaced("audioserver", { "-e", sfLdPath, "system/bin/audioserver" });
         }
         if (!cameraSvcPath_.empty() && FileExists(cameraSvcPath_)) {
-            const std::string targetCamSvc = rootfs_ + "/system/bin/svbox-cameraserver";
-            CopyRegularFile(cameraSvcPath_, targetCamSvc);
-            chmod(targetCamSvc.c_str(), 0755);
             launchPaced("cameraserver", { "-e", sfLdPath, "system/bin/svbox-cameraserver" });
         }
         // HarmonyOS PC enforces W^X (denies anonymous PROT_EXEC for unsigned HAPs),
         // so configure Chromium WebView V8 to run --jitless instead of crashing on CodeRange mmap.
         {
-            const std::string wvFlags = runBase_ + "/data/local/tmp/webview-command-line";
+            const std::string wvFlags = dataBase_ + "/data/local/tmp/webview-command-line";
             WriteFile(wvFlags, "_ --js-flags=--jitless\n");
             chmod(wvFlags.c_str(), 0644);
+        }
+        // Native Android 11 64-bit adbd on TCP 127.0.0.1:5555 (also serves @jdwp-control
+        // before zygote64 starts so apps/system_server never spam JDWP connect errors).
+        // Exec via sh with an absolute path so Bionic linker64 matches
+        // /linkerconfig/com.android.adbd/ld.config.txt (dir.com.android.adbd = /apex/com.android.adbd/bin)
+        // cleanly without polluting LD_LIBRARY_PATH for child adb shell commands.
+        if (FileExists(rootfs_ + "/system/apex/com.android.adbd/bin/adbd")) {
+            int adbdFd = MakeListenUnix(sockDir + "/adbd", SOCK_SEQPACKET, 0666);
+            if (adbdFd >= 0) {
+                std::lock_guard<std::mutex> lk(procMu_);
+                ownedFds_.push_back(adbdFd);
+            }
+            std::vector<std::string> adbdCmd;
+            if (adbdFd >= 0) {
+                adbdCmd.push_back("-e");
+                adbdCmd.push_back("ANDROID_SOCKET_adbd=" + std::to_string(adbdFd));
+            }
+            adbdCmd.push_back("--");
+            adbdCmd.push_back("system/bin/sh");
+            adbdCmd.push_back("-c");
+            adbdCmd.push_back("exec /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0");
+            runSvbox("adbd", adbdCmd, false,
+                     adbdFd >= 0 ? std::vector<int>{ adbdFd } : std::vector<int>{});
+            SleepCancelableMs(80);
         }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
         launchPaced("keystore", { "-e", sfLdPath, "system/bin/keystore", "/data/misc/keystore" });
-        launchPaced("vold", { "-e", sfLdPath, "system/bin/vold",
-                   "--blkid_context=u:r:blkid:s0",
-                   "--blkid_untrusted_context=u:r:blkid_untrusted:s0",
-                   "--fsck_context=u:r:fsck:s0",
-                   "--fsck_untrusted_context=u:r:fsck_untrusted:s0" });
+        // Launch vold without /storage/* sub-mounts in its /proc/mounts view so vold's
+        // startup unmountAll() does not waste 5s/mount trying to ForceUnmount them.
+        {
+            auto voldArgs = BaseSvboxArgs(/*includeStorageSubmounts=*/false);
+            const std::vector<std::string> voldCmd = {
+                "-e", sfLdPath, "system/bin/vold",
+                "--blkid_context=u:r:blkid:s0",
+                "--blkid_untrusted_context=u:r:blkid_untrusted:s0",
+                "--fsck_context=u:r:fsck:s0",
+                "--fsck_untrusted_context=u:r:fsck_untrusted:s0"
+            };
+            voldArgs.insert(voldArgs.end(), voldCmd.begin(), voldCmd.end());
+            Spawn(voldArgs, false, logDir + "/vold.log");
+            SleepCancelableMs(25);
+        }
         launchPaced("suspend", { "-e", sfLdPath, "system/bin/hw/android.system.suspend@1.0-service" });
         launchPaced("power_stats", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.power.stats@1.0-service.mock" });
         launchPaced("power", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.power-service.example" });
