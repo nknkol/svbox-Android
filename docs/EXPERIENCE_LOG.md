@@ -518,6 +518,51 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **`svbox-netd` VPN 控制面 RPC** | `service call netd 5`（`networkCreateVpn(101)`）与 `service call netd 6`（`networkDestroy(101)`）均返回 `Parcel(00000000)` 零异常 |
 | **零改只读 `rootfs/` 校验** | `rootfs/` 0 字节改动，`adbd` (`127.0.0.1:5555`) 响应流畅无卡死 |
 
+---
+
+### 5.6 Step 6.5 与 Step 7 实机落地与验证记录（2026-11-23）
+
+#### A. Step 6.5：根因定位并修复 `pm install` 挂死（反哺 Layer 1 `svbox` `vdev.c`）
+
+* **真因定位（通用容器运行时缺陷，非 Android 特有）**：
+  * `svbox/src/payload/logic/vdev.c` 中 `struct vdev_open_slot` 静态固定 `VDEV_MAX_THREADS = 64` 且从未回收已退出线程；`system_server` 启动后常驻 ~112–136 个线程，导致第 65+ 个线程（如 `PackageInstaller`、`StorageManager`）每次 `ioctl(BINDER_WRITE_READ)` 均在 `get_thread_rpc_fd()` 中新建并泄漏独立 `rpc_fd`，第一次发送 `BC_TRANSACTION` 在通道 A，第二次 `waitForResponse` 却挂在全新通道 B 等待 `BR_REPLY`，永久阻塞在 `af_unix_recvmsg`（并令 `system_server` 与 `svbox-binderd` 泄漏 400+ FD）。
+* **Layer 1 `svbox` 通用修复（`feat/vdev-binder`，零 Android/OHOS 代码）**：
+  1. `vdev.c`：将每槽线程表改为按需 `mmap` 动态扩容（初始 256，上限 4096），扩容前以 `__NR_tgkill(pid, tid, 0) == -ESRCH` 自动回收已退出线程并关闭其 `rpc_fd`；收到 `SV_BINDER_THREAD_EXIT` 后立即清理当前线程通道；`VDEV_MAX_OPEN` 提升至 32；通用字符设备 `ioctl` 统一规范化 32 位命令字。
+  2. 新增通用多线程回归单测 `test/vfs/test_vdev_threads.py`（128 并发线程状态会话 + 320 短生命周期线程回收验证，`total_attaches=448, peak_live=257`）。
+* **`HAD-W32` 真机结果**：
+  * `system_server` FD 数由 **741 → 325**，`svbox-binderd` FD 数由 **668 → 319**；
+  * `adb shell pm install -r /data/local/tmp/vpntest.apk`：**`Success`（0.26–0.29s）**，`pm uninstall org.svbox.vpntest`：**`Success`（0.23–0.30s）**。
+
+#### B. Step 7：Layer 2 `ohos_bridge/` 解耦 + 手柄/USB 桥接 + 标准 ARM64 Linux 发行版真机复用验证
+
+* **Layer 1 `svbox` 通用增强（标准 Linux `evdev` / `termios` / `usbfs` / BusyBox 网络兼容）**：
+  1. `vdev.c`：`VDEV_TYPE_CHR` 字符设备对 `FIONBIO (0x5421)` / `FIONREAD (0x541b)` 透明直通内核流 socket；支持传统 Linux `termios`/`winsize`/`TIOCM*`（`TCGETS=0x5401` 36B 等）；支持标准 Linux `usbfs`（`USBDEVFS_CONTROL` / `USBDEVFS_BULK` 内嵌 `void *data` 指针双向封送，以及 `USBDEVFS_CLAIMINTERFACE` / `GETDRIVER` / `CONNECTINFO` / `GET_CAPABILITIES`）；修正 `fill_chr_stat()` `makedev` 编码及默认 minor（`220 + vdev_idx`）消除 8-bit 溢出。
+  2. `net_proto.h` / `net_stack.c` / `svbox_net.c`：补齐 BusyBox `ip addr` 所需的 `SIOCGIFTXQLEN (0x8942)` / `SIOCSIFTXQLEN (0x8943)`。
+  3. 新增通用单测 `test/vfs/test_vdev_chr_ioctls.py`，全量 `svbox` 套件 + 零关键词纯净度校验全部 PASS。
+* **Layer 2 `ohos_bridge/` 独立静态库（零 Android 业务代码，同时服务 HAP 与独立 CLI）**：
+  * 从 `hap/entry/src/main/cpp/` 彻底抽离并删除旧副本，形成独立 `ohos_bridge/` 模块（`CMakeLists.txt` + `Makefile` + `include/ohos_bridge/*` + `src/*`）：
+    * `SurfaceBridge`（`OHNativeWindow` + `OH_NativeVSync`，同时支持 HWC prime-FD 与通用 RGBA 帧缓冲服务 `/ipc/fb.sock`）
+    * `GfxstreamBridge`（动态 `libgfxstream_host.so`）
+    * `InputBridge`（`/dev/input/event0` 触控、`/dev/input/event1` 键盘、**新增 `/dev/input/event2` 标准 Linux Xbox 360 手柄 `svbox-gamepad`** + 动态挂载鸿蒙 `GameControllerKit` `libohgame_controller.z.so` 21 路按键/摇杆/扳机监听）
+    * `AudioBridge`（动态 `libohaudio.so` 播放，HAP 与独立 CLI 均可出声）
+    * `UsbBridge`（**新增 `/dev/bus/usb/001/002` 标准 Linux `usbfs` + `/dev/ttyUSB0` 虚拟串口**，支持 `libusb_ndk.z.so` 探测、宿主委托回调与内置回环/AT 响应器）
+    * `SchedQos`（动态 `libqos.so` + `libohhidebug.so` + 20 核 L/M/B 拓扑探测）
+    * `OhosBridge::ContainerRunner` + 独立运行器 `ohos_bridge/tools/svbox_linux.cpp`（`build/svbox-linux`）。
+* **Layer 3 `svbox-Android` HAP 瘦身**：
+  * `hap/entry/src/main/cpp/` 仅保留 `CMakeLists.txt`、`android_runtime.{h,cpp}` 与 `napi_init.cpp`，通过 `add_subdirectory(ohos_bridge)` 直接链接 `libohos_bridge.a`，并同步向 Android 11 暴露 `/dev/input/event2`、`/dev/bus/usb/001/002`、`/dev/ttyUSB0` 及 NAPI 手柄注入接口。
+
+#### C. `HAD-W32` 真机 Step 7 双系统（Alpine Linux 3.21.3 ARM64 + Android 11）验收结果
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **标准 ARM64 Linux 发行版真机运行** | 原版未改 **Alpine Linux 3.21.3 ARM64** 通过 `svbox` + `ohos_bridge/build/svbox-linux` 直接启动（`Linux svbox-linux 6.1.0-svbox aarch64`，只读 `--lower` + 可写 `--upper` + 宿主共享目录 `/mnt/share`），`SchedQos` 探测 `20c (sys: L=4 M=8 B=8)` |
+| **Alpine 虚拟网络 & `apk` 真机装包** | `ip addr` 洁净输出 `eth0 10.0.2.15/24 qlen 1000`（零 `SIOCGIFTXQLEN` 报错）；经 `svbox-net` 完成 `apk update`（25,263 包）+ `apk add python3`（17 包，49 MiB，`Python 3.12.16`）；`/dev/net/tun` 创建与自动拆毁全通 |
+| **Alpine 手柄 / 键盘 `evdev` 链路** | 鸿蒙 `GameControllerKit` 成功注册 21 路监听器（`gck=1`）；Alpine 内打开 `/dev/input/event2`（`svbox-gamepad`，`USB 045e:028e`）与 `/dev/input/event1`，实收注入的 `ABS_X/Y/RZ/HAT0X` + `BTN_SOUTH`（8 事件）与 `KEY_A`（4 事件） |
+| **Alpine Linux `usbfs` & `/dev/ttyUSB0`** | 读取 `/dev/bus/usb/001/002` 50B 原始 USB 描述符（`VID:PID=1d6b:0104`），`USBDEVFS_GET_CAPABILITIES` / `CONNECTINFO` / `CLAIMINTERFACE` / `GETDRIVER("usbfs")` / `CONTROL GET_DESCRIPTOR("HarmonyOS Virtual USB Bridge")` / `BULK 24B` 往返全通；`/dev/ttyUSB0` `TCGETS`/`TIOCGWINSZ` + `AT\r\n` → `OK\r\n` 通过 |
+| **Alpine 鸿蒙 `OHAudio` & 通用 RGBA 帧缓冲** | Alpine 经 `/ipc/audio.sock` 推送 35,280B 440Hz PCM，真机拉起 `libohaudio.so` 播放（`audio_backend=1, audio_rx=audio_played=35280`）；经 `/ipc/fb.sock` 推送 320×240 RGBA 帧获 `"ok"` ACK，宿主机像素校验 100% 一致 |
+| **Android 11 零回归 + 手柄/USB 原生识别** | 解耦后的 `org.svbox.android` 真机启动流畅：`dumpsys input` 识别 **`svbox-touchscreen` (`event0`)、`svbox-keyboard` (`event1`)、`svbox-gamepad` (`event2`, `Classes: 0x80000141 EXTERNAL\|JOYSTICK\|GAMEPAD\|KEYBOARD`, `Sources: 0x01000511`)**；`/dev/bus/usb/001/002` 返回 50B 描述符；`dumpsys connectivity` `VALIDATED (Score 70)`；`pm install` **0.26s** / `pm uninstall` **0.30s**；`SurfaceFlinger` 正常渲染，`rootfs/` 0 字节改动 |
+
+
 
 
 

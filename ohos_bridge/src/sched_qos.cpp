@@ -1,24 +1,21 @@
 /* SPDX-License-Identifier: MIT */
-#include "sched_qos.h"
+#include "ohos_bridge/sched_qos.h"
+#include "ohos_bridge/log.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fstream>
-#include <hidebug/hidebug.h>
-#include <hilog/log.h>
 #include <mutex>
 #include <sched.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-
-#undef LOG_TAG
-#define LOG_TAG "SvboxQos"
 
 namespace SchedQos {
 
@@ -30,12 +27,45 @@ SetThreadQoSFn GetSetThreadQoSFn() {
     static SetThreadQoSFn fn = []() -> SetThreadQoSFn {
         void* h = dlopen("libqos.so", RTLD_NOW | RTLD_LOCAL);
         if (!h) {
-            OH_LOG_WARN(LOG_APP, "dlopen(libqos.so) unavailable");
+            OB_LOG_WARN("SvboxQos", "dlopen(libqos.so) unavailable");
             return nullptr;
         }
         return reinterpret_cast<SetThreadQoSFn>(dlsym(h, "OH_QoS_SetThreadQoS"));
     }();
     return fn;
+}
+
+struct HiDebugNativeMemInfoCompat {
+    uint32_t pss;
+    uint32_t vss;
+    uint32_t rss;
+    uint32_t sharedDirty;
+    uint32_t privateDirty;
+    uint32_t sharedClean;
+    uint32_t privateClean;
+};
+
+struct HiDebugApi {
+    double (*getSysCpu)(void) = nullptr;
+    double (*getAppCpu)(void) = nullptr;
+    void (*getNativeMem)(HiDebugNativeMemInfoCompat*, bool) = nullptr;
+    int (*getGfxMem)(uint32_t*) = nullptr;
+};
+
+const HiDebugApi& GetHiDebugApi() {
+    static HiDebugApi api = []() {
+        HiDebugApi a;
+        void* h = dlopen("libohhidebug.so", RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            a.getSysCpu = reinterpret_cast<double (*)(void)>(dlsym(h, "OH_HiDebug_GetSystemCpuUsage"));
+            a.getAppCpu = reinterpret_cast<double (*)(void)>(dlsym(h, "OH_HiDebug_GetAppCpuUsage"));
+            a.getNativeMem = reinterpret_cast<void (*)(HiDebugNativeMemInfoCompat*, bool)>(
+                dlsym(h, "OH_HiDebug_GetAppNativeMemInfoWithCache"));
+            a.getGfxMem = reinterpret_cast<int (*)(uint32_t*)>(dlsym(h, "OH_HiDebug_GetGraphicsMemory"));
+        }
+        return a;
+    }();
+    return api;
 }
 
 std::mutex g_topoMu;
@@ -62,8 +92,6 @@ std::string FormatCpuList(const std::vector<int32_t>& cpus) {
     return oss.str();
 }
 
-// ~2ms single-core ALU micro-benchmark (modeled on gpui-ohos/sched_qos.rs)
-// to classify Big/Medium/Little cores even when HAP sandbox blocks /sys cpu_capacity.
 double MeasureCoreThroughput(int cpu) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -71,7 +99,6 @@ double MeasureCoreThroughput(int cpu) {
     if (sched_setaffinity(0, sizeof(set), &set) != 0) {
         return 0.0;
     }
-    // Brief warmup so the core ramps out of idle
     volatile uint64_t x = 0x123456789abcdef0ull + static_cast<uint64_t>(cpu);
     for (int i = 0; i < 60000; ++i) {
         x = (x * 6364136223846793005ull) + 1442695040888963407ull;
@@ -151,7 +178,6 @@ void RunProbeWorker() {
     topo.totalCores = static_cast<int32_t>(allowed.size());
 
     if (maxScore <= 0.0 || (maxScore - minScore) / maxScore < 0.08) {
-        // Homogeneous or noisy measurement: partition evenly by CPU index
         size_t n = allowed.size();
         for (size_t i = 0; i < n; ++i) {
             if (i < n / 4) topo.littleCores.push_back(allowed[i]);
@@ -184,7 +210,7 @@ void RunProbeWorker() {
         << " B=" << topo.bigCores.size() << ")";
     topo.summary = sum.str();
 
-    OH_LOG_INFO(LOG_APP, "Core topology probed: %{public}s [L=%{public}s M=%{public}s B=%{public}s]",
+    OB_LOG_INFO("SvboxQos", "Core topology probed: %s [L=%s M=%s B=%s]",
                 topo.summary.c_str(),
                 FormatCpuList(topo.littleCores).c_str(),
                 FormatCpuList(topo.mediumCores).c_str(),
@@ -214,7 +240,7 @@ bool SetCurrentThreadQoS(Level level, const char* label) {
     if (!fn) return false;
     int rc = fn(static_cast<int>(level));
     if (rc == 0) {
-        OH_LOG_INFO(LOG_APP, "SetThreadQoS(%{public}s) = %{public}d OK",
+        OB_LOG_INFO("SvboxQos", "SetThreadQoS(%s) = %d OK",
                     label ? label : "?", static_cast<int>(level));
         return true;
     }
@@ -265,25 +291,26 @@ std::string ResolveCpuset(const std::string& profile,
         }
         return "12-19";
     }
-    return ""; // "all" -> unrestricted
+    return "";
 }
 
 Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
     Telemetry t;
-    t.systemCpuPercent = OH_HiDebug_GetSystemCpuUsage() * 100.0;
-    t.appCpuPercent = OH_HiDebug_GetAppCpuUsage() * 100.0;
-
-    HiDebug_NativeMemInfo nmem = {};
-    OH_HiDebug_GetAppNativeMemInfoWithCache(&nmem, false);
-    t.hostNativeRssMb = static_cast<uint32_t>(nmem.rss / 1024u);
-
-    uint32_t gfxKb = 0;
-    if (OH_HiDebug_GetGraphicsMemory(&gfxKb) == HIDEBUG_SUCCESS) {
-        t.graphicsMemMb = gfxKb / 1024u;
+    const auto& hd = GetHiDebugApi();
+    if (hd.getSysCpu) t.systemCpuPercent = hd.getSysCpu() * 100.0;
+    if (hd.getAppCpu) t.appCpuPercent = hd.getAppCpu() * 100.0;
+    if (hd.getNativeMem) {
+        HiDebugNativeMemInfoCompat nmem = {};
+        hd.getNativeMem(&nmem, false);
+        t.hostNativeRssMb = static_cast<uint32_t>(nmem.rss / 1024u);
+    }
+    if (hd.getGfxMem) {
+        uint32_t gfxKb = 0;
+        if (hd.getGfxMem(&gfxKb) == 0) {
+            t.graphicsMemMb = gfxKb / 1024u;
+        }
     }
 
-    // Sum RSS of all running processes under our UID (except self) to capture
-    // svbox daemons + Zygote64 + system_server + Android apps accurately.
     uid_t myUid = getuid();
     pid_t myPid = getpid();
     uint64_t totalKb = 0;

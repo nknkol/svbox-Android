@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/* Real HarmonyOS OHAudio PCM bridge: receives mixed PCM streams over
- * /ipc/audio.sock from audio.primary.svbox.so and plays them through
- * HarmonyOS PC's native libohaudio.so (OH_AudioRenderer) with automatic
- * silence pause for low-power compliance. */
+/* HarmonyOS OHAudio PCM bridge: receives mixed PCM streams ("SVAU" header +
+ * raw S16LE frames) over a Unix socket from any Linux/Android guest and plays
+ * them through HarmonyOS PC's libohaudio.so (OH_AudioRenderer) with automatic
+ * silence pause. Dynamically loads libohaudio.so so both HAP and standalone
+ * CLI tools link cleanly. */
 #pragma once
 
 #include <atomic>
@@ -11,9 +12,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-struct OH_AudioStreamBuilderStruct;
-struct OH_AudioRendererStruct;
 
 class AudioBridge {
 public:
@@ -24,25 +22,30 @@ public:
     void SetMuted(bool muted) { muted_.store(muted); }
     bool IsMuted() const { return muted_.load(); }
     bool IsActive() const { return active_.load(); }
+    bool HasBackend() const { return backendAvailable_.load(); }
     uint64_t BytesPlayed() const { return bytesPlayed_.load(); }
+    uint64_t BytesReceived() const { return bytesReceived_.load(); }
 
 private:
     AudioBridge() = default;
 
     void ServerLoop();
     void HandleClient(int fd);
+    bool EnsureOhAudioLoaded();
     bool EnsureRenderer(uint32_t sampleRate, uint32_t channels);
     void ReleaseRenderer();
     void PushPcm(const uint8_t* data, size_t len);
     size_t PopPcm(uint8_t* dst, size_t len);
 
-    static int32_t OnWriteData(OH_AudioRendererStruct* renderer, void* userData,
+    static int32_t OnWriteData(void* renderer, void* userData,
                                void* audioData, int32_t audioDataSize);
 
     std::atomic<bool> running_{false};
     std::atomic<bool> muted_{false};
     std::atomic<bool> active_{false};
+    std::atomic<bool> backendAvailable_{false};
     std::atomic<uint64_t> bytesPlayed_{0};
+    std::atomic<uint64_t> bytesReceived_{0};
 
     std::string sockPath_;
     int listenFd_ = -1;
@@ -56,8 +59,10 @@ private:
     uint32_t emptyCallbacks_ = 0;
 
     std::mutex ohMu_;
-    OH_AudioStreamBuilderStruct* builder_ = nullptr;
-    OH_AudioRendererStruct* renderer_ = nullptr;
+    void* ohLib_ = nullptr;
+    bool ohLoadTried_ = false;
+    void* builder_ = nullptr;
+    void* renderer_ = nullptr;
     uint32_t curRate_ = 0;
     uint32_t curChannels_ = 0;
     bool rendererStarted_ = false;

@@ -4,11 +4,12 @@
  * graphics HALs, SurfaceFlinger, and either BootAnimation demo or full
  * Android 11 (Zygote64 -> system_server) using svbox. */
 #include "android_runtime.h"
-#include "audio_bridge.h"
-#include "gfxstream_bridge.h"
-#include "hwc_renderer.h"
-#include "input_bridge.h"
-#include "sched_qos.h"
+#include "ohos_bridge/audio_bridge.h"
+#include "ohos_bridge/gpu_bridge.h"
+#include "ohos_bridge/input_bridge.h"
+#include "ohos_bridge/sched_qos.h"
+#include "ohos_bridge/surface_bridge.h"
+#include "ohos_bridge/usb_bridge.h"
 #include "net_proto.h"
 
 #include <arpa/inet.h>
@@ -694,6 +695,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/__properties__:/dev/__properties__",
         "-v", sockDir + ":/dev/socket",
         "-v", runBase_ + "/dev_input:/dev/input",
+        "-v", runBase_ + "/dev_bus_usb:/dev/bus/usb",
         "-v", runBase_ + "/ipc:/ipc",
         "-v", dataBase_ + "/data:/data",
         "-v", dataBase_ + "/data/data:/data/user/0",
@@ -739,6 +741,9 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--vdev", "/dev/vndbinder:" + sockDir + "/vndbinder.sock:binder",
         "--vdev", "/dev/input/event0:" + sockDir + "/input_touch.sock:chr",
         "--vdev", "/dev/input/event1:" + sockDir + "/input_kbd.sock:chr",
+        "--vdev", "/dev/input/event2:" + sockDir + "/input_gamepad.sock:chr",
+        "--vdev", "/dev/bus/usb/001/002:" + sockDir + "/usb_001_002.sock:chr",
+        "--vdev", "/dev/ttyUSB0:" + sockDir + "/ttyusb0.sock:chr",
     };
     if (!netSockPath_.empty()) {
         vdevsAndEnv.push_back("--net-sock");
@@ -1594,7 +1599,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Ephemeral per-boot runtime directories (under sandboxTempDir)
     const char* runDirs[] = {
         "", "/sockets", "/__properties__", "/ipc", "/cache", "/acct", "/cgroup",
-        "/sys_power", "/dev_input", "/cpuset", "/cpuset/foreground", "/cpuset/background",
+        "/sys_power", "/dev_input", "/dev_bus_usb", "/dev_bus_usb/001", "/cpuset", "/cpuset/foreground", "/cpuset/background",
         "/cpuset/system-background", "/cpuset/top-app", "/stune", "/stune/foreground",
         "/stune/background", "/stune/top-app", "/mnt/user/0", "/mnt/expand",
         "/mnt/runtime/default/emulated/0", "/mnt/runtime/read/emulated/0",
@@ -1660,6 +1665,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     WriteFile(runBase_ + "/dev_input/event0", "");
     WriteFile(runBase_ + "/dev_input/event1", "");
+    WriteFile(runBase_ + "/dev_input/event2", "");
+    WriteFile(runBase_ + "/dev_bus_usb/001/002", "");
     WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
 
     std::string gpuModeSnap;
@@ -1954,10 +1961,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 ", cameraStub=" + std::to_string(!cameraSvcPath_.empty()) + ")");
     }
 
-    // Start XComponent renderer (gfxstream hardware GPU or HwcRenderer SwiftShader), InputBridge, AudioBridge
+    // Start Layer 2 ohos_bridge services (display, evdev touch/kbd/gamepad, OHAudio, USB/serial)
     logdwThread_ = std::thread(&AndroidRuntime::LogdwLoop, this, sockDir + "/logdw", logDir + "/logcat.txt");
-    InputBridge::Instance().Start(sockDir + "/input_touch.sock", sockDir + "/input_kbd.sock", width, height);
+    InputBridge::Instance().Start(sockDir + "/input_touch.sock", sockDir + "/input_kbd.sock",
+                                  width, height, sockDir + "/input_gamepad.sock", true);
     AudioBridge::Instance().Start(ipcDir + "/audio.sock");
+    UsbBridge::Instance().Start(sockDir + "/usb_001_002.sock", sockDir + "/ttyusb0.sock");
     if (useGfx) {
         HwcRenderer::Instance().ClearWindow();
         if (winSnap) {
@@ -1982,6 +1991,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     WaitForFile(sockDir + "/input_touch.sock", 500);
     WaitForFile(sockDir + "/input_kbd.sock", 500);
+    WaitForFile(sockDir + "/input_gamepad.sock", 500);
+    WaitForFile(sockDir + "/usb_001_002.sock", 500);
+    WaitForFile(sockDir + "/ttyusb0.sock", 500);
 
     // 3. Start servicemanager & hwservicemanager
     auto runSvbox = [&](const std::string& tag,
@@ -2181,6 +2193,7 @@ std::string AndroidRuntime::Stop() {
     HwcRenderer::Instance().Stop();
     InputBridge::Instance().Stop();
     AudioBridge::Instance().Stop();
+    UsbBridge::Instance().Stop();
     if (dnsListenFd_ >= 0) {
         shutdown(dnsListenFd_, SHUT_RDWR);
         dnsListenFd_ = -1;

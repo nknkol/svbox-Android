@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /* HarmonyOS PC thread QoS (libqos.so), sandbox-safe Big/Medium/Little CPU
- * cluster discovery via ~2ms/core ALU micro-probe (when /sys cpu_capacity is
- * blocked by HAP sandbox), and HiDebug + /proc container telemetry. */
+ * cluster discovery via ~2ms/core ALU micro-probe, and HiDebug + /proc
+ * container telemetry. Generic Layer 2 bridge (zero guest-OS assumptions). */
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 namespace SchedQos {
@@ -41,14 +42,11 @@ bool SetCurrentThreadQoS(Level level, const char* label);
 void StartCoreTopologyProbeAsync();
 CoreTopology GetCoreTopology();
 
-// Converts a profile ("eco"|"balanced"|"perf"|"all") + optional custom cpuset
-// into a concrete Linux cpuset string (e.g. "0-3", "4-9", "12-19") and nice/sched.
 std::string ResolveCpuset(const std::string& profile,
                           const std::string& customCpuset,
                           int32_t* outNice,
                           std::string* outSched);
 
-// Samples HiDebug CPU/graphics metrics + container process tree RSS from /proc.
 Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids);
 
 } // namespace SchedQos

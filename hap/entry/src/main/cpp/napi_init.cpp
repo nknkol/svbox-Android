@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: MIT */
 #include "android_runtime.h"
-#include "audio_bridge.h"
-#include "gfxstream_bridge.h"
-#include "hwc_renderer.h"
-#include "input_bridge.h"
-#include "sched_qos.h"
+#include "ohos_bridge/audio_bridge.h"
+#include "ohos_bridge/gpu_bridge.h"
+#include "ohos_bridge/input_bridge.h"
+#include "ohos_bridge/sched_qos.h"
+#include "ohos_bridge/surface_bridge.h"
+#include "ohos_bridge/usb_bridge.h"
 
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <cstdio>
@@ -330,6 +331,34 @@ napi_value InjectTapNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value InjectGamepadButtonNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t btn = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    bool down = argc > 1 ? GetBoolArg(env, args[1], false) : false;
+    if (btn > 0 && btn < 65536) {
+        InputBridge::Instance().InjectGamepadButton(static_cast<uint16_t>(btn), down);
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value InjectGamepadAxisNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t axis = argc > 0 ? GetInt32Arg(env, args[0], -1) : -1;
+    int32_t val = argc > 1 ? GetInt32Arg(env, args[1], 0) : 0;
+    if (axis >= 0 && axis < 64) {
+        InputBridge::Instance().InjectGamepadAxis(static_cast<uint16_t>(axis), val);
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
 napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
@@ -374,6 +403,9 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setBool("connected", useGfx ? gfx.IsConnected() : hwc.IsConnected());
     setBool("vsyncActive", useGfx ? gfx.IsActive() : hwc.UsingNativeVsync());
     setBool("inputReady", inp.HasTouchClient() || inp.HasKbdClient());
+    setBool("gamepadReady", inp.HasGamepadClient());
+    setBool("gameControllerKit", inp.GameControllerKitActive());
+    setI64("usbTransfers", static_cast<int64_t>(UsbBridge::Instance().UsbTransfers()));
     setBool("audioActive", aud.IsActive());
     setI64("frames", static_cast<int64_t>(useGfx ? gfx.FrameCount() : hwc.FrameCount()));
     setI32("width", useGfx ? gfx.FrameWidth() : hwc.FrameWidth());
@@ -409,6 +441,8 @@ napi_value Init(napi_env env, napi_value exports) {
         { "runGuestCmd", nullptr, RunGuestCmdNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "dumpProcs", nullptr, DumpProcsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectTap", nullptr, InjectTapNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "injectGamepadButton", nullptr, InjectGamepadButtonNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "injectGamepadAxis", nullptr, InjectGamepadAxisNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

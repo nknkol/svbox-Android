@@ -1666,7 +1666,7 @@ int main(int argc, char **argv)
         perror("bind");
         return 1;
     }
-    if (listen(g_listen_fd, 64) < 0) {
+    if (listen(g_listen_fd, 256) < 0) {
         perror("listen");
         return 1;
     }

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #pragma once
 
-#include "sched_qos.h"
+#include "ohos_bridge/sched_qos.h"
 
 #include <atomic>
 #include <cstdint>

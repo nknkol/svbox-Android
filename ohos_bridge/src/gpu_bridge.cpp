@@ -1,12 +1,8 @@
 /* SPDX-License-Identifier: MIT */
-#include "gfxstream_bridge.h"
+#include "ohos_bridge/gpu_bridge.h"
+#include "ohos_bridge/log.h"
 
-#include <chrono>
 #include <dlfcn.h>
-#include <hilog/log.h>
-
-#undef LOG_TAG
-#define LOG_TAG "SvboxGfxBridge"
 
 GfxstreamBridge& GfxstreamBridge::Instance() {
     static GfxstreamBridge inst;
@@ -21,7 +17,7 @@ bool GfxstreamBridge::EnsureLoadedLocked() {
     if (!dlHandle_) {
         const char* err = dlerror();
         lastError_ = std::string("dlopen(libgfxstream_host.so) failed: ") + (err ? err : "unknown");
-        OH_LOG_ERROR(LOG_APP, "%{public}s", lastError_.c_str());
+        OB_LOG_ERROR("SvboxGfxBridge", "%s", lastError_.c_str());
         return false;
     }
     fnInit_ = reinterpret_cast<int (*)(int32_t, int32_t, int, const char*)>(
@@ -41,12 +37,12 @@ bool GfxstreamBridge::EnsureLoadedLocked() {
 
     if (!fnInit_ || !fnSetWindow_ || !fnClearWindow_ || !fnStop_ || !fnGetStats_) {
         lastError_ = "Missing svbox_gfx_* symbols in libgfxstream_host.so";
-        OH_LOG_ERROR(LOG_APP, "%{public}s", lastError_.c_str());
+        OB_LOG_ERROR("SvboxGfxBridge", "%s", lastError_.c_str());
         dlclose(dlHandle_);
         dlHandle_ = nullptr;
         return false;
     }
-    OH_LOG_INFO(LOG_APP, "Loaded libgfxstream_host.so successfully");
+    OB_LOG_INFO("SvboxGfxBridge", "Loaded libgfxstream_host.so successfully");
     return true;
 }
 
@@ -61,7 +57,6 @@ bool GfxstreamBridge::Start(const std::string& sockPath, int32_t width, int32_t 
     fbW_ = width;
     fbH_ = height;
 
-    // Pre-register XComponent OHNativeWindow if already available
     if (pendingWindow_) {
         fnSetWindow_(pendingWindow_, pendingW_ > 0 ? pendingW_ : width,
                      pendingH_ > 0 ? pendingH_ : height);
@@ -70,7 +65,7 @@ bool GfxstreamBridge::Start(const std::string& sockPath, int32_t width, int32_t 
     int rc = fnInit_(width, height, static_cast<int>(mode), sockPath.c_str());
     if (rc != 0) {
         lastError_ = "svbox_gfx_init failed rc=" + std::to_string(rc);
-        OH_LOG_ERROR(LOG_APP, "%{public}s (mode=%{public}d sock=%{public}s)",
+        OB_LOG_ERROR("SvboxGfxBridge", "%s (mode=%d sock=%s)",
                      lastError_.c_str(), static_cast<int>(mode), sockPath.c_str());
         return false;
     }
@@ -78,7 +73,7 @@ bool GfxstreamBridge::Start(const std::string& sockPath, int32_t width, int32_t 
     active_.store(true);
     SvboxGfxStats st{};
     fnGetStats_(&st);
-    OH_LOG_INFO(LOG_APP, "gfxstream started: mode=%{public}d renderer=%{public}s version=%{public}s",
+    OB_LOG_INFO("SvboxGfxBridge", "gfxstream started: mode=%d renderer=%s version=%s",
                 static_cast<int>(mode), st.renderer, st.version);
     return true;
 }
@@ -88,13 +83,9 @@ void GfxstreamBridge::Stop() {
     if (!active_.exchange(false)) {
         return;
     }
-    if (fnClearWindow_) {
-        fnClearWindow_();
-    }
-    if (fnStop_) {
-        fnStop_();
-    }
-    OH_LOG_INFO(LOG_APP, "gfxstream stopped");
+    if (fnClearWindow_) fnClearWindow_();
+    if (fnStop_) fnStop_();
+    OB_LOG_INFO("SvboxGfxBridge", "gfxstream stopped");
 }
 
 void GfxstreamBridge::SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH) {
@@ -105,8 +96,8 @@ void GfxstreamBridge::SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_
     if (active_.load() && fnSetWindow_ && window) {
         int rc = fnSetWindow_(window, surfaceW > 0 ? surfaceW : fbW_,
                               surfaceH > 0 ? surfaceH : fbH_);
-        OH_LOG_INFO(LOG_APP, "gfxstream SetWindow(%p, %{public}dx%{public}d) -> %{public}d",
-                    window, surfaceW, surfaceH, rc);
+        OB_LOG_INFO("SvboxGfxBridge", "gfxstream SetWindow(%p, %dx%d) -> %d",
+                    static_cast<void*>(window), surfaceW, surfaceH, rc);
     }
 }
 
@@ -115,16 +106,12 @@ void GfxstreamBridge::ClearWindow() {
     pendingWindow_ = nullptr;
     pendingW_ = 0;
     pendingH_ = 0;
-    if (active_.load() && fnClearWindow_) {
-        fnClearWindow_();
-    }
+    if (active_.load() && fnClearWindow_) fnClearWindow_();
 }
 
 void GfxstreamBridge::SetVisible(bool visible) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (active_.load() && fnSetVisible_) {
-        fnSetVisible_(visible ? 1 : 0);
-    }
+    if (active_.load() && fnSetVisible_) fnSetVisible_(visible ? 1 : 0);
 }
 
 bool GfxstreamBridge::IsConnected() const {
@@ -165,15 +152,11 @@ int32_t GfxstreamBridge::FrameHeight() const {
 }
 
 std::string GfxstreamBridge::RendererName() const {
-    if (!active_.load()) return "";
     std::lock_guard<std::mutex> lk(mu_);
-    if (!fnGetStats_) return "";
+    if (!fnGetStats_ || !active_.load()) return "";
     SvboxGfxStats st{};
     fnGetStats_(&st);
-    if (st.renderer[0] != '\0') {
-        return std::string(st.renderer);
-    }
-    return "Maleoon 916";
+    return st.renderer;
 }
 
 std::string GfxstreamBridge::LastError() const {

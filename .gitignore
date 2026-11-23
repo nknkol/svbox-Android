@@ -39,3 +39,6 @@ gpu/ndk_sysroot/
 gpu/build_host/
 gpu/build_guest/
 gpu/out/
+
+# Step 7 Layer 2 ohos_bridge CLI build outputs
+ohos_bridge/build/

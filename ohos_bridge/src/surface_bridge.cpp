@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: MIT */
-#include "hwc_renderer.h"
-#include "sched_qos.h"
+#include "ohos_bridge/surface_bridge.h"
+#include "ohos_bridge/log.h"
+#include "ohos_bridge/sched_qos.h"
 
 #include <chrono>
 #include <cstring>
 #include <errno.h>
-#include <hilog/log.h>
+#ifndef OHOS_BRIDGE_HEADLESS
 #include <native_buffer/native_buffer.h>
 #include <native_vsync/native_vsync.h>
+#endif
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -15,10 +18,18 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#undef LOG_TAG
-#define LOG_TAG "SvboxHwc"
+namespace {
 
-static bool RecvExact(int fd, void* dst, size_t n, const std::atomic<bool>& stop) {
+constexpr uint32_t kFbMagic = 0x42465653u; /* "SVFB" */
+
+struct SvFbFrameHdr {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format; /* 0 = RGBA8888 */
+};
+
+bool RecvExact(int fd, void* dst, size_t n, const std::atomic<bool>& stop) {
     uint8_t* p = static_cast<uint8_t*>(dst);
     size_t got = 0;
     while (got < n && !stop.load()) {
@@ -35,7 +46,7 @@ static bool RecvExact(int fd, void* dst, size_t n, const std::atomic<bool>& stop
     return got == n;
 }
 
-static int RecvPrimeFd(int sockFd, const std::atomic<bool>& stop) {
+int RecvPrimeFd(int sockFd, const std::atomic<bool>& stop) {
     while (!stop.load()) {
         char dummy[16] = {};
         struct iovec iov = { dummy, sizeof(dummy) };
@@ -69,37 +80,39 @@ static int RecvPrimeFd(int sockFd, const std::atomic<bool>& stop) {
     return -1;
 }
 
-HwcRenderer& HwcRenderer::Instance() {
-    static HwcRenderer inst;
+} // namespace
+
+SurfaceBridge& SurfaceBridge::Instance() {
+    static SurfaceBridge inst;
     return inst;
 }
 
-void HwcRenderer::SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH) {
+void SurfaceBridge::SetWindow(OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH) {
     {
         std::lock_guard<std::mutex> lk(winMu_);
         window_ = window;
         configured_ = false;
     }
-    OH_LOG_INFO(LOG_APP, "XComponent surface ready: %{public}dx%{public}d win=%{public}p",
-                surfaceW, surfaceH, window);
+    OB_LOG_INFO("SvboxSurface", "XComponent surface ready: %dx%d win=%p",
+                surfaceW, surfaceH, static_cast<void*>(window));
     RequestVsyncFrame();
 }
 
-void HwcRenderer::ClearWindow() {
+void SurfaceBridge::ClearWindow() {
     std::lock_guard<std::mutex> lk(winMu_);
     window_ = nullptr;
     configured_ = false;
 }
 
-void HwcRenderer::SetVisible(bool visible) {
+void SurfaceBridge::SetVisible(bool visible) {
     visible_.store(visible);
     if (visible) {
         RequestVsyncFrame();
     }
 }
 
-void HwcRenderer::OnVsyncFrame(long long /*timestamp*/, void* data) {
-    auto* self = static_cast<HwcRenderer*>(data);
+void SurfaceBridge::OnVsyncFrame(long long /*timestamp*/, void* data) {
+    auto* self = static_cast<SurfaceBridge*>(data);
     if (!self) return;
     {
         std::lock_guard<std::mutex> lk(self->vsyncMu_);
@@ -109,7 +122,6 @@ void HwcRenderer::OnVsyncFrame(long long /*timestamp*/, void* data) {
         return;
     }
     self->PresentLatest();
-    // If another frame arrived during presentation, arm the next VSync on demand
     bool more = false;
     {
         std::lock_guard<std::mutex> lk(self->bufMu_);
@@ -120,21 +132,23 @@ void HwcRenderer::OnVsyncFrame(long long /*timestamp*/, void* data) {
     }
 }
 
-void HwcRenderer::RequestVsyncFrame() {
+void SurfaceBridge::RequestVsyncFrame() {
     if (stop_.load() || !visible_.load()) return;
+#ifndef OHOS_BRIDGE_HEADLESS
     if (usingVsync_.load()) {
         std::lock_guard<std::mutex> lk(vsyncMu_);
         if (vsync_ && !vsyncArmed_) {
-            if (OH_NativeVSync_RequestFrame(vsync_, &HwcRenderer::OnVsyncFrame, this) == 0) {
+            if (OH_NativeVSync_RequestFrame(vsync_, &SurfaceBridge::OnVsyncFrame, this) == 0) {
                 vsyncArmed_ = true;
             }
         }
-    } else {
-        presentCv_.notify_one();
+        return;
     }
+#endif
+    presentCv_.notify_one();
 }
 
-void HwcRenderer::Start(const std::string& hwcSockPath, int32_t frameW, int32_t frameH) {
+void SurfaceBridge::StartCommon(int32_t frameW, int32_t frameH) {
     Stop();
     stop_.store(false);
     connected_.store(false);
@@ -153,18 +167,22 @@ void HwcRenderer::Start(const std::string& hwcSockPath, int32_t frameW, int32_t 
         hasPendingFrame_ = false;
     }
 
+#ifndef OHOS_BRIDGE_HEADLESS
     {
         std::lock_guard<std::mutex> lk(vsyncMu_);
-        const char* name = "svbox_hwc";
+        const char* name = "svbox_surface";
         vsync_ = OH_NativeVSync_Create(name, static_cast<unsigned int>(std::strlen(name)));
         vsyncArmed_ = false;
         usingVsync_.store(vsync_ != nullptr);
     }
-    OH_LOG_INFO(LOG_APP, "HwcRenderer started (OH_NativeVSync=%{public}d)", usingVsync_.load() ? 1 : 0);
+#else
+    usingVsync_.store(false);
+#endif
+    OB_LOG_INFO("SvboxSurface", "SurfaceBridge started (OH_NativeVSync=%d)", usingVsync_.load() ? 1 : 0);
 
     if (!usingVsync_.load()) {
         fallbackPresentThread_ = std::thread([this]() {
-            SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "hwc-present");
+            SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "surface-present");
             while (!stop_.load()) {
                 std::unique_lock<std::mutex> lk(vsyncMu_);
                 presentCv_.wait_for(lk, std::chrono::milliseconds(50), [this]() {
@@ -179,12 +197,26 @@ void HwcRenderer::Start(const std::string& hwcSockPath, int32_t frameW, int32_t 
             }
         });
     }
-
-    worker_ = std::thread(&HwcRenderer::RecvLoop, this, hwcSockPath, frameW, frameH);
 }
 
-void HwcRenderer::Stop() {
+void SurfaceBridge::Start(const std::string& hwcSockPath, int32_t frameW, int32_t frameH) {
+    StartCommon(frameW, frameH);
+    worker_ = std::thread(&SurfaceBridge::RecvLoop, this, hwcSockPath, frameW, frameH);
+}
+
+void SurfaceBridge::StartFramebufferServer(const std::string& fbSockPath, int32_t frameW, int32_t frameH) {
+    StartCommon(frameW, frameH);
+    fbSockPath_ = fbSockPath;
+    worker_ = std::thread(&SurfaceBridge::FbServerLoop, this, fbSockPath, frameW, frameH);
+}
+
+void SurfaceBridge::Stop() {
     stop_.store(true);
+    if (fbListenFd_ >= 0) {
+        shutdown(fbListenFd_, SHUT_RDWR);
+        close(fbListenFd_);
+        fbListenFd_ = -1;
+    }
     presentCv_.notify_all();
     if (worker_.joinable()) {
         worker_.join();
@@ -192,6 +224,7 @@ void HwcRenderer::Stop() {
     if (fallbackPresentThread_.joinable()) {
         fallbackPresentThread_.join();
     }
+#ifndef OHOS_BRIDGE_HEADLESS
     {
         std::lock_guard<std::mutex> lk(vsyncMu_);
         if (vsync_) {
@@ -200,12 +233,54 @@ void HwcRenderer::Stop() {
         }
         vsyncArmed_ = false;
     }
+#endif
+    if (!fbSockPath_.empty()) {
+        unlink(fbSockPath_.c_str());
+        fbSockPath_.clear();
+    }
     usingVsync_.store(false);
     connected_.store(false);
     fps_.store(0);
 }
 
-void HwcRenderer::PresentLatest() {
+void SurfaceBridge::SubmitRgbaFrame(const uint8_t* rgba, int32_t w, int32_t h) {
+    if (!rgba || w <= 0 || h <= 0) return;
+    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+    int backIdx = 0;
+    {
+        std::lock_guard<std::mutex> lk(bufMu_);
+        backIdx = 1 - frontIdx_;
+        if (staging_[backIdx].size() < bytes) {
+            staging_[backIdx].resize(bytes);
+        }
+    }
+    std::memcpy(staging_[backIdx].data(), rgba, bytes);
+    {
+        std::lock_guard<std::mutex> lk(bufMu_);
+        frontIdx_ = backIdx;
+        stagedW_ = w;
+        stagedH_ = h;
+        hasPendingFrame_ = true;
+    }
+    frameW_.store(w);
+    frameH_.store(h);
+    frames_.fetch_add(1);
+    RequestVsyncFrame();
+}
+
+bool SurfaceBridge::CopyLatestFrame(std::vector<uint8_t>& outRgba, int32_t& outW, int32_t& outH) {
+    std::lock_guard<std::mutex> lk(bufMu_);
+    const size_t bytes = (stagedW_ > 0 && stagedH_ > 0)
+        ? static_cast<size_t>(stagedW_) * static_cast<size_t>(stagedH_) * 4u
+        : 0u;
+    if (bytes == 0 || staging_[frontIdx_].size() < bytes) return false;
+    outW = stagedW_;
+    outH = stagedH_;
+    outRgba.assign(staging_[frontIdx_].begin(), staging_[frontIdx_].begin() + bytes);
+    return true;
+}
+
+void SurfaceBridge::PresentLatest() {
     int idx = 0;
     int32_t w = 0, h = 0;
     {
@@ -221,7 +296,11 @@ void HwcRenderer::PresentLatest() {
     }
 }
 
-bool HwcRenderer::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t srcH) {
+bool SurfaceBridge::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t srcH) {
+#ifdef OHOS_BRIDGE_HEADLESS
+    (void)srcRgba; (void)srcW; (void)srcH;
+    return true;
+#else
     std::lock_guard<std::mutex> lk(winMu_);
     if (!window_ || !srcRgba || srcW <= 0 || srcH <= 0) {
         return false;
@@ -287,11 +366,12 @@ bool HwcRenderer::PresentRgbaFrame(const uint8_t* srcRgba, int32_t srcW, int32_t
     Region region = { nullptr, 0 };
     OH_NativeWindow_NativeWindowFlushBuffer(window_, buffer, -1, region);
     return true;
+#endif
 }
 
-void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
-    SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "hwc-recv");
-    OH_LOG_INFO(LOG_APP, "HwcRenderer waiting for %{public}s (%{public}dx%{public}d)", sockPath.c_str(), w, h);
+void SurfaceBridge::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "surface-recv");
+    OB_LOG_INFO("SvboxSurface", "SurfaceBridge waiting for %s (%dx%d)", sockPath.c_str(), w, h);
 
     while (!stop_.load()) {
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -313,7 +393,7 @@ void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
             continue;
         }
 
-        OH_LOG_INFO(LOG_APP, "Connected to hwcomposer socket: %{public}s", sockPath.c_str());
+        OB_LOG_INFO("SvboxSurface", "Connected to prime-FD frame socket: %s", sockPath.c_str());
         connected_.store(true);
 
         auto fpsWindowStart = std::chrono::steady_clock::now();
@@ -344,7 +424,6 @@ void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
                             staging_[backIdx].resize(frameBytes);
                         }
                     }
-                    // Copy outside lock into back buffer, then flip frontIdx_
                     std::memcpy(staging_[backIdx].data(), mapped, frameBytes);
                     munmap(mapped, mapSize);
                     {
@@ -359,7 +438,6 @@ void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
             }
             close(primeFd);
 
-            // Immediate ACK decouples SurfaceFlinger from OHNativeWindow swap latency
             const char ack[2] = { 'o', 'k' };
             if (send(fd, ack, 2, MSG_NOSIGNAL) != 2) {
                 break;
@@ -382,5 +460,46 @@ void HwcRenderer::RecvLoop(std::string sockPath, int32_t w, int32_t h) {
         if (!stop_.load()) {
             usleep(100000);
         }
+    }
+}
+
+void SurfaceBridge::FbServerLoop(std::string sockPath, int32_t defaultW, int32_t defaultH) {
+    SchedQos::SetCurrentThreadQoS(SchedQos::Level::UserInteractive, "surface-fb");
+    unlink(sockPath.c_str());
+    int sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (sfd < 0) return;
+    struct sockaddr_un sa = {};
+    sa.sun_family = AF_UNIX;
+    std::strncpy(sa.sun_path, sockPath.c_str(), sizeof(sa.sun_path) - 1);
+    if (bind(sfd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0 || listen(sfd, 4) < 0) {
+        close(sfd);
+        return;
+    }
+    chmod(sockPath.c_str(), 0666);
+    fbListenFd_ = sfd;
+    OB_LOG_INFO("SvboxSurface", "Generic RGBA framebuffer listening on %s (%dx%d)",
+                sockPath.c_str(), defaultW, defaultH);
+
+    std::vector<uint8_t> rxBuf;
+    while (!stop_.load()) {
+        struct pollfd pfd = { sfd, POLLIN, 0 };
+        int r = poll(&pfd, 1, 150);
+        if (r <= 0 || !(pfd.revents & POLLIN)) continue;
+        int cfd = accept4(sfd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) continue;
+        connected_.store(true);
+        while (!stop_.load()) {
+            SvFbFrameHdr fhdr = {};
+            if (!RecvExact(cfd, &fhdr, sizeof(fhdr), stop_) || fhdr.magic != kFbMagic) break;
+            if (fhdr.width == 0 || fhdr.height == 0 || fhdr.width > 4096 || fhdr.height > 4096) break;
+            size_t nbytes = static_cast<size_t>(fhdr.width) * static_cast<size_t>(fhdr.height) * 4u;
+            rxBuf.resize(nbytes);
+            if (!RecvExact(cfd, rxBuf.data(), nbytes, stop_)) break;
+            SubmitRgbaFrame(rxBuf.data(), static_cast<int32_t>(fhdr.width), static_cast<int32_t>(fhdr.height));
+            const char ack[2] = { 'o', 'k' };
+            if (send(cfd, ack, 2, MSG_NOSIGNAL) != 2) break;
+        }
+        connected_.store(false);
+        close(cfd);
     }
 }

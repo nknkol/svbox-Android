@@ -1,11 +1,19 @@
 /* SPDX-License-Identifier: MIT */
+/* HarmonyOS GPU / gfxstream host bridge: dynamically loads libgfxstream_host.so
+ * and binds an OHNativeWindow for hardware-accelerated Vulkan/GLES presentation. */
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <mutex>
-#include <native_window/external_window.h>
 #include <string>
+
+#ifndef OHOS_BRIDGE_HEADLESS
+#include <native_window/external_window.h>
+#else
+struct NativeWindow;
+using OHNativeWindow = NativeWindow;
+#endif
 
 #include "svbox_gfxstream_capi.h"
 

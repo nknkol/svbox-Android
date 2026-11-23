@@ -1,26 +1,53 @@
 /* SPDX-License-Identifier: MIT */
-#include "audio_bridge.h"
-#include "sched_qos.h"
+#include "ohos_bridge/audio_bridge.h"
+#include "ohos_bridge/log.h"
+#include "ohos_bridge/sched_qos.h"
 
 #include <algorithm>
 #include <cstring>
+#include <dlfcn.h>
 #include <errno.h>
-#include <hilog/log.h>
-#include <ohaudio/native_audiorenderer.h>
-#include <ohaudio/native_audiostreambuilder.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#undef LOG_TAG
-#define LOG_TAG "SvboxAudio"
-
 namespace {
 
 constexpr uint32_t kAudioMagic = 0x55415653u; /* "SVAU" */
 constexpr size_t kRingCapacity = 262144u;     /* 256 KiB (~1.4s @ 44.1kHz stereo S16LE) */
+
+/* HarmonyOS OHAudio ABI constants (matching <ohaudio/native_audiostream_base.h>) */
+constexpr int32_t kAudioStreamSuccess = 0;
+constexpr int32_t kAudioStreamTypeRenderer = 1;
+constexpr int32_t kAudioSampleS16LE = 1;
+constexpr int32_t kAudioEncodingRaw = 0;
+constexpr int32_t kAudioUsageMusic = 1;
+constexpr int32_t kAudioLatencyNormal = 0;
+constexpr int32_t kAudioDataCallbackInvalid = -1;
+constexpr int32_t kAudioDataCallbackValid = 0;
+
+using WriteDataCb = int32_t (*)(void* renderer, void* userData, void* audioData, int32_t audioDataSize);
+
+struct OhAudioApi {
+    int32_t (*builderCreate)(void** builder, int32_t type) = nullptr;
+    int32_t (*builderDestroy)(void* builder) = nullptr;
+    int32_t (*setSamplingRate)(void* builder, int32_t rate) = nullptr;
+    int32_t (*setChannelCount)(void* builder, int32_t channels) = nullptr;
+    int32_t (*setSampleFormat)(void* builder, int32_t fmt) = nullptr;
+    int32_t (*setEncodingType)(void* builder, int32_t enc) = nullptr;
+    int32_t (*setRendererInfo)(void* builder, int32_t usage) = nullptr;
+    int32_t (*setLatencyMode)(void* builder, int32_t mode) = nullptr;
+    int32_t (*setWriteDataCb)(void* builder, WriteDataCb cb, void* userData) = nullptr;
+    int32_t (*generateRenderer)(void* builder, void** renderer) = nullptr;
+    int32_t (*rendererStart)(void* renderer) = nullptr;
+    int32_t (*rendererPause)(void* renderer) = nullptr;
+    int32_t (*rendererStop)(void* renderer) = nullptr;
+    int32_t (*rendererRelease)(void* renderer) = nullptr;
+};
+
+OhAudioApi g_ohAudio;
 
 struct AudioStreamHdr {
     uint32_t magic;
@@ -67,6 +94,47 @@ AudioBridge& AudioBridge::Instance() {
     return inst;
 }
 
+bool AudioBridge::EnsureOhAudioLoaded() {
+    if (ohLoadTried_) {
+        return backendAvailable_.load();
+    }
+    ohLoadTried_ = true;
+    ohLib_ = dlopen("libohaudio.so", RTLD_NOW | RTLD_LOCAL);
+    if (!ohLib_) {
+        OB_LOG_WARN("SvboxAudio", "dlopen(libohaudio.so) unavailable: running in sink-only mode");
+        backendAvailable_.store(false);
+        return false;
+    }
+    auto loadSym = [this](const char* name) { return dlsym(ohLib_, name); };
+    g_ohAudio.builderCreate = reinterpret_cast<decltype(g_ohAudio.builderCreate)>(loadSym("OH_AudioStreamBuilder_Create"));
+    g_ohAudio.builderDestroy = reinterpret_cast<decltype(g_ohAudio.builderDestroy)>(loadSym("OH_AudioStreamBuilder_Destroy"));
+    g_ohAudio.setSamplingRate = reinterpret_cast<decltype(g_ohAudio.setSamplingRate)>(loadSym("OH_AudioStreamBuilder_SetSamplingRate"));
+    g_ohAudio.setChannelCount = reinterpret_cast<decltype(g_ohAudio.setChannelCount)>(loadSym("OH_AudioStreamBuilder_SetChannelCount"));
+    g_ohAudio.setSampleFormat = reinterpret_cast<decltype(g_ohAudio.setSampleFormat)>(loadSym("OH_AudioStreamBuilder_SetSampleFormat"));
+    g_ohAudio.setEncodingType = reinterpret_cast<decltype(g_ohAudio.setEncodingType)>(loadSym("OH_AudioStreamBuilder_SetEncodingType"));
+    g_ohAudio.setRendererInfo = reinterpret_cast<decltype(g_ohAudio.setRendererInfo)>(loadSym("OH_AudioStreamBuilder_SetRendererInfo"));
+    g_ohAudio.setLatencyMode = reinterpret_cast<decltype(g_ohAudio.setLatencyMode)>(loadSym("OH_AudioStreamBuilder_SetLatencyMode"));
+    g_ohAudio.setWriteDataCb = reinterpret_cast<decltype(g_ohAudio.setWriteDataCb)>(loadSym("OH_AudioStreamBuilder_SetRendererWriteDataCallback"));
+    g_ohAudio.generateRenderer = reinterpret_cast<decltype(g_ohAudio.generateRenderer)>(loadSym("OH_AudioStreamBuilder_GenerateRenderer"));
+    g_ohAudio.rendererStart = reinterpret_cast<decltype(g_ohAudio.rendererStart)>(loadSym("OH_AudioRenderer_Start"));
+    g_ohAudio.rendererPause = reinterpret_cast<decltype(g_ohAudio.rendererPause)>(loadSym("OH_AudioRenderer_Pause"));
+    g_ohAudio.rendererStop = reinterpret_cast<decltype(g_ohAudio.rendererStop)>(loadSym("OH_AudioRenderer_Stop"));
+    g_ohAudio.rendererRelease = reinterpret_cast<decltype(g_ohAudio.rendererRelease)>(loadSym("OH_AudioRenderer_Release"));
+
+    bool ok = g_ohAudio.builderCreate && g_ohAudio.builderDestroy &&
+              g_ohAudio.setSamplingRate && g_ohAudio.setChannelCount &&
+              g_ohAudio.setSampleFormat && g_ohAudio.setEncodingType &&
+              g_ohAudio.setRendererInfo && g_ohAudio.setLatencyMode &&
+              g_ohAudio.setWriteDataCb && g_ohAudio.generateRenderer &&
+              g_ohAudio.rendererStart && g_ohAudio.rendererPause &&
+              g_ohAudio.rendererStop && g_ohAudio.rendererRelease;
+    backendAvailable_.store(ok);
+    if (!ok) {
+        OB_LOG_WARN("SvboxAudio", "libohaudio.so missing required symbols");
+    }
+    return ok;
+}
+
 void AudioBridge::Start(const std::string& sockPath) {
     Stop();
     sockPath_ = sockPath;
@@ -77,6 +145,7 @@ void AudioBridge::Start(const std::string& sockPath) {
         emptyCallbacks_ = 0;
     }
     bytesPlayed_.store(0);
+    bytesReceived_.store(0);
     active_.store(false);
     running_.store(true);
     serverThread_ = std::thread(&AudioBridge::ServerLoop, this);
@@ -142,11 +211,11 @@ size_t AudioBridge::PopPcm(uint8_t* dst, size_t len) {
     return take;
 }
 
-int32_t AudioBridge::OnWriteData(OH_AudioRendererStruct*, void* userData,
+int32_t AudioBridge::OnWriteData(void*, void* userData,
                                  void* audioData, int32_t audioDataSize) {
     auto* self = static_cast<AudioBridge*>(userData);
     if (!self || !audioData || audioDataSize <= 0) {
-        return AUDIO_DATA_CALLBACK_RESULT_INVALID;
+        return kAudioDataCallbackInvalid;
     }
     uint8_t* dst = static_cast<uint8_t*>(audioData);
     size_t need = static_cast<size_t>(audioDataSize);
@@ -159,14 +228,17 @@ int32_t AudioBridge::OnWriteData(OH_AudioRendererStruct*, void* userData,
     } else if (got > 0) {
         self->bytesPlayed_.fetch_add(got);
     }
-    return AUDIO_DATA_CALLBACK_RESULT_VALID;
+    return kAudioDataCallbackValid;
 }
 
 bool AudioBridge::EnsureRenderer(uint32_t sampleRate, uint32_t channels) {
     std::lock_guard<std::mutex> lk(ohMu_);
+    if (!EnsureOhAudioLoaded()) {
+        return false;
+    }
     if (renderer_ && curRate_ == sampleRate && curChannels_ == channels) {
         if (!rendererStarted_) {
-            if (OH_AudioRenderer_Start(renderer_) == AUDIOSTREAM_SUCCESS) {
+            if (g_ohAudio.rendererStart(renderer_) == kAudioStreamSuccess) {
                 rendererStarted_ = true;
                 active_.store(true);
             }
@@ -174,59 +246,55 @@ bool AudioBridge::EnsureRenderer(uint32_t sampleRate, uint32_t channels) {
         return true;
     }
     if (renderer_) {
-        OH_AudioRenderer_Stop(renderer_);
-        OH_AudioRenderer_Release(renderer_);
+        g_ohAudio.rendererStop(renderer_);
+        g_ohAudio.rendererRelease(renderer_);
         renderer_ = nullptr;
         rendererStarted_ = false;
     }
     if (builder_) {
-        OH_AudioStreamBuilder_Destroy(builder_);
+        g_ohAudio.builderDestroy(builder_);
         builder_ = nullptr;
     }
 
-    if (OH_AudioStreamBuilder_Create(&builder_, AUDIOSTREAM_TYPE_RENDERER) != AUDIOSTREAM_SUCCESS || !builder_) {
-        OH_LOG_WARN(LOG_APP, "OH_AudioStreamBuilder_Create failed");
+    if (g_ohAudio.builderCreate(&builder_, kAudioStreamTypeRenderer) != kAudioStreamSuccess || !builder_) {
+        OB_LOG_WARN("SvboxAudio", "OH_AudioStreamBuilder_Create failed");
         return false;
     }
-    OH_AudioStreamBuilder_SetSamplingRate(builder_, static_cast<int32_t>(sampleRate));
-    OH_AudioStreamBuilder_SetChannelCount(builder_, static_cast<int32_t>(channels));
-    OH_AudioStreamBuilder_SetSampleFormat(builder_, AUDIOSTREAM_SAMPLE_S16LE);
-    OH_AudioStreamBuilder_SetEncodingType(builder_, AUDIOSTREAM_ENCODING_TYPE_RAW);
-    OH_AudioStreamBuilder_SetRendererInfo(builder_, AUDIOSTREAM_USAGE_MUSIC);
-    OH_AudioStreamBuilder_SetLatencyMode(builder_, AUDIOSTREAM_LATENCY_MODE_NORMAL);
+    g_ohAudio.setSamplingRate(builder_, static_cast<int32_t>(sampleRate));
+    g_ohAudio.setChannelCount(builder_, static_cast<int32_t>(channels));
+    g_ohAudio.setSampleFormat(builder_, kAudioSampleS16LE);
+    g_ohAudio.setEncodingType(builder_, kAudioEncodingRaw);
+    g_ohAudio.setRendererInfo(builder_, kAudioUsageMusic);
+    g_ohAudio.setLatencyMode(builder_, kAudioLatencyNormal);
+    g_ohAudio.setWriteDataCb(builder_, &AudioBridge::OnWriteData, this);
 
-    OH_AudioStreamBuilder_SetRendererWriteDataCallback(
-        builder_,
-        reinterpret_cast<OH_AudioRenderer_OnWriteDataCallback>(&AudioBridge::OnWriteData),
-        this);
-
-    OH_AudioStream_Result rc = OH_AudioStreamBuilder_GenerateRenderer(builder_, &renderer_);
-    if (rc != AUDIOSTREAM_SUCCESS || !renderer_) {
-        OH_LOG_WARN(LOG_APP, "OH_AudioStreamBuilder_GenerateRenderer failed: %{public}d", rc);
-        OH_AudioStreamBuilder_Destroy(builder_);
+    int32_t rc = g_ohAudio.generateRenderer(builder_, &renderer_);
+    if (rc != kAudioStreamSuccess || !renderer_) {
+        OB_LOG_WARN("SvboxAudio", "OH_AudioStreamBuilder_GenerateRenderer failed: %d", rc);
+        g_ohAudio.builderDestroy(builder_);
         builder_ = nullptr;
         return false;
     }
 
     curRate_ = sampleRate;
     curChannels_ = channels;
-    if (OH_AudioRenderer_Start(renderer_) == AUDIOSTREAM_SUCCESS) {
+    if (g_ohAudio.rendererStart(renderer_) == kAudioStreamSuccess) {
         rendererStarted_ = true;
         active_.store(true);
-        OH_LOG_INFO(LOG_APP, "OHAudio renderer started: %{public}u Hz, %{public}u ch", sampleRate, channels);
+        OB_LOG_INFO("SvboxAudio", "OHAudio renderer started: %u Hz, %u ch", sampleRate, channels);
     }
     return true;
 }
 
 void AudioBridge::ReleaseRenderer() {
     std::lock_guard<std::mutex> lk(ohMu_);
-    if (renderer_) {
-        OH_AudioRenderer_Stop(renderer_);
-        OH_AudioRenderer_Release(renderer_);
+    if (renderer_ && g_ohAudio.rendererStop && g_ohAudio.rendererRelease) {
+        g_ohAudio.rendererStop(renderer_);
+        g_ohAudio.rendererRelease(renderer_);
         renderer_ = nullptr;
     }
-    if (builder_) {
-        OH_AudioStreamBuilder_Destroy(builder_);
+    if (builder_ && g_ohAudio.builderDestroy) {
+        g_ohAudio.builderDestroy(builder_);
         builder_ = nullptr;
     }
     rendererStarted_ = false;
@@ -251,13 +319,12 @@ void AudioBridge::ServerLoop() {
     }
     chmod(sockPath_.c_str(), 0666);
     listenFd_ = sfd;
-    OH_LOG_INFO(LOG_APP, "AudioBridge listening on %{public}s", sockPath_.c_str());
+    OB_LOG_INFO("SvboxAudio", "AudioBridge listening on %s", sockPath_.c_str());
 
     while (running_.load()) {
         struct pollfd pfd = { sfd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200);
         if (r <= 0) {
-            // Auto-pause renderer after prolonged silence (~600ms)
             uint32_t empties = 0;
             {
                 std::lock_guard<std::mutex> lk(ringMu_);
@@ -265,8 +332,8 @@ void AudioBridge::ServerLoop() {
             }
             if (empties >= 30) {
                 std::lock_guard<std::mutex> lk(ohMu_);
-                if (renderer_ && rendererStarted_) {
-                    OH_AudioRenderer_Pause(renderer_);
+                if (renderer_ && rendererStarted_ && g_ohAudio.rendererPause) {
+                    g_ohAudio.rendererPause(renderer_);
                     rendererStarted_ = false;
                     active_.store(false);
                 }
@@ -287,7 +354,7 @@ void AudioBridge::HandleClient(int fd) {
     }
     uint32_t rate = (hdr.sample_rate >= 8000 && hdr.sample_rate <= 96000) ? hdr.sample_rate : 44100u;
     uint32_t ch = (hdr.channels >= 1 && hdr.channels <= 2) ? hdr.channels : 2u;
-    OH_LOG_INFO(LOG_APP, "Audio stream connected: %{public}u Hz %{public}u ch", rate, ch);
+    OB_LOG_INFO("SvboxAudio", "Audio stream connected: %u Hz %u ch", rate, ch);
 
     uint8_t buf[8192];
     int silentChunks = 0;
@@ -298,8 +365,8 @@ void AudioBridge::HandleClient(int fd) {
             silentChunks++;
             if (silentChunks >= 3) {
                 std::lock_guard<std::mutex> lk(ohMu_);
-                if (renderer_ && rendererStarted_) {
-                    OH_AudioRenderer_Pause(renderer_);
+                if (renderer_ && rendererStarted_ && g_ohAudio.rendererPause) {
+                    g_ohAudio.rendererPause(renderer_);
                     rendererStarted_ = false;
                     active_.store(false);
                 }
@@ -312,6 +379,7 @@ void AudioBridge::HandleClient(int fd) {
         }
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
+        bytesReceived_.fetch_add(static_cast<uint64_t>(n));
 
         if (HasNonSilentSamples(buf, static_cast<size_t>(n))) {
             silentChunks = 0;
@@ -323,8 +391,8 @@ void AudioBridge::HandleClient(int fd) {
                 silentChunks++;
                 if (silentChunks > 30) {
                     std::lock_guard<std::mutex> lk(ohMu_);
-                    if (renderer_ && rendererStarted_) {
-                        OH_AudioRenderer_Pause(renderer_);
+                    if (renderer_ && rendererStarted_ && g_ohAudio.rendererPause) {
+                        g_ohAudio.rendererPause(renderer_);
                         rendererStarted_ = false;
                         active_.store(false);
                     }
