@@ -22,6 +22,7 @@
 #include <hilog/log.h>
 #include <netdb.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <sstream>
 #include <sys/mman.h>
@@ -266,29 +267,79 @@ void RemoveDirRecursive(const std::string& path) {
     rmdir(path.c_str());
 }
 
+struct OwnerHdr {
+    char magic[8];
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t lock;
+    uint32_t version;
+    uint32_t reserved[10];
+};
+struct OwnerRec {
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t mode;
+    uint32_t flags;
+};
+static_assert(sizeof(OwnerHdr) == 64 && sizeof(OwnerRec) == 32, "ELFOWN1 layout");
+constexpr uint32_t kOwnerDead = 8u;
+
+inline uint64_t OwnerHash(uint64_t dev, uint64_t ino) {
+    uint64_t h = ino * 0x9E3779B97F4A7C15ull ^ dev * 0xC2B2AE3D27D4EB4Full;
+    return h ^ (h >> 29);
+}
+
 void EnsureOwnerDb(const std::string& path) {
-    struct OwnerHdr {
-        char magic[8];
-        uint32_t capacity;
-        uint32_t count;
-        uint32_t lock;
-        uint32_t version;
-        uint8_t pad[40];
-    };
-    const off_t kExpectedSize = static_cast<off_t>(sizeof(OwnerHdr) + 65536u * 32u);
+    const off_t kExpectedSize = static_cast<off_t>(sizeof(OwnerHdr) + 65536u * sizeof(OwnerRec));
     int fd = open(path.c_str(), O_RDWR);
     if (fd >= 0) {
         struct stat st = {};
         OwnerHdr hdr = {};
         if (fstat(fd, &st) == 0 && st.st_size >= kExpectedSize &&
             pread(fd, &hdr, sizeof(hdr), 0) == static_cast<ssize_t>(sizeof(hdr)) &&
-            std::memcmp(hdr.magic, "ELFOWN1\0", 8) == 0 && hdr.capacity >= 65536u) {
+            std::memcmp(hdr.magic, "ELFOWN1\0", 8) == 0 && hdr.capacity >= 65536u &&
+            (hdr.capacity & (hdr.capacity - 1u)) == 0 &&
+            static_cast<uint64_t>(st.st_size) >= sizeof(OwnerHdr) + static_cast<uint64_t>(hdr.capacity) * sizeof(OwnerRec)) {
             // Preserve persistent fake UID/GID records across restarts, while clearing any
             // lock or odd seqlock version left behind if a previous container was SIGKILLed.
             if (hdr.lock != 0 || (hdr.version & 1u) != 0) {
                 hdr.lock = 0;
                 if (hdr.version & 1u) hdr.version += 1u;
                 (void)pwrite(fd, &hdr, sizeof(hdr), 0);
+            }
+            // Compact tombstones before container boot if table exceeds 50% load.
+            if (hdr.count > hdr.capacity / 2u) {
+                const size_t mapLen = sizeof(OwnerHdr) + static_cast<size_t>(hdr.capacity) * sizeof(OwnerRec);
+                void* mem = mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (mem != MAP_FAILED) {
+                    auto* h = static_cast<OwnerHdr*>(mem);
+                    auto* recs = reinterpret_cast<OwnerRec*>(h + 1);
+                    std::vector<OwnerRec> live;
+                    live.reserve(h->count);
+                    for (uint32_t i = 0; i < h->capacity; ++i) {
+                        if (recs[i].flags != 0 && !(recs[i].flags & kOwnerDead)) {
+                            live.push_back(recs[i]);
+                        }
+                    }
+                    std::memset(recs, 0, static_cast<size_t>(h->capacity) * sizeof(OwnerRec));
+                    const uint32_t mask = h->capacity - 1u;
+                    uint32_t newCount = 0;
+                    for (const auto& r : live) {
+                        uint32_t at = static_cast<uint32_t>(OwnerHash(r.dev, r.ino)) & mask;
+                        for (uint32_t n = 0; n <= mask; ++n, at = (at + 1u) & mask) {
+                            if (recs[at].flags == 0) {
+                                recs[at] = r;
+                                ++newCount;
+                                break;
+                            }
+                        }
+                    }
+                    h->count = newCount;
+                    h->version = (h->version & ~1u) + 2u;
+                    munmap(mem, mapLen);
+                }
             }
             close(fd);
             return;
@@ -304,6 +355,90 @@ void EnsureOwnerDb(const std::string& path) {
     (void)write(fd, &hdr, sizeof(hdr));
     (void)ftruncate(fd, kExpectedSize);
     close(fd);
+}
+
+// Clear stale (st_dev, st_ino) records in persistent owner.db for host-created
+// ephemeral/bind-mounted paths (e.g. /dev/__properties__/*, sockets, inject_layer,
+// linkerconfig). Because host temp/ and userdata14/ share the same filesystem st_dev,
+// the kernel may recycle an inode that previously belonged to a non-root guest file
+// (such as uid=1000 system:system), which causes Bionic libc to reject /dev/__properties__.
+int ForgetOwnerDbTree(const std::string& ownerDbPath, const std::vector<std::string>& roots) {
+    std::vector<std::pair<uint64_t, uint64_t>> devInos;
+    std::vector<std::string> stack;
+    for (const auto& r : roots) {
+        if (!r.empty()) stack.push_back(r);
+    }
+    while (!stack.empty()) {
+        std::string cur = std::move(stack.back());
+        stack.pop_back();
+        struct stat st = {};
+        if (lstat(cur.c_str(), &st) != 0) continue;
+        devInos.emplace_back(static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino));
+        if (S_ISDIR(st.st_mode)) {
+            DIR* d = opendir(cur.c_str());
+            if (!d) continue;
+            while (struct dirent* e = readdir(d)) {
+                if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+                stack.push_back(cur + "/" + e->d_name);
+            }
+            closedir(d);
+        }
+    }
+    if (devInos.empty()) return 0;
+
+    int fd = open(ownerDbPath.c_str(), O_RDWR);
+    if (fd < 0) return 0;
+    struct stat dbSt = {};
+    if (fstat(fd, &dbSt) != 0 || dbSt.st_size < static_cast<off_t>(sizeof(OwnerHdr))) {
+        close(fd);
+        return 0;
+    }
+    void* mem = mmap(nullptr, static_cast<size_t>(dbSt.st_size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mem == MAP_FAILED) return 0;
+
+    auto* h = static_cast<OwnerHdr*>(mem);
+    int cleared = 0;
+    if (std::memcmp(h->magic, "ELFOWN1\0", 8) == 0 && h->capacity > 0 &&
+        (h->capacity & (h->capacity - 1u)) == 0 &&
+        static_cast<uint64_t>(dbSt.st_size) >= sizeof(OwnerHdr) + static_cast<uint64_t>(h->capacity) * sizeof(OwnerRec)) {
+        // Acquire seqlock using the same protocol as svbox container_state.c
+        for (unsigned long spins = 0;; ++spins) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&h->lock, &expected, 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+                break;
+            if (spins > 200000) {
+                __atomic_store_n(&h->lock, 1u, __ATOMIC_SEQ_CST);
+                break;
+            }
+            sched_yield();
+        }
+        uint32_t curVer = __atomic_load_n(&h->version, __ATOMIC_RELAXED);
+        __atomic_store_n(&h->version, curVer | 1u, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+        auto* recs = reinterpret_cast<OwnerRec*>(h + 1);
+        const uint32_t mask = h->capacity - 1u;
+        for (const auto& di : devInos) {
+            uint32_t at = static_cast<uint32_t>(OwnerHash(di.first, di.second)) & mask;
+            for (uint32_t n = 0; n <= mask; ++n, at = (at + 1u) & mask) {
+                uint32_t fl = recs[at].flags;
+                if (fl == 0) break;
+                if (fl & kOwnerDead) continue;
+                if (recs[at].dev == di.first && recs[at].ino == di.second) {
+                    recs[at].flags = kOwnerDead;
+                    ++cleared;
+                    break;
+                }
+            }
+        }
+
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __atomic_store_n(&h->version, (curVer | 1u) + 1u, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->lock, 0u, __ATOMIC_RELEASE);
+    }
+    munmap(mem, static_cast<size_t>(dbSt.st_size));
+    return cleared;
 }
 
 int MakeListenUnix(const std::string& path, int sockType = SOCK_STREAM, mode_t mode = 0666) {
@@ -1956,6 +2091,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     // Rebuild ephemeral overlay upper + injection layer + linkerconfig cleanly on every boot
     // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
+    // Forget any owner.db entries for ephemeral trees before deleting them on the host.
+    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig" });
     RemoveDirRecursive(rootUpper_);
     MkdirP(rootUpper_);
     RemoveDirRecursive(injectLayer_);
@@ -2408,6 +2545,16 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
     }
 
+    // Sanitize persistent owner.db against host-recycled inodes in runBase_ (especially
+    // /dev/__properties__/*, /dev/socket/*, inject_layer/*, sys_fs_bpf/*) and linkerconfig cache.
+    {
+        int cleared = ForgetOwnerDbTree(dataBase_ + "/owner.db",
+                                        { runBase_, dataBase_ + "/cache/linkerconfig_a14" });
+        if (cleared > 0) {
+            logLine("OwnerDb sanitized: cleared " + std::to_string(cleared) + " stale ephemeral inode records");
+        }
+    }
+
     // 2.5 Generate Android 14 /linkerconfig/* directly into persistent cache dir (all files + apex.libraries.config.txt)
     {
         const std::string lcDir = dataBase_ + "/cache/linkerconfig_a14";
@@ -2561,6 +2708,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 std::lock_guard<std::mutex> lk(procMu_);
                 ownedFds_.push_back(adbdFd);
             }
+            ForgetOwnerDbTree(dataBase_ + "/owner.db", { sockDir });
             std::vector<std::string> adbdCmd;
             if (adbdFd >= 0) {
                 adbdCmd.push_back("-e");
@@ -2617,6 +2765,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             if (zfd >= 0) ownedFds_.push_back(zfd);
             if (ufd >= 0) ownedFds_.push_back(ufd);
         }
+        ForgetOwnerDbTree(dataBase_ + "/owner.db", { sockDir, propDir });
 
         std::vector<std::string> zygCmd = {
             "-e", "ANDROID_SOCKET_zygote=" + std::to_string(zfd),
@@ -2645,6 +2794,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 CopyRegularFile(wmJniSrc, wmGuestHostDir + "/libsvbox_wm_jni.so")) {
                 chmod((wmGuestHostDir + "/svbox-wm-agent.jar").c_str(), 0644);
                 chmod((wmGuestHostDir + "/libsvbox_wm_jni.so").c_str(), 0755);
+                ForgetOwnerDbTree(dataBase_ + "/owner.db", { wmGuestHostDir });
                 hasWmAgent = true;
             }
         }

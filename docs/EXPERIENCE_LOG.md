@@ -792,6 +792,23 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **`bt_stack_manage` `SIGABRT` 次数** | `5` 次（含 `real time scheduling` 崩溃循环） | `2` 次（`real time scheduling` 与 `snoop_logger` 目录报错均清零） | **-60%** |
 | **存储与多窗验收** | `emulated;0` `MOUNTED` | `emulated;0` 3 轮快速冷启均 `MOUNTED`、`System unlocked [0]`、`MediaProvider` 14 目录、`Files` + `Gallery` + `Clock` 三屏并行零崩溃 | **全部 PASS** |
 
+---
+
+### 18. `owner.db` 宿主临时文件 Inode 复用碰撞导致 `/dev/__properties__` 全员拒载 & CPU 93% 死循环（已根治）
+
+* **现象**：应用在多轮启停或关闭重开后，启动卡死在 `Booting Full Android 14 ... Zygote...`，传统模拟器黑屏 `0/120Hz`，整机 CPU 飙至 `93%`（仅占 `416MB` 内存）。
+* **根因链条**：
+  1. `userdata14/owner.db` 持久化按 `(st_dev, st_ino)` 存储虚拟 `uid/gid/mode`，而宿主 `temp/svbox-android14-hap/` 与 `files/userdata14/` 位于**同一 `el2` 文件系统（同一 `st_dev`）**。
+  2. 此前容器运行中 `system_server` 等非 root 进程创建并删除过 `/data` 文件，或宿主 `RemoveDirRecursive` 在容器外直接删除临时文件时未触发 `owners_forget()`，导致 `owner.db` 中残留 `uid=1000 (system:system)` 等旧 `(st_dev, st_ino)` 记录。
+  3. 后续启动时，`svbox-propd` 在宿主创建 `property_info` 和 `u:object_r:default_prop:s0` 恰好复用了被内核回收的旧 inode，导致容器内 `ls -la /dev/__properties__` 显示两者归属 `system:system` 而非 `root:root`。
+  4. Bionic `libc` 严格校验 `st.st_uid == 0 && st.st_gid == 0`，直接拒载整个属性区 → `ro.property_service.version` / `ro.product.cpu.abilist64` / `ro.hardware.hwcomposer` / `ro.debuggable` 全空 → `zygote64`、`adbd`、`hwcomposer` 崩溃退出，`surfaceflinger` / `audioserver` / `artd` 等 12+ Binder 客户端在 `WaitForProperty("servicemanager.ready")` 中因 `__system_property_area__ == nullptr` 立即返回 `false` 形成 100% CPU 紧循环。
+* **根治修复**：
+  1. **Layer 3 (`android_runtime.cpp`)**：新增 `ForgetOwnerDbTree()`（按 `ELFOWN1` 协议加 seqlock 原子标记过期 `(st_dev, st_ino)` 为 `OWNER_DEAD`）并在 `EnsureOwnerDb()` 中加入 >50% 负载自动 tombstone 压缩；在 `RemoveDirRecursive` 前、启动 `linkerconfig`/`servicemanager` 前（全量清理 `runBase_` 与 `linkerconfig_a14`）、以及 `adbd`/`zygote64`/`wm_agent` 启动前清理宿主新建文件/Socket 的碰撞记录。
+  2. **Layer 3 (`EntryAbility.ets`)**：补充 `onDestroy()` 主动调用 `native.stopContainer()`，避免关闭主窗时子进程被 `ClearSession` 强杀。
+  3. **Layer 1 (`svbox/src/payload/logic/container_state.c`)**：为 `read_begin()` 补齐与 `spin_lock()` 对称的死写者 seqlock 恢复（>200,000 次 yield 后推进奇数 `version` 并释放 `lock`），杜绝运行期进程被 `SIGKILL` 留下奇数 `version` 导致其他读者永久死循环。
+* **真机实测验证**：不清空已有被污染的 `owner.db`，直接启动 `Vulkan · 120Hz · 720×1280 · 传统模拟器`，首启即自动清理 **44 条**残留 inode 记录，`/dev/__properties__/*` 全部恢复 `root:root`，`sys.boot_completed=1`、`modeId 3 @ 120Hz`、`emulated;0 mounted`、`Launcher3` 正常出画；连续 Stop → Start 重启（自动清理 **41 条**）同样 2/2 稳定通过。
+
+
 
 
 

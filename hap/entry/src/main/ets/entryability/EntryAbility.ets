@@ -138,6 +138,14 @@ export default class EntryAbility extends UIAbility {
   onBackground(): void {
   }
 
+  onDestroy(): void {
+    hilog.info(0x0000, TAG, 'EntryAbility onDestroy -> stopping container cleanly');
+    try {
+      native.stopContainer();
+    } catch (_e) {
+    }
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
     try {
       this.mainWindow = windowStage.getMainWindowSync();
