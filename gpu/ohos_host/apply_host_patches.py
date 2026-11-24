@@ -533,6 +533,45 @@ def main() -> None:
         "    if (m_lastPostedColorBuffer && sInitialized.load(std::memory_order_relaxed)) {",
         "FrameBuffer::repost present last posted cb in Vulkan mode too",
     )
+    patch_file(
+        fb_cpp,
+        "bool FrameBuffer::removeSubWindow() {\n"
+        "    if (!m_useSubWindow) {\n"
+        "        ERR(\"Cannot remove native sub-window in this configuration\");\n"
+        "        return false;\n"
+        "    }\n"
+        "    AutoLock lock(sGlobals()->lock);\n"
+        "    sInitialized.store(false, std::memory_order_relaxed);\n"
+        "    sGlobals()->condVar.broadcastAndUnlock(&lock);",
+        "bool FrameBuffer::removeSubWindow() {\n"
+        "    if (!m_useSubWindow) {\n"
+        "        ERR(\"Cannot remove native sub-window in this configuration\");\n"
+        "        return false;\n"
+        "    }\n"
+        "    // Keep sInitialized=true when detaching slot-0 subwindow so multi-window\n"
+        "    // secondary displays and shutdown RenderThread teardown never deadlock in\n"
+        "    // FrameBuffer::waitUntilInitialized().",
+        "FrameBuffer::removeSubWindow keep sInitialized=true to avoid Stop/multi-window deadlock",
+    )
+    fb_h = os.path.join(gfx, "host/FrameBuffer.h")
+    patch_file(
+        fb_h,
+        "    void setShuttingDown() { m_shuttingDown = true; }",
+        "    void setShuttingDown();",
+        "FrameBuffer::setShuttingDown declare out-of-line",
+    )
+    patch_file(
+        fb_cpp,
+        "void FrameBuffer::waitUntilInitialized() {",
+        "void FrameBuffer::setShuttingDown() {\n"
+        "    m_shuttingDown = true;\n"
+        "    AutoLock lock(sGlobals()->lock);\n"
+        "    sInitialized.store(true, std::memory_order_release);\n"
+        "    sGlobals()->condVar.broadcastAndUnlock(&lock);\n"
+        "}\n\n"
+        "void FrameBuffer::waitUntilInitialized() {",
+        "FrameBuffer::setShuttingDown wake waitUntilInitialized waiters",
+    )
 
     # 7. VkDecoderGlobalState.cpp: fallback for vkGetPhysicalDeviceImageFormatProperties2 when
     #    host GPU (Maleoon 916) does not support OPAQUE_FD external image queries, so Android

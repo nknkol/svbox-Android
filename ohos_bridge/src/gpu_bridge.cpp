@@ -98,7 +98,9 @@ void GfxstreamBridge::Stop() {
     if (!active_.exchange(false)) {
         return;
     }
-    if (fnClearWindow_) fnClearWindow_();
+    pendingWindow_ = nullptr;
+    pendingW_ = 0;
+    pendingH_ = 0;
     if (fnStop_) fnStop_();
     OB_LOG_INFO("SvboxGfxBridge", "gfxstream stopped");
 }

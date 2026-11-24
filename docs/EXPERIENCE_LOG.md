@@ -808,6 +808,36 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   3. **Layer 1 (`svbox/src/payload/logic/container_state.c`)**：为 `read_begin()` 补齐与 `spin_lock()` 对称的死写者 seqlock 恢复（>200,000 次 yield 后推进奇数 `version` 并释放 `lock`），杜绝运行期进程被 `SIGKILL` 留下奇数 `version` 导致其他读者永久死循环。
 * **真机实测验证**：不清空已有被污染的 `owner.db`，直接启动 `Vulkan · 120Hz · 720×1280 · 传统模拟器`，首启即自动清理 **44 条**残留 inode 记录，`/dev/__properties__/*` 全部恢复 `root:root`，`sys.boot_completed=1`、`modeId 3 @ 120Hz`、`emulated;0 mounted`、`Launcher3` 正常出画；连续 Stop → Start 重启（自动清理 **41 条**）同样 2/2 稳定通过。
 
+---
+
+### 19. Layer 1 `/proc/{maps,smaps,status,cmdline}` 虚拟化（防劫持暴露）与酷安 16.7.3 真机跑通
+
+* **背景**：此前安装酷安 `CoolApk-16.7.3`（109 MB，内置 `libNetHTProtect.so` / `libverbanr.so` / `libsecsdk.so` / `libpanglearmor.so` 等壳与反篡改 SDK）冷启触发 `SIGABRT`（`SI_QUEUE`），且 `F/DEBUG` 回溯落入 `<anonymous:3f80015000>`。根因在于容器内进程可直接通过 `/proc/self/maps`（匿名可执行拷贝段、payload `0x3f80000000`、stub island、`owner.db`、`.svbox_svc_cache`）、`/proc/self/status`（`Seccomp: 2`）以及 `/proc/<pid>/cmdline`（`svbox --root ...` 参数）识别出用户态 syscall 劫持实现。
+* **Layer 1 通用修复（`svbox`，`feat/vdev-binder`，零 Android/OHOS 耦合）**：
+  1. **初始与运行期可执行 VMA 追踪**（[`config.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/config.h)、[`loader/elf_load.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/elf_load.c)、[`loader/main.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/main.c)、[`hook_runtime.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/hook_runtime.c)、[`dispatch.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c)）：记录 loader 阶段拷贝的 `prog`/`interp` `PT_LOAD` 与运行期 `map_exec_copy()` 映射的原文件 `(dev, ino, file_off, host_path)`，并在 `munmap` / 非执行 `MAP_FIXED` `mmap` 时同步剔除或拆分。
+  2. **流式 `/proc/<pid>/{maps,smaps}` 虚拟化**（[`vfs_procfs.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_procfs.c)、[`vfs_ops.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_ops.c)）：隐藏全部 `hook_protected_overlap`（payload、stub islands、`owner.db`、`.svbox_svc_cache`、`mount_table`）与内部路径，恢复匿名拷贝执行段的真实容器内路径/偏移/`dev:ino`，并将剩余宿主路径翻译为容器路径。
+  3. **`/proc/<pid>/status` & `/proc/<pid>/cmdline` 净化**：当启用 `seccomp_backstop || trap_sigsys` 时将 `Seccomp:` 与 `Seccomp_filters:` 改写为 `0`；将 `Bridge.proc_data` 从 `8192` 扩至 `65536` 以完整解析超过 20 KB 的容器命令行，同时在 Layer 3 [`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp) 的 `runSvbox()` 与 `wm_agent` 启动参数中统一插入 `"--"` 分隔符。
+  4. **伴生坑修复（`mounts_unshare()` 过期保护区导致 `Zygote` `munmap` `-EPERM`）**：首次真机验证发现 `Zygote` 调用 `unshare(CLONE_NEWNS)` 触发 `mounts_unshare()` 释放旧 `mount_table` 后，其 VA 仍残留在 `protected_lo/hi` 中，随后内核将该地址复用于 `ZygoteCommandBuffer` 导致 `freeNativeBuffer` 报 `JNI FatalError: Failed to unmap argument buffer`。新增 `hook_unnote_internal()` 在 `mounts_unshare()` `munmap(prev)` 前原子注销旧映射并注册 `new_t`，彻底根治。
+* **真机实测结果**：
+  * `/proc/self/status` 输出 `Seccomp: 0`；`/proc/self/maps` 零泄露且全部 `r-xp` 恢复真实 `/system/...` 与 `.so` 路径；`ps -A` 全系统进程恢复原生名称（`surfaceflinger` / `zygote64` / `system_server` / `com.android.launcher3`）。
+  * **酷安 16.7.3（`com.coolapk.market`）无需 Step 2 即直接跑通**：冷启 `2,631 ms` 正常进入隐私条款页，点击“同意协议并继续”后完整加载首页头条、图片与底部导航栏，常驻 `660 MB RSS` 零崩溃。证明酷安此前 `SIGABRT` 的直接根因就是 `/proc/self/maps`（匿名 `r-xp` 与 `svbox` 痕迹）/ `status` (`Seccomp`) / `cmdline` 检测。
+
+---
+
+### 20. 停止模拟器主线程卡死（`THREAD_BLOCK_6S` AppFreeze）根因定位与修复
+
+* **现象**：在传统模拟器或关闭模拟器窗口后点击停止实例，应用卡死触发鸿蒙 `AppFreeze`（`THREAD_BLOCK_6S`）。
+* **FaultLog 根因铁证**（`/data/log/faultlog/faultlogger/appfreeze-org.svbox.android-20020420-20261125011443053.log`）：
+  * 主线程（ArkUI）：`StopContainerNapi -> AndroidRuntime::Stop -> GfxstreamBridge::Stop -> svbox_gfx_stop -> RendererImpl::stop(true) -> RenderThread::waitForFinished()`。
+  * 子线程（`RenderThread`）：永久阻塞在 `FrameBuffer::waitUntilInitialized()`。
+  * **触发链**：关闭 `EmulatorWindowAbility` 或 `GfxstreamBridge::Stop()` 提前调 `fnClearWindow_()` 会触发 `FrameBuffer::removeSubWindow()`，而原版 `gfxstream` 在 `removeSubWindow()` 中执行了 `sInitialized.store(false)`；随后任何新进或竞态的 `RenderThread` 均在 `waitUntilInitialized()` 上永久等待，且 `FrameBuffer::setShuttingDown()` 未将 `sInitialized` 置 `true` 也未广播 `sGlobals()->condVar`，形成永久死锁。此外 `AndroidRuntime::Stop()` 此前先 join 各桥接线程后才杀容器子进程，导致桥接线程在等待活着的 Guest Socket 时产生数秒额外卡顿。
+* **根治修复**：
+  1. **Layer 2 (`apply_host_patches.py`)**：`FrameBuffer::removeSubWindow()` 不再清除 `sInitialized`；将 `FrameBuffer::setShuttingDown()` 移至 `FrameBuffer.cpp` 实现，关停时置 `m_shuttingDown = true`、`sInitialized.store(true, release)` 并调用 `sGlobals()->condVar.broadcast()` 唤醒所有等待者。
+  2. **Layer 2 (`ohos_bridge/src/gpu_bridge.cpp`)**：`GfxstreamBridge::Stop()` 移除 `fnStop_()` 之前冗余的 `fnClearWindow_()`。
+  3. **Layer 3 (`android_runtime.cpp`)**：`AndroidRuntime::Stop()` 改为**优先向全部容器进程组发送 `SIGCONT -> SIGTERM -> 60ms -> SIGKILL`** 让全部宿主机桥接 Socket 瞬间收到 EOF 退出，随后再 join 线程并关闭 `GfxstreamBridge`（并在 `bootThread_.join()` 后再补收一次竞态残留 PID）。
+* **真机实测验证**：执行 `autoStart restart`（完整 `Stop -> Start` 闭环），`hilog` 在 `< 1s` 内干净输出 `SvboxGfxBridge: gfxstream stopped`，全流程 **0 次 `THREAD_BLOCK` / `AppFreeze`**，且 `8s` 即完成二次重启进入 `sys.boot_completed=1`。
+
+
 
 
 

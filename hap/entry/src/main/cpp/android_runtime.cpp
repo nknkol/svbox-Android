@@ -2529,7 +2529,27 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                         bool nullStdio = false,
                         const std::vector<int>& keepFds = {}) {
         auto args = BaseSvboxArgs();
-        args.insert(args.end(), guestCmd.begin(), guestCmd.end());
+        // Separate leading svbox flags (e.g. "-e", "K=V") from guest binary with "--"
+        // so svbox's /proc/<pid>/cmdline virtualizer strips loader flags cleanly.
+        size_t i = 0;
+        bool hasSep = false;
+        while (i < guestCmd.size()) {
+            if (guestCmd[i] == "--") {
+                hasSep = true;
+                break;
+            }
+            if (guestCmd[i] == "-e" && i + 1 < guestCmd.size()) {
+                args.push_back(guestCmd[i]);
+                args.push_back(guestCmd[i + 1]);
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        if (!hasSep && i < guestCmd.size()) {
+            args.push_back("--");
+        }
+        args.insert(args.end(), guestCmd.begin() + static_cast<std::ptrdiff_t>(i), guestCmd.end());
         return Spawn(args, nullStdio, nullStdio ? "" : (logDir + "/" + tag + ".log"), keepFds);
     };
 
@@ -2810,6 +2830,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 std::vector<std::string> wmArgv = BaseSvboxArgs();
                 wmArgv.push_back("-e");
                 wmArgv.push_back("CLASSPATH=/data/local/tmp/svbox_wm/svbox-wm-agent.jar");
+                wmArgv.push_back("--");
                 wmArgv.push_back("system/bin/app_process64");
                 wmArgv.push_back("-Xusejit:false");
                 wmArgv.push_back("-Dsvbox.jni.dir=/data/local/tmp/svbox_wm");
@@ -2855,6 +2876,44 @@ std::string AndroidRuntime::Stop() {
     running_.store(false);
     paused_.store(false);
     wmAgentReady_.store(false);
+
+    auto killAndReapPids = [&]() {
+        std::vector<pid_t> pidsCopy;
+        std::vector<int> fdsCopy;
+        {
+            std::lock_guard<std::mutex> lk(procMu_);
+            pidsCopy.swap(pids_);
+            fdsCopy.swap(ownedFds_);
+        }
+        // Wake any SIGSTOP-paused process groups first, then SIGTERM -> SIGKILL the entire tree
+        for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
+            if (*it > 0) {
+                kill(-(*it), SIGCONT);
+                kill(*it, SIGCONT);
+                kill(-(*it), SIGTERM);
+                kill(*it, SIGTERM);
+            }
+        }
+        if (!pidsCopy.empty()) {
+            usleep(60000);
+        }
+        for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
+            if (*it > 0) {
+                kill(-(*it), SIGKILL);
+                kill(*it, SIGKILL);
+                int st = 0;
+                waitpid(*it, &st, WNOHANG);
+            }
+        }
+        for (int fd : fdsCopy) {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    // Terminate guest processes FIRST so all IPC / bridge sockets receive immediate EOF
+    // and host bridge / RenderThread workers exit without waiting on live guests.
+    killAndReapPids();
+
     HwcRenderer::Instance().Stop();
     InputBridge::Instance().Stop();
     AudioBridge::Instance().Stop();
@@ -2866,6 +2925,9 @@ std::string AndroidRuntime::Stop() {
     if (bootThread_.joinable()) {
         bootThread_.join();
     }
+    // Reap any straggler spawned by bootThread_ right as Stop() raced with startup.
+    killAndReapPids();
+
     if (wmEventThread_.joinable()) {
         wmEventThread_.join();
     }
@@ -2887,37 +2949,6 @@ std::string AndroidRuntime::Stop() {
         dnsThread_.join();
     }
 
-    std::vector<pid_t> pidsCopy;
-    std::vector<int> fdsCopy;
-    {
-        std::lock_guard<std::mutex> lk(procMu_);
-        pidsCopy.swap(pids_);
-        fdsCopy.swap(ownedFds_);
-    }
-
-    // Wake any SIGSTOP-paused process groups first, then SIGTERM -> SIGKILL the entire tree
-    for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
-        if (*it > 0) {
-            kill(-(*it), SIGCONT);
-            kill(*it, SIGCONT);
-            kill(-(*it), SIGTERM);
-            kill(*it, SIGTERM);
-        }
-    }
-    if (!pidsCopy.empty()) {
-        usleep(120000);
-    }
-    for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
-        if (*it > 0) {
-            kill(-(*it), SIGKILL);
-            kill(*it, SIGKILL);
-            int st = 0;
-            waitpid(*it, &st, WNOHANG);
-        }
-    }
-    for (int fd : fdsCopy) {
-        if (fd >= 0) close(fd);
-    }
     GfxstreamBridge::Instance().Stop();
     SetStatus("Stopped");
     return "Stopped";
