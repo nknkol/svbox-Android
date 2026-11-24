@@ -486,6 +486,53 @@ def main() -> None:
         "#endif",
         "FrameBuffer::postWithCallback flushColorBufferFromGl for Vulkan composition",
     )
+    patch_file(
+        fb_cpp,
+        "                if (m_lastPostedColorBuffer) {\n"
+        "                    GL_LOG(\"setupSubwindow: draw last posted cb\");\n"
+        "                    postImpl(m_lastPostedColorBuffer,\n"
+        "                        [](std::shared_future<void> waitForGpu) {}, false);\n"
+        "                } else {\n"
+        "                    Post clearCmd;\n"
+        "                    clearCmd.cmd = PostCmd::Clear;\n"
+        "                    sendPostWorkerCmd(std::move(clearCmd));\n"
+        "                }\n"
+        "            }\n"
+        "            m_windowContentFullWidth = fbw;",
+        "                if (m_lastPostedColorBuffer) {\n"
+        "                    GL_LOG(\"setupSubwindow: draw last posted cb\");\n"
+        "                    postImpl(m_lastPostedColorBuffer,\n"
+        "                        [](std::shared_future<void> waitForGpu) {}, false);\n"
+        "                } else {\n"
+        "                    Post clearCmd;\n"
+        "                    clearCmd.cmd = PostCmd::Clear;\n"
+        "                    sendPostWorkerCmd(std::move(clearCmd));\n"
+        "                }\n"
+        "            } else if (m_lastPostedColorBuffer) {\n"
+        "                // Redraw the last committed frame immediately when re-attaching a\n"
+        "                // Vulkan swapchain (e.g. reopening the Classic Emulator window while\n"
+        "                // Android is idle) so the window does not stay black until next input.\n"
+        "                GL_LOG(\"setupSubwindow: draw last posted cb (vk)\");\n"
+        "                postImpl(m_lastPostedColorBuffer,\n"
+        "                    [](std::shared_future<void> waitForGpu) {}, false);\n"
+        "            }\n"
+        "            m_windowContentFullWidth = fbw;",
+        "FrameBuffer::setupSubWindow redraw last posted cb on Vulkan swapchain attach",
+    )
+    patch_file(
+        fb_cpp,
+        "bool FrameBuffer::repost(bool needLockAndBind) {\n"
+        "    GL_LOG(\"Reposting framebuffer.\");\n"
+        "    if (m_displayVk) {\n"
+        "        setGuestPostedAFrame();\n"
+        "        return true;\n"
+        "    }\n"
+        "    if (m_lastPostedColorBuffer && sInitialized.load(std::memory_order_relaxed)) {",
+        "bool FrameBuffer::repost(bool needLockAndBind) {\n"
+        "    GL_LOG(\"Reposting framebuffer.\");\n"
+        "    if (m_lastPostedColorBuffer && sInitialized.load(std::memory_order_relaxed)) {",
+        "FrameBuffer::repost present last posted cb in Vulkan mode too",
+    )
 
     # 7. VkDecoderGlobalState.cpp: fallback for vkGetPhysicalDeviceImageFormatProperties2 when
     #    host GPU (Maleoon 916) does not support OPAQUE_FD external image queries, so Android
