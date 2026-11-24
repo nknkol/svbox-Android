@@ -6,7 +6,6 @@ import {
   findPresetByKey,
   InstanceConfig,
   instanceConfigStore,
-  REFRESH_RATES,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
 
@@ -26,7 +25,7 @@ interface PopOutReply {
 struct EmulatorWindowPage {
   @LocalStorageProp('sandboxTempDir') sandboxTempDir: string = '';
   @LocalStorageProp('sandboxFilesDir') sandboxFilesDir: string = '';
-  @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 136;
+  @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 152;
 
   @State private running: boolean = false;
   @State private wmAgentReady: boolean = false;
@@ -129,19 +128,6 @@ struct EmulatorWindowPage {
     }
   }
 
-  private cycleRefreshRate(): void {
-    const idx: number = REFRESH_RATES.indexOf(this.refreshRate);
-    const nextHz: number = REFRESH_RATES[(idx + 1) % REFRESH_RATES.length];
-    this.refreshRate = nextHz;
-    AppStorage.setOrCreate<number>('refreshRate', nextHz);
-    native.setRefreshRate(nextHz);
-    const filesDir: string = this.sandboxFilesDir.length > 0
-      ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
-    const cfg: InstanceConfig = instanceConfigStore.get(filesDir);
-    cfg.refreshRate = nextHz;
-    instanceConfigStore.save(filesDir, cfg);
-  }
-
   private async handlePopOutCurrentApp(): Promise<void> {
     if (!this.wmAgentReady) {
       this.showToast('等待 Android 14 窗口服务就绪');
@@ -204,43 +190,31 @@ struct EmulatorWindowPage {
 
   build() {
     Column() {
-      // Single Immersive Dark Title Bar (38vp)
-      Row({ space: 8 }) {
-        SymbolGlyph($r('sys.symbol.phone_fill'))
-          .fontSize(15)
-          .fontColor(['#38BDF8'])
+      // Single Immersive Dark Title Bar (38vp, strictly avoiding native 3-button area)
+      Row({ space: 6 }) {
+        Row({ space: 6 }) {
+          SymbolGlyph($r('sys.symbol.display'))
+            .fontSize(15)
+            .fontColor(['#38BDF8'])
 
-        Text('Android 14 · 传统模拟器')
-          .fontSize(13)
-          .fontWeight(FontWeight.Medium)
-          .fontColor('#F3F4F6')
-          .maxLines(1)
+          Text('传统模拟器')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#F3F4F6')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
 
-        Text(`${this.dispW}×${this.dispH} · ${this.fps}/${this.refreshRate}Hz`)
-          .fontSize(10)
-          .fontColor('#9CA3AF')
-          .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-          .backgroundColor('#1E2430')
-          .borderRadius(5)
-          .maxLines(1)
-
-        Blank()
-
-        Button({ type: ButtonType.Normal }) {
-          Row({ space: 3 }) {
-            SymbolGlyph($r('sys.symbol.bolt_fill'))
-              .fontSize(11)
-              .fontColor([this.refreshRate === 120 ? '#34D399' : '#93C5FD'])
-            Text(`${this.refreshRate}Hz`)
-              .fontSize(11)
-              .fontColor('#E5E7EB')
-          }
+          Text(`${this.fps}/${this.refreshRate}Hz`)
+            .fontSize(10)
+            .fontColor('#9CA3AF')
+            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+            .backgroundColor('#1E2430')
+            .borderRadius(5)
+            .maxLines(1)
         }
-        .height(26)
-        .padding({ left: 8, right: 8 })
-        .borderRadius(6)
-        .backgroundColor('#1E2430')
-        .onClick(() => { this.cycleRefreshRate(); })
+        .layoutWeight(1)
+        .alignItems(VerticalAlign.Center)
 
         Button({ type: ButtonType.Normal }) {
           Row({ space: 4 }) {
@@ -261,7 +235,7 @@ struct EmulatorWindowPage {
       }
       .width('100%')
       .height(38)
-      .padding({ left: 10, right: this.decorRightAvoidVp })
+      .padding({ left: 10, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor('#13161D')
       .border({ width: { bottom: 1 }, color: '#222733' })
       .alignItems(VerticalAlign.Center)

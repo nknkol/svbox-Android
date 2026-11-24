@@ -37,7 +37,7 @@ export function argbToHex(argb: number): string {
 }
 
 export function applyImmersiveDecor(win: window.Window, heightVp: number, darkBg: boolean): number {
-  let rightAvoidVp: number = 136;
+  let rightAvoidVp: number = 152;
   try {
     win.setWindowDecorVisible(false);
   } catch (err) {
@@ -63,7 +63,7 @@ export function applyImmersiveDecor(win: window.Window, heightVp: number, darkBg
   try {
     const rect: window.TitleButtonRect = win.getTitleButtonRect();
     if (rect && rect.width > 0) {
-      rightAvoidVp = Math.max(116, Math.ceil(rect.width + rect.right + 10));
+      rightAvoidVp = Math.max(152, Math.ceil(rect.width + rect.right + 14));
     }
   } catch (_e) {
   }

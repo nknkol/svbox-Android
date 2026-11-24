@@ -277,7 +277,7 @@ struct AppsPage {
       }
       .width('100%')
       .height(44)
-      .padding({ left: 14, right: this.decorRightAvoidVp })
+      .padding({ left: 14, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor('#13161D')
       .border({ width: { bottom: 1 }, color: '#222733' })
       .alignItems(VerticalAlign.Center)

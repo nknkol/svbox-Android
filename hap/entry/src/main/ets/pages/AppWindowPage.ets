@@ -424,9 +424,7 @@ struct AppWindowPage {
           .fontColor(this.titleInkColor())
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 220 })
-
-        Blank()
+          .layoutWeight(1)
 
         // Single Portrait/Landscape toggle button placed directly left of system 3-button area
         Button({ type: ButtonType.Normal }) {
@@ -447,7 +445,7 @@ struct AppWindowPage {
       }
       .width('100%')
       .height(38)
-      .padding({ left: 8, right: this.decorRightAvoidVp })
+      .padding({ left: 8, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor(this.topBarHex)
       .animation({ duration: 220, curve: Curve.EaseOut })
       .alignItems(VerticalAlign.Center)

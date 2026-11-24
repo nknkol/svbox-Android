@@ -327,6 +327,7 @@ struct Index {
   }
 
   private selectRefreshRate(hz: number): void {
+    if (this.running) return;
     this.refreshRate = hz;
     AppStorage.setOrCreate<number>('refreshRate', hz);
     native.setRefreshRate(hz);
@@ -414,7 +415,7 @@ struct Index {
       }
       .width('100%')
       .height(44)
-      .padding({ left: 14, right: this.decorRightAvoidVp })
+      .padding({ left: 14, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor('#13161D')
       .border({ width: { bottom: 1 }, color: '#222733' })
       .alignItems(VerticalAlign.Center)
@@ -471,7 +472,7 @@ struct Index {
 
           Button({ type: ButtonType.Normal }) {
             Row({ space: 10 }) {
-              SymbolGlyph($r('sys.symbol.phone'))
+              SymbolGlyph($r('sys.symbol.pad'))
                 .fontSize(16)
                 .fontColor(['#9CA3AF'])
               Text('传统模拟器')
@@ -539,23 +540,6 @@ struct Index {
             .alignItems(HorizontalAlign.Start)
 
             Blank()
-
-            Row({ space: 3 }) {
-              ForEach(REFRESH_RATES, (hz: number) => {
-                Button(`${hz}Hz`)
-                  .height(26)
-                  .fontSize(11)
-                  .fontColor(this.refreshRate === hz ? '#FFFFFF' : '#9CA3AF')
-                  .backgroundColor(this.refreshRate === hz ? '#0284C7' : Color.Transparent)
-                  .borderRadius(6)
-                  .padding({ left: 10, right: 10 })
-                  .onClick(() => { this.selectRefreshRate(hz); })
-              })
-            }
-            .padding(3)
-            .backgroundColor('#161B24')
-            .borderRadius(8)
-            .border({ width: 1, color: '#242B38' })
           }
           .width('100%')
           .alignItems(VerticalAlign.Center)
@@ -569,7 +553,7 @@ struct Index {
                   .height(44)
                   .borderRadius(11)
                   .backgroundColor(this.running ? '#172554' : '#1E232E')
-                SymbolGlyph(this.runMode === 'emulator' ? $r('sys.symbol.phone_fill') : $r('sys.symbol.pad_fill'))
+                SymbolGlyph(this.runMode === 'emulator' ? $r('sys.symbol.display') : $r('sys.symbol.pad_fill'))
                   .fontSize(22)
                   .fontColor([this.running ? '#38BDF8' : '#6B7280'])
               }
@@ -645,7 +629,7 @@ struct Index {
                   if (this.runMode === 'emulator') {
                     Button({ type: ButtonType.Normal }) {
                       Row({ space: 6 }) {
-                        SymbolGlyph($r('sys.symbol.phone'))
+                        SymbolGlyph($r('sys.symbol.pad'))
                           .fontSize(14)
                           .fontColor(['#FFFFFF'])
                         Text('打开模拟器')
@@ -701,7 +685,7 @@ struct Index {
 
                     Button({ type: ButtonType.Normal }) {
                       Row({ space: 5 }) {
-                        SymbolGlyph($r('sys.symbol.phone'))
+                        SymbolGlyph($r('sys.symbol.pad'))
                           .fontSize(14)
                           .fontColor(['#E5E7EB'])
                         Text('模拟器窗')
@@ -796,7 +780,7 @@ struct Index {
 
                     Button({ type: ButtonType.Normal }) {
                       Row({ space: 5 }) {
-                        SymbolGlyph($r('sys.symbol.phone'))
+                        SymbolGlyph($r('sys.symbol.pad'))
                           .fontSize(12)
                           .fontColor([this.runMode === 'emulator' ? '#FFFFFF' : '#9CA3AF'])
                         Text('传统模拟器')
@@ -809,6 +793,29 @@ struct Index {
                     .borderRadius(6)
                     .backgroundColor(this.runMode === 'emulator' ? '#059669' : '#1E2430')
                     .onClick(() => { this.selectRunMode('emulator'); })
+                  }
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Center)
+
+                // Refresh Rate (only editable when instance is stopped)
+                Row({ space: 10 }) {
+                  Text('刷新率')
+                    .fontSize(12)
+                    .fontColor('#9CA3AF')
+                    .width(84)
+                  Row({ space: 6 }) {
+                    ForEach(REFRESH_RATES, (hz: number) => {
+                      Button(`${hz}Hz`)
+                        .height(26)
+                        .fontSize(11)
+                        .fontColor(this.refreshRate === hz ? '#FFFFFF' : '#9CA3AF')
+                        .backgroundColor(this.refreshRate === hz ? '#0284C7' : '#1E2430')
+                        .borderRadius(6)
+                        .padding({ left: 10, right: 10 })
+                        .enabled(!this.running)
+                        .onClick(() => { this.selectRefreshRate(hz); })
+                    })
                   }
                 }
                 .width('100%')
@@ -882,7 +889,7 @@ struct Index {
                 .alignItems(VerticalAlign.Center)
 
                 if (this.running) {
-                  Text('提示：运行模式与刷新率可随时热切换；分辨率、图形引擎与性能模式需在停止实例后修改。')
+                  Text('提示：运行模式可随时切换；刷新率、分辨率、图形引擎与性能模式需在停止实例后修改。')
                     .fontSize(11)
                     .fontColor('#6B7280')
                 }
