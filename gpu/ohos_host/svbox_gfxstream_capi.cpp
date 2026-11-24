@@ -912,12 +912,18 @@ int svbox_gfx_set_display_window(int32_t displaySlot, void* ohNativeWindow,
             sec.surfaceH = surfaceH;
             return 0;
         }
+        const bool alreadyAttached = (sec.window == static_cast<OHNativeWindow*>(ohNativeWindow) &&
+                                      sec.displayVk != nullptr && sec.displaySurface != nullptr);
+        const int32_t prevBufW = sec.bufW;
+        const int32_t prevBufH = sec.bufH;
         bool ok = AttachSecondarySlotLocked(
             sec, displaySlot, static_cast<OHNativeWindow*>(ohNativeWindow), surfaceW, surfaceH);
         if (!ok) return -1;
-        repaintCb = sec.lastCb;
-        repaintW = sec.fbW;
-        repaintH = sec.fbH;
+        if (!alreadyAttached || sec.bufW != prevBufW || sec.bufH != prevBufH) {
+            repaintCb = sec.lastCb;
+            repaintW = sec.fbW;
+            repaintH = sec.fbH;
+        }
     }
     if (repaintCb != 0) {
         svbox_gfx_present_cb(displaySlot, repaintCb, repaintW, repaintH);

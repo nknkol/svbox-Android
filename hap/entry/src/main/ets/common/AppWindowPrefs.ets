@@ -92,12 +92,12 @@ export function defaultPrefForApp(app: AndroidAppItem | undefined, globalHz: num
   const mode: string = app ? app.defaultMode : 'adaptive';
   const hz: number = (globalHz === 60 || globalHz === 90 || globalHz === 120) ? globalHz : 60;
   if (mode === 'fixed_landscape') {
-    return { mode: 'fixed_landscape', presetKey: '1280x720', refreshRate: hz, winW: 1280, winH: 760 };
+    return { mode: 'fixed_landscape', presetKey: '1280x720', refreshRate: hz, winW: 1600, winH: 980 };
   }
   if (mode === 'fixed_portrait') {
-    return { mode: 'fixed_portrait', presetKey: '720x1280', refreshRate: hz, winW: 540, winH: 960 };
+    return { mode: 'fixed_portrait', presetKey: '720x1280', refreshRate: hz, winW: 900, winH: 1520 };
   }
-  return { mode: 'adaptive', presetKey: '720x1280', refreshRate: hz, winW: 640, winH: 920 };
+  return { mode: 'adaptive', presetKey: '720x1280', refreshRate: hz, winW: 960, winH: 1440 };
 }
 
 interface PrefRecordEntry {

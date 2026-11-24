@@ -38,10 +38,11 @@ struct AppWindowPage {
   @State private winMode: string = 'adaptive';
   @State private presetKey: string = '720x1280';
   @State private curHz: number = 60;
-  @State private dispW: number = 640;
-  @State private dispH: number = 880;
-  @State private stageVpW: number = 640;
-  @State private stageVpH: number = 880;
+  @State private dispW: number = 720;
+  @State private dispH: number = 1080;
+  @State private stageVpW: number = 0;
+  @State private stageVpH: number = 0;
+  @State private stageReady: boolean = false;
   @State private ready: boolean = false;
   @State private fps: number = 0;
   @State private frames: number = 0;
@@ -74,6 +75,33 @@ struct AppWindowPage {
     return undefined;
   }
 
+  private computeAdaptiveTargetSize(): number[] {
+    let physW: number = 720;
+    let physH: number = 1080;
+    if (this.stageVpW > 100 && this.stageVpH > 100) {
+      try {
+        const uiCtx = this.getUIContext();
+        physW = Math.round(uiCtx.vp2px(this.stageVpW));
+        physH = Math.round(uiCtx.vp2px(this.stageVpH));
+      } catch (_e) {
+        physW = Math.round(this.stageVpW * 2);
+        physH = Math.round(this.stageVpH * 2);
+      }
+    } else if (this.winPxW > 200 && this.winPxH > 260) {
+      physW = this.winPxW;
+      physH = Math.max(320, this.winPxH - 160);
+    }
+
+    // Uniform scale down only if longer side exceeds 1600px, preserving exact 1:1 aspect ratio
+    const maxSide: number = Math.max(physW, physH);
+    const scale: number = maxSide > 1600 ? (1600 / maxSide) : 1.0;
+    let targetW: number = Math.max(320, Math.round(physW * scale));
+    let targetH: number = Math.max(320, Math.round(physH * scale));
+    targetW = targetW - (targetW % 2);
+    targetH = targetH - (targetH % 2);
+    return [targetW, targetH];
+  }
+
   private loadPrefs(): void {
     this.curAppMeta = this.lookupAppMeta();
     const globalHz: number = AppStorage.get<number>('refreshRate') ?? 60;
@@ -84,8 +112,9 @@ struct AppWindowPage {
     this.presetKey = pref.presetKey;
     this.curHz = pref.refreshRate;
     if (this.winMode === 'adaptive') {
-      this.dispW = Math.max(360, Math.min(2560, this.winPxW > 100 ? this.winPxW : pref.winW));
-      this.dispH = Math.max(360, Math.min(1600, (this.winPxH > 140 ? this.winPxH - 44 : pref.winH - 44)));
+      const sz: number[] = this.computeAdaptiveTargetSize();
+      this.dispW = sz[0];
+      this.dispH = sz[1];
     } else {
       const p: ResolutionPresetItem = findPresetByKey(this.presetKey);
       this.dispW = p.w;
@@ -154,7 +183,12 @@ struct AppWindowPage {
   private tickStatus(): void {
     try {
       if (!this.displayCreated) {
-        if (native.isWmAgentReady()) {
+        if (native.isWmAgentReady() && (this.stageReady || this.winMode !== 'adaptive')) {
+          if (this.winMode === 'adaptive') {
+            const sz: number[] = this.computeAdaptiveTargetSize();
+            this.dispW = sz[0];
+            this.dispH = sz[1];
+          }
           this.refreshIconUri();
           this.createAndLaunchDisplay();
         } else {
@@ -220,24 +254,26 @@ struct AppWindowPage {
 
   private onWindowSizeChanged(): void {
     this.persistPref();
-    if (!this.ready || this.winMode !== 'adaptive') return;
+    this.scheduleAdaptiveResize();
+  }
+
+  private scheduleAdaptiveResize(): void {
+    if (!this.ready || this.winMode !== 'adaptive' || !this.stageReady) return;
     if (this.resizeDebounceTimer !== -1) {
       clearTimeout(this.resizeDebounceTimer);
     }
     this.resizeDebounceTimer = setTimeout(() => {
       this.resizeDebounceTimer = -1;
       this.applyAdaptiveResize();
-    }, 250);
+    }, 180);
   }
 
   private async applyAdaptiveResize(): Promise<void> {
-    if (!this.ready || this.winMode !== 'adaptive' || this.displaySlot < 1) return;
-    // Align to even pixel counts for GPU/HWC cleanliness
-    let targetW: number = Math.max(360, Math.min(2560, this.winPxW));
-    let targetH: number = Math.max(360, Math.min(1600, this.winPxH - 44));
-    targetW = targetW - (targetW % 2);
-    targetH = targetH - (targetH % 2);
-    if (Math.abs(targetW - this.dispW) < 8 && Math.abs(targetH - this.dispH) < 8) return;
+    if (!this.ready || this.winMode !== 'adaptive' || this.displaySlot < 1 || !this.stageReady) return;
+    const sz: number[] = this.computeAdaptiveTargetSize();
+    const targetW: number = sz[0];
+    const targetH: number = sz[1];
+    if (Math.abs(targetW - this.dispW) < 4 && Math.abs(targetH - this.dispH) < 4) return;
     const dpi: number = computeDpiForSize(targetW, targetH);
     this.dispW = targetW;
     this.dispH = targetH;
@@ -351,29 +387,31 @@ struct AppWindowPage {
   }
 
   private computeFitWidth(): number {
-    if (this.winMode === 'adaptive') {
-      return Math.max(120, Math.floor(this.stageVpW));
+    if (!this.stageReady || this.stageVpW <= 0 || this.stageVpH <= 0) {
+      return 120;
     }
-    const padW: number = Math.max(120, this.stageVpW * 0.98);
-    const padH: number = Math.max(120, this.stageVpH * 0.98);
+    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.98;
+    const padW: number = Math.max(120, this.stageVpW * scaleFactor);
+    const padH: number = Math.max(120, this.stageVpH * scaleFactor);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
     if (padW / padH > aspect) {
-      return Math.floor(padH * aspect);
+      return Math.max(120, Math.round(padH * aspect));
     }
-    return Math.floor(padW);
+    return Math.max(120, Math.round(padW));
   }
 
   private computeFitHeight(): number {
-    if (this.winMode === 'adaptive') {
-      return Math.max(120, Math.floor(this.stageVpH));
+    if (!this.stageReady || this.stageVpW <= 0 || this.stageVpH <= 0) {
+      return 120;
     }
-    const padW: number = Math.max(120, this.stageVpW * 0.98);
-    const padH: number = Math.max(120, this.stageVpH * 0.98);
+    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.98;
+    const padW: number = Math.max(120, this.stageVpW * scaleFactor);
+    const padH: number = Math.max(120, this.stageVpH * scaleFactor);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
     if (padW / padH > aspect) {
-      return Math.floor(padH);
+      return Math.max(120, Math.round(padH));
     }
-    return Math.floor(padW / aspect);
+    return Math.max(120, Math.round(padW / aspect));
   }
 
   build() {
@@ -499,8 +537,20 @@ struct AppWindowPage {
         const w: number = Number(newVal.width);
         const h: number = Number(newVal.height);
         if (w > 100 && h > 100) {
+          const changed: boolean = Math.abs(w - this.stageVpW) >= 1 || Math.abs(h - this.stageVpH) >= 1;
           this.stageVpW = w;
           this.stageVpH = h;
+          if (!this.stageReady) {
+            this.stageReady = true;
+            if (this.winMode === 'adaptive') {
+              const sz: number[] = this.computeAdaptiveTargetSize();
+              this.dispW = sz[0];
+              this.dispH = sz[1];
+            }
+            this.tickStatus();
+          } else if (changed) {
+            this.scheduleAdaptiveResize();
+          }
         }
       })
     }
