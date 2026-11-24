@@ -43,6 +43,54 @@
 #define NODE_WAKELOCK           0x1008ull
 #define NODE_SUSPEND_CTRL       0x1009ull
 #define NODE_SUSPEND_CTRL_INT   0x100aull
+#define NODE_VOLD               0x100bull
+
+/* Android 14 IVold transaction codes (verified from framework.jar classes3.dex) */
+#define VOLD_TX_SET_LISTENER               1u
+#define VOLD_TX_ABORT_FUSE                 2u
+#define VOLD_TX_MONITOR                    3u
+#define VOLD_TX_RESET                      4u
+#define VOLD_TX_SHUTDOWN                   5u
+#define VOLD_TX_ON_USER_ADDED              6u
+#define VOLD_TX_ON_USER_REMOVED            7u
+#define VOLD_TX_ON_USER_STARTED            8u
+#define VOLD_TX_ON_USER_STOPPED            9u
+#define VOLD_TX_MOUNT                      15u
+#define VOLD_TX_UNMOUNT                    16u
+#define VOLD_TX_SETUP_APP_DIR              23u
+#define VOLD_TX_FIXUP_APP_DIR              24u
+#define VOLD_TX_ENSURE_APP_DIRS_CREATED    25u
+#define VOLD_TX_CREATE_OBB                 26u
+#define VOLD_TX_GET_STORAGE_LIFETIME       31u
+#define VOLD_TX_GET_WRITE_AMOUNT           34u
+#define VOLD_TX_INIT_USER0                 38u
+#define VOLD_TX_GET_UNLOCKED_USERS         45u
+#define VOLD_TX_UNLOCK_USER_KEY            46u
+#define VOLD_TX_LOCK_USER_KEY              47u
+#define VOLD_TX_PREPARE_USER_STORAGE       48u
+#define VOLD_TX_NEEDS_CHECKPOINT           53u
+#define VOLD_TX_NEEDS_ROLLBACK             54u
+#define VOLD_TX_IS_CHECKPOINTING           55u
+#define VOLD_TX_SUPPORTS_CHECKPOINT        62u
+#define VOLD_TX_SUPPORTS_BLOCK_CHECKPOINT  63u
+#define VOLD_TX_SUPPORTS_FILE_CHECKPOINT   64u
+#define VOLD_TX_EARLY_BOOT_ENDED           66u
+#define VOLD_TX_CREATE_STUB_VOLUME         67u
+#define VOLD_TX_INCFS_ENABLED              70u
+#define VOLD_TX_BIND_MOUNT                 74u
+#define VOLD_TX_GET_STORAGE_SIZE           76u
+
+/* Android 14 IVoldListener transaction codes (oneway, verified from framework.jar) */
+#define VOLD_CB_ON_VOLUME_CREATED          5u
+#define VOLD_CB_ON_VOLUME_STATE_CHANGED    6u
+#define VOLD_CB_ON_VOLUME_PATH_CHANGED     8u
+#define VOLD_CB_ON_VOLUME_INTERNAL_PATH    9u
+#define VOLD_CB_ON_VOLUME_DESTROYED        10u
+
+#define VOLD_VOL_TYPE_EMULATED             2
+#define VOLD_VOL_STATE_UNMOUNTED           0
+#define VOLD_VOL_STATE_CHECKING            1
+#define VOLD_VOL_STATE_MOUNTED             2
 
 /* Android 11 INetd transaction codes (verified from services.jar) */
 #define TX_IS_ALIVE                       1u
@@ -114,7 +162,14 @@ static size_t g_mmap_len = 0;
 
 static char g_net_sock_path[256] = {0};
 static char g_fwmark_sock_path[256] = {0};
+static char g_data_dir[512] = {0};
 static const struct sv_net_state *g_net_state = NULL;
+
+/* FUSE-less IVold state (backed by svbox bind-mounted /storage/emulated/0 -> /data/media/0) */
+static uint32_t g_vold_listener = 0;
+static int      g_vold_has_listener = 0;
+static uint32_t g_vold_created_users_mask = 0;
+static uint32_t g_vold_unlocked_users_mask = 1u; /* User 0 unlocked */
 
 static int32_t g_default_netid = 100;
 static int32_t g_phys_netid = 100;
@@ -555,6 +610,13 @@ static void p_u32(struct parcel *p, uint32_t v)
     p->len += 4;
 }
 
+static void p_i64(struct parcel *p, int64_t v)
+{
+    if (p->len + 8 > sizeof(p->buf)) return;
+    memcpy(p->buf + p->len, &v, 8);
+    p->len += 8;
+}
+
 static void p_str16(struct parcel *p, const char *s)
 {
     if (!s) { p_i32(p, -1); return; }
@@ -684,6 +746,136 @@ static void notify_unsol_link_state(const char *ifname, int up)
     p_i32(&p, up ? 1 : 0);
     for (int i = 0; i < g_unsol_count; i++)
         send_oneway_txn(g_unsol_handles[i], UNSOL_ON_IFACE_LINK_STATE, &p);
+}
+
+/* ---- FUSE-less IVold helpers & IVoldListener callbacks ---- */
+
+static void vold_mkdir_p(const char *path, mode_t mode)
+{
+    if (!path || !path[0]) return;
+    char tmp[1024];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp)) return;
+    memcpy(tmp, path, len + 1);
+    while (len > 1 && tmp[len - 1] == '/') tmp[--len] = '\0';
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            (void)mkdir(tmp, mode);
+            *p = '/';
+        }
+    }
+    (void)mkdir(tmp, mode);
+}
+
+static void vold_ensure_host_dir(const char *guest_path)
+{
+    if (!g_data_dir[0] || !guest_path || !guest_path[0]) return;
+    if (strstr(guest_path, "..") != NULL) return;
+    char host[1024];
+    if (strncmp(guest_path, "/storage/emulated/", 18) == 0) {
+        snprintf(host, sizeof(host), "%s/data/media/%s", g_data_dir, guest_path + 18);
+    } else if (strncmp(guest_path, "/sdcard/", 8) == 0) {
+        snprintf(host, sizeof(host), "%s/data/media/0/%s", g_data_dir, guest_path + 8);
+    } else if (strncmp(guest_path, "/data/media/", 12) == 0) {
+        snprintf(host, sizeof(host), "%s/data/media/%s", g_data_dir, guest_path + 12);
+    } else if (strncmp(guest_path, "/data/user/", 11) == 0 ||
+               strncmp(guest_path, "/data/user_de/", 14) == 0) {
+        snprintf(host, sizeof(host), "%s%s", g_data_dir, guest_path);
+    } else {
+        return;
+    }
+    vold_mkdir_p(host, 0775);
+}
+
+static void vold_prepare_user_dirs(int32_t user_id)
+{
+    if (!g_data_dir[0] || user_id < 0 || user_id > 999) return;
+    const char *sub[] = {
+        "data/media/%d",
+        "data/media/%d/Android/data",
+        "data/media/%d/Android/obb",
+        "data/media/%d/Download",
+        "data/media/%d/Pictures",
+        "data/media/%d/DCIM",
+        "data/media/%d/Documents",
+        "data/system_ce/%d",
+        "data/system_de/%d",
+        "data/misc_ce/%d",
+        "data/misc_de/%d",
+        "data/vendor_ce/%d",
+        "data/vendor_de/%d",
+        "data/user/%d",
+        "data/user_de/%d",
+    };
+    char path[1024];
+    for (size_t i = 0; i < sizeof(sub) / sizeof(sub[0]); i++) {
+        char rel[128];
+        snprintf(rel, sizeof(rel), sub[i], user_id);
+        snprintf(path, sizeof(path), "%s/%s", g_data_dir, rel);
+        vold_mkdir_p(path, 0775);
+    }
+}
+
+static void vold_notify_volume_created(int32_t user_id)
+{
+    if (!g_vold_has_listener) return;
+    char vol_id[32];
+    snprintf(vol_id, sizeof(vol_id), "emulated;%d", user_id);
+    struct parcel p;
+    memset(&p, 0, sizeof(p));
+    p_iface_token(&p, "android.os.IVoldListener");
+    p_str16(&p, vol_id);
+    p_i32(&p, VOLD_VOL_TYPE_EMULATED);
+    p_str16(&p, NULL); /* diskId = null (matches stock AOSP EmulatedVolume) */
+    p_str16(&p, "");   /* partGuid */
+    p_i32(&p, user_id);
+    send_oneway_txn(g_vold_listener, VOLD_CB_ON_VOLUME_CREATED, &p);
+    fprintf(stderr, "[svbox-netd] vold -> onVolumeCreated(%s, EMULATED, user=%d)\n", vol_id, user_id);
+    fflush(stderr);
+}
+
+static void vold_notify_state(const char *vol_id, int32_t state)
+{
+    if (!g_vold_has_listener || !vol_id || !vol_id[0]) return;
+    struct parcel p;
+    memset(&p, 0, sizeof(p));
+    p_iface_token(&p, "android.os.IVoldListener");
+    p_str16(&p, vol_id);
+    p_i32(&p, state);
+    send_oneway_txn(g_vold_listener, VOLD_CB_ON_VOLUME_STATE_CHANGED, &p);
+}
+
+static void vold_notify_path(const char *vol_id, const char *path)
+{
+    if (!g_vold_has_listener || !vol_id || !vol_id[0]) return;
+    struct parcel p;
+    memset(&p, 0, sizeof(p));
+    p_iface_token(&p, "android.os.IVoldListener");
+    p_str16(&p, vol_id);
+    p_str16(&p, path);
+    send_oneway_txn(g_vold_listener, VOLD_CB_ON_VOLUME_PATH_CHANGED, &p);
+}
+
+static void vold_notify_internal_path(const char *vol_id, const char *path)
+{
+    if (!g_vold_has_listener || !vol_id || !vol_id[0]) return;
+    struct parcel p;
+    memset(&p, 0, sizeof(p));
+    p_iface_token(&p, "android.os.IVoldListener");
+    p_str16(&p, vol_id);
+    p_str16(&p, path);
+    send_oneway_txn(g_vold_listener, VOLD_CB_ON_VOLUME_INTERNAL_PATH, &p);
+}
+
+static void vold_notify_destroyed(const char *vol_id)
+{
+    if (!g_vold_has_listener || !vol_id || !vol_id[0]) return;
+    struct parcel p;
+    memset(&p, 0, sizeof(p));
+    p_iface_token(&p, "android.os.IVoldListener");
+    p_str16(&p, vol_id);
+    send_oneway_txn(g_vold_listener, VOLD_CB_ON_VOLUME_DESTROYED, &p);
 }
 
 static int parse_cidr(const char *cidr, int *is_v6, uint32_t *v4_out, uint8_t v6_out[16], uint32_t *pfx_out)
@@ -863,6 +1055,10 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
     char post_ifname[32] = {0};
     char post_addr_cidr[64] = {0};
     int post_link_event = 0; /* 1=up, -1=down */
+    int post_vold_create_uid = -1;
+    int post_vold_destroy_uid = -1;
+    int post_vold_mount = 0; /* 1=mount, -1=unmount */
+    char post_vold_id[64] = {0};
 
     if (code == PING_TRANSACTION) {
         /* empty */
@@ -876,12 +1072,13 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         else if (node == NODE_WAKELOCK) p_str16(&reply, "android.system.suspend.IWakeLock");
         else if (node == NODE_SUSPEND_CTRL) p_str16(&reply, "android.system.suspend.ISuspendControlService");
         else if (node == NODE_SUSPEND_CTRL_INT) p_str16(&reply, "android.system.suspend.internal.ISuspendControlServiceInternal");
+        else if (node == NODE_VOLD) p_str16(&reply, "android.os.IVold");
         else p_str16(&reply, "android.net.INetd");
     } else if (code == GET_INTERFACE_VERSION) {
         p_i32(&reply, 0);
         p_i32(&reply, node == NODE_DNSRESOLVER ? 9 :
                       ((node == NODE_OEMNETD || node == NODE_SYSTEM_SUSPEND || node == NODE_WAKELOCK ||
-                        node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT) ? 1 : 12));
+                        node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT || node == NODE_VOLD) ? 1 : 12));
     } else if (code == GET_INTERFACE_HASH) {
         p_i32(&reply, 0);
         if (node == NODE_DNSRESOLVER)
@@ -1316,6 +1513,152 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         } else {
             p_i32(&reply, 0); p_i32(&reply, 0); p_i32(&reply, 0); p_i32(&reply, 0);
         }
+    } else if (node == NODE_VOLD) {
+        if (code == VOLD_TX_SET_LISTENER) {
+            if (tr->offsets_size >= sizeof(uint64_t) && tr->data.ptr.offsets && pr.buf) {
+                uint64_t obj_off = 0;
+                memcpy(&obj_off, (const void *)(uintptr_t)tr->data.ptr.offsets, sizeof(uint64_t));
+                if (obj_off + sizeof(struct sv_flat_binder_object) <= tr->data_size) {
+                    struct sv_flat_binder_object fbo;
+                    memcpy(&fbo, pr.buf + obj_off, sizeof(fbo));
+                    if (fbo.type == SV_BINDER_TYPE_HANDLE) {
+                        acquire_handle(fbo.handle);
+                        g_vold_listener = fbo.handle;
+                        g_vold_has_listener = 1;
+                        fprintf(stderr, "[svbox-netd] vold: setListener(handle=%u)\n", fbo.handle);
+                        fflush(stderr);
+                    }
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_RESET) {
+            g_vold_created_users_mask = 0;
+            fprintf(stderr, "[svbox-netd] vold: reset()\n");
+            fflush(stderr);
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_ON_USER_ADDED) {
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                fprintf(stderr, "[svbox-netd] vold: onUserAdded(userId=%d)\n", uid);
+                fflush(stderr);
+                if (uid >= 0 && uid < 32 && !(g_vold_created_users_mask & (1u << uid))) {
+                    g_vold_created_users_mask |= (1u << uid);
+                    post_vold_create_uid = uid;
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_ON_USER_STARTED) {
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                fprintf(stderr, "[svbox-netd] vold: onUserStarted(userId=%d)\n", uid);
+                fflush(stderr);
+                if (uid >= 0 && uid < 32 && !(g_vold_created_users_mask & (1u << uid))) {
+                    g_vold_created_users_mask |= (1u << uid);
+                    post_vold_create_uid = uid;
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_ON_USER_REMOVED) {
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                if (uid >= 0 && uid < 32) {
+                    g_vold_created_users_mask &= ~(1u << uid);
+                    if (uid > 0) g_vold_unlocked_users_mask &= ~(1u << uid);
+                    post_vold_destroy_uid = uid;
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_MOUNT) {
+            char vol_id[64] = {0};
+            int32_t flags = 0, mount_uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_str16(&pr, vol_id, sizeof(vol_id)) == 0) {
+                (void)pr_i32(&pr, &flags);
+                (void)pr_i32(&pr, &mount_uid);
+                strncpy(post_vold_id, vol_id, sizeof(post_vold_id) - 1);
+                post_vold_mount = 1;
+                fprintf(stderr, "[svbox-netd] vold: mount(volId=%s flags=0x%x userId=%d) -> FUSE-less STATE_MOUNTED\n",
+                        vol_id, flags, mount_uid);
+                fflush(stderr);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_UNMOUNT) {
+            char vol_id[64] = {0};
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_str16(&pr, vol_id, sizeof(vol_id)) == 0) {
+                strncpy(post_vold_id, vol_id, sizeof(post_vold_id) - 1);
+                post_vold_mount = -1;
+                fprintf(stderr, "[svbox-netd] vold: unmount(volId=%s)\n", vol_id);
+                fflush(stderr);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_SETUP_APP_DIR || code == VOLD_TX_FIXUP_APP_DIR) {
+            char path[512] = {0};
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_str16(&pr, path, sizeof(path)) == 0) {
+                vold_ensure_host_dir(path);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_ENSURE_APP_DIRS_CREATED) {
+            int32_t cnt = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &cnt) == 0) {
+                for (int32_t i = 0; i < cnt && i < 64; i++) {
+                    char path[512] = {0};
+                    if (pr_str16(&pr, path, sizeof(path)) < 0) break;
+                    vold_ensure_host_dir(path);
+                }
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_UNLOCK_USER_KEY) {
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                if (uid >= 0 && uid < 32) g_vold_unlocked_users_mask |= (1u << uid);
+                fprintf(stderr, "[svbox-netd] vold: unlockUserKey(userId=%d)\n", uid);
+                fflush(stderr);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_LOCK_USER_KEY) {
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                if (uid > 0 && uid < 32) g_vold_unlocked_users_mask &= ~(1u << uid);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_GET_UNLOCKED_USERS) {
+            int32_t cnt = 0;
+            for (int32_t u = 0; u < 32; u++) {
+                if (g_vold_unlocked_users_mask & (1u << u)) cnt++;
+            }
+            p_i32(&reply, 0);
+            p_i32(&reply, cnt);
+            for (int32_t u = 0; u < 32; u++) {
+                if (g_vold_unlocked_users_mask & (1u << u)) p_i32(&reply, u);
+            }
+        } else if (code == VOLD_TX_PREPARE_USER_STORAGE) {
+            char uuid[128] = {0};
+            int32_t uid = 0;
+            if (pr.buf && pr_skip_iface_token(&pr) == 0 &&
+                pr_str16(&pr, uuid, sizeof(uuid)) == 0 &&
+                pr_i32(&pr, &uid) == 0) {
+                vold_prepare_user_dirs(uid);
+                fprintf(stderr, "[svbox-netd] vold: prepareUserStorage(uuid=%s userId=%d)\n", uuid, uid);
+                fflush(stderr);
+            }
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_GET_STORAGE_LIFETIME || code == VOLD_TX_GET_WRITE_AMOUNT) {
+            p_i32(&reply, 0);
+            p_i32(&reply, -1);
+        } else if (code == VOLD_TX_NEEDS_CHECKPOINT || code == VOLD_TX_NEEDS_ROLLBACK ||
+                   code == VOLD_TX_IS_CHECKPOINTING || code == VOLD_TX_SUPPORTS_CHECKPOINT ||
+                   code == VOLD_TX_SUPPORTS_BLOCK_CHECKPOINT || code == VOLD_TX_SUPPORTS_FILE_CHECKPOINT ||
+                   code == VOLD_TX_INCFS_ENABLED) {
+            p_i32(&reply, 0);
+            p_i32(&reply, 0);
+        } else if (code == VOLD_TX_GET_STORAGE_SIZE) {
+            p_i32(&reply, 0);
+            p_i64(&reply, 34359738368LL); /* 32 GiB */
+        } else if (code == VOLD_TX_CREATE_OBB || code == VOLD_TX_CREATE_STUB_VOLUME) {
+            p_i32(&reply, 0);
+            p_str16(&reply, "");
+        } else {
+            p_i32(&reply, 0);
+        }
     } else {
         p_i32(&reply, 0);
         p_i32(&reply, 0);
@@ -1352,24 +1695,49 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         notify_unsol_link_state(post_ifname, post_link_event > 0);
     if (post_addr_event != 0 && post_ifname[0] && post_addr_cidr[0])
         notify_unsol_addr(post_addr_event > 0, post_ifname, post_addr_cidr);
+    if (post_vold_create_uid >= 0) {
+        vold_notify_volume_created(post_vold_create_uid);
+    }
+    if (post_vold_destroy_uid >= 0) {
+        char vid[32];
+        snprintf(vid, sizeof(vid), "emulated;%d", post_vold_destroy_uid);
+        vold_notify_destroyed(vid);
+    }
+    if (post_vold_mount > 0 && post_vold_id[0]) {
+        /* FUSE-less mount: skip IVoldMountCallback.onVolumeChecking (no /dev/fuse),
+         * directly report path=/storage/emulated, internalPath=/data/media, STATE_MOUNTED. */
+        vold_notify_state(post_vold_id, VOLD_VOL_STATE_CHECKING);
+        vold_notify_path(post_vold_id, "/storage/emulated");
+        vold_notify_internal_path(post_vold_id, "/data/media");
+        vold_notify_state(post_vold_id, VOLD_VOL_STATE_MOUNTED);
+        fprintf(stderr, "[svbox-netd] vold -> %s MOUNTED (/storage/emulated <-> /data/media)\n", post_vold_id);
+        fflush(stderr);
+    } else if (post_vold_mount < 0 && post_vold_id[0]) {
+        vold_notify_state(post_vold_id, VOLD_VOL_STATE_UNMOUNTED);
+    }
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <binder.sock> [--net-sock PATH] [--fwmark-sock PATH] [--no-audio-stubs]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <binder.sock> [--net-sock PATH] [--fwmark-sock PATH] [--data-dir PATH] [--no-audio-stubs] [--no-vold]\n", argv[0]);
         return 1;
     }
     signal(SIGPIPE, SIG_IGN);
     const char *binder_sock = argv[1];
     int register_audio_stubs = 1;
+    int register_vold = 1;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--no-audio-stubs") == 0) {
             register_audio_stubs = 0;
+        } else if (strcmp(argv[i], "--no-vold") == 0) {
+            register_vold = 0;
         } else if (strcmp(argv[i], "--net-sock") == 0 && i + 1 < argc) {
             strncpy(g_net_sock_path, argv[++i], sizeof(g_net_sock_path) - 1);
         } else if (strcmp(argv[i], "--fwmark-sock") == 0 && i + 1 < argc) {
             strncpy(g_fwmark_sock_path, argv[++i], sizeof(g_fwmark_sock_path) - 1);
+        } else if (strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc) {
+            strncpy(g_data_dir, argv[++i], sizeof(g_data_dir) - 1);
         }
     }
 
@@ -1410,6 +1778,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[svbox-netd] registered 'suspend_control'\n");
     if (add_service("suspend_control_internal", NODE_SUSPEND_CTRL_INT) == 0)
         fprintf(stderr, "[svbox-netd] registered 'suspend_control_internal'\n");
+    if (register_vold && add_service("vold", NODE_VOLD) == 0)
+        fprintf(stderr, "[svbox-netd] registered 'vold' (FUSE-less, data_dir=%s)\n",
+                g_data_dir[0] ? g_data_dir : "<none>");
     if (register_audio_stubs) {
         add_service("media.audio_policy", NODE_AUDIO_POLICY);
         add_service("media.audio_flinger", NODE_AUDIO_FLINGER);

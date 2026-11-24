@@ -114,6 +114,8 @@ struct bnode {
     bool     is_ctx_mgr;
     bool     has_weak_ref;
     bool     has_strong_ref;
+    bool     pending_weak_ref;
+    bool     pending_strong_ref;
     bool     has_async_txn;
     uint64_t async_buf_ptr;
     struct bmsg *async_head;
@@ -370,6 +372,16 @@ static struct bnode *find_node(uint32_t node_id)
     uint32_t b = hash_u32(node_id);
     for (int idx = g_node_id_buckets[b]; idx >= 0; idx = g_nodes[idx].id_hash_next) {
         if (g_nodes[idx].used && g_nodes[idx].node_id == node_id)
+            return &g_nodes[idx];
+    }
+    return NULL;
+}
+
+static struct bnode *find_node_by_ptr(uint32_t owner_proc_id, uint64_t ptr)
+{
+    uint32_t bptr = hash_node_ptr(owner_proc_id, ptr);
+    for (int idx = g_node_ptr_buckets[bptr]; idx >= 0; idx = g_nodes[idx].ptr_hash_next) {
+        if (g_nodes[idx].used && g_nodes[idx].owner_proc_id == owner_proc_id && g_nodes[idx].ptr == ptr)
             return &g_nodes[idx];
     }
     return NULL;
@@ -813,12 +825,12 @@ static void node_check_release(struct bnode *node)
             break;
     }
     uint64_t pc[2] = { node->ptr, node->cookie };
-    if (!any_strong && node->has_strong_ref) {
+    if (!any_strong && node->has_strong_ref && !node->pending_strong_ref) {
         node->has_strong_ref = false;
         push_inbox(owner, make_simple_br(SV_BR_RELEASE, pc, sizeof(pc)));
         wake_proc_waiters(owner);
     }
-    if (!any_weak) {
+    if (!any_weak && !node->pending_strong_ref && !node->pending_weak_ref) {
         if (node->has_weak_ref) {
             node->has_weak_ref = false;
             push_inbox(owner, make_simple_br(SV_BR_DECREFS, pc, sizeof(pc)));
@@ -843,10 +855,14 @@ static void node_inc_refs(struct bnode *node, bool strong, struct bthread *prefe
     bool send_strong = strong && !node->has_strong_ref;
     if (!send_weak && !send_strong)
         return;
-    if (send_weak)
+    if (send_weak) {
         node->has_weak_ref = true;
-    if (send_strong)
+        node->pending_weak_ref = true;
+    }
+    if (send_strong) {
         node->has_strong_ref = true;
+        node->pending_strong_ref = true;
+    }
     if (prefer_t && prefer_t->used && prefer_t->proc_id == owner->proc_id) {
         if (send_weak)
             push_direct(prefer_t, make_simple_br(SV_BR_INCREFS, pc, sizeof(pc)));
@@ -1322,8 +1338,21 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             break;
         }
         case SV_BC_INCREFS_DONE:
-        case SV_BC_ACQUIRE_DONE:
+        case SV_BC_ACQUIRE_DONE: {
+            if (asz >= 16) {
+                uint64_t ptr = 0;
+                memcpy(&ptr, arg, 8);
+                struct bnode *node = find_node_by_ptr(proc->proc_id, ptr);
+                if (node) {
+                    if (cmd == SV_BC_INCREFS_DONE)
+                        node->pending_weak_ref = false;
+                    else
+                        node->pending_strong_ref = false;
+                    node_check_release(node);
+                }
+            }
             break;
+        }
         case SV_BC_DEAD_BINDER_DONE: {
             uint64_t cookie = 0;
             if (asz >= 8)

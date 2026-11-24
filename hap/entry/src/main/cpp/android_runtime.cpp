@@ -2132,6 +2132,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "persist.zygote.app_data_isolation=0\n"
         "persist.sys.vold_app_data_isolation_enabled=false\n"
         "persist.sys.fuse=false\n"
+        "persist.sys.fuse.transcode_enabled=false\n"
+        "sys.fuse.transcode_enabled=false\n"
         "ro.fuse.bpf.enabled=false\n"
         "persist.sys.fuse.bpf.override=false\n"
         "external_storage.sdcardfs.enabled=false\n"
@@ -2475,7 +2477,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         const bool useRealAudio = !audioHalPath_.empty() && FileExists(audioHalPath_) &&
                                   FileExists(rootfs_ + "/vendor/bin/hw/android.hardware.audio.service");
         if (FileExists(netd)) {
-            std::vector<std::string> netdArgs = { netd, sockDir + "/binder.sock" };
+            std::vector<std::string> netdArgs = { netd, sockDir + "/binder.sock", "--data-dir", dataBase_ };
             if (!netSockPath_.empty()) {
                 netdArgs.push_back("--net-sock");
                 netdArgs.push_back(netSockPath_);
@@ -2529,6 +2531,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         if (FileExists(rootfs_ + "/system/apex/com.android.art/bin/artd")) {
             launchPaced("artd", { "-e", sfLdPath, "apex/com.android.art/bin/artd" });
         }
+        // Android 14 software Codec2 HAL (android.hardware.media.c2@1.0::IComponentStore/software).
+        // Prevents StorageManagerService's MediaCodecList init from deadlocking its Handler thread
+        // before H_BOOT_COMPLETED / H_COMPLETE_UNLOCK_USER / emulated;0 auto-mount.
+        if (FileExists(rootfs_ + "/system/apex/com.android.media.swcodec/bin/mediaswcodec")) {
+            launchPaced("mediaswcodec", { "apex/com.android.media.swcodec/bin/mediaswcodec" });
+        }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
@@ -2538,21 +2546,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         if (FileExists(rootfs_ + "/system/bin/credstore")) {
             launchPaced("credstore", { "-e", sfLdPath, "system/bin/credstore", "/data/misc/credstore" });
         }
-        // Launch vold without /storage/* sub-mounts in its /proc/mounts view
-        {
-            auto voldArgs = BaseSvboxArgs(/*includeStorageSubmounts=*/false);
-            const std::vector<std::string> voldCmd = {
-                "-e", sfLdPath, "system/bin/vold",
-                "--blkid_context=u:r:blkid:s0",
-                "--blkid_untrusted_context=u:r:blkid_untrusted:s0",
-                "--fsck_context=u:r:fsck:s0",
-                "--fsck_untrusted_context=u:r:fsck_untrusted:s0"
-            };
-            voldArgs.insert(voldArgs.end(), voldCmd.begin(), voldCmd.end());
-            Spawn(voldArgs, false, logDir + "/vold.log");
-            SleepCancelableMs(25);
-        }
-        // Note: android.system.suspend.ISystemSuspend/default is served by svbox-netd
+        // Note: 'vold' (android.os.IVold) is served FUSE-less by svbox-netd directly over
+        // svbox's bind-mounted /storage/emulated/0 <-> /data/media/0 (HarmonyOS PC kernel
+        // has no /dev/fuse, which caused stock system/bin/vold to fail mounting emulated;0).
+        // Note: android.system.suspend.ISystemSuspend/default is also served by svbox-netd
         // (avoids Scudo double-free in stock android.system.suspend-service on virtual /sys/power).
         launchPaced("power", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.power-service.example" });
         launchPaced("health", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.health-service.example" });

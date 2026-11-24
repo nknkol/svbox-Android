@@ -705,6 +705,35 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **跨应用弹窗 & 双模式实时互转** | `CROSS_APP_LAUNCH` 精准捕获 Settings 内拉起 Contacts (`taskId=10`)，且豁免 `PermissionController` 权限弹窗；`MOVE_TASK`、`SEND_KEY`、`PULL_BACK_TO_EMULATOR`（`moved=2`）、`POP_OUT_EMULATOR`（`Calendar -> displayId=3`）、`CLOSE_APP`、`DESTROY_DISPLAY` 全通；`system_server Fatal signals = 0` |
 | **构建打包与 Layer 1 回归** | `svbox` 回归 **26/26 PASS**、Layer 1 纯净度通过；`hvigorw assembleHap` 0 错误 + `pack_hnp.py` 注入 `svbox.hnp`（5.96 MB，含 `svbox`、`libsvbox_wm_jni.so`、`svbox-wm-agent.jar`），`module.json` 含 `AppWindowAbility (specified)` 与 `MyAbilityStage`；`rootfs/` 与 `rootfs14/` 0 字节改动 |
 
+---
+
+### 16. 无 FUSE `IVold` 存储挂载、Binder 引用竞态与 `mediaswcodec` 自启修复（2026-11-24）
+
+彻底根治 Android 14 在无 `/dev/fuse` 的鸿蒙 PC 内核上 `VolumeInfo{emulated;0}` 无法挂载、`MediaProvider` 卡死/报 `Volume external_primary not found` 以及 `Files`（`com.android.documentsui`）/ `Gallery`（`com.android.gallery3d`）白屏问题，全程保持 `rootfs14/` 与 Layer 1 `svbox` 0 字节改动。
+
+#### A. 核心改动（严格限定在 Layer 3 `svbox-Android`）
+
+1. **`netd/svbox_netd.c`（新增无 FUSE `android.os.IVold` 服务 `NODE_VOLD`）**：
+   * 注册 `"vold"`（`android.os.IVold`），按 `rootfs14/system/framework/framework.jar`（`classes3.dex`）校验的精确事务码实现：`setListener (1)`、`reset (4)`、`onUserAdded (6)`、`onUserRemoved (7)`、`onUserStarted (8)`、`mount (15)`、`unmount (16)`、`setupAppDir (23)`、`fixupAppDir (24)`、`ensureAppDirsCreated (25)`、`getStorageLifeTime (31)`、`getWriteAmount (34)`、`getUnlockedUsers (45)`、`unlockUserKey (46)`、`lockUserKey (47)`、`prepareUserStorage (48)`、checkpoint/incfs 查询（`53/54/55/62/63/64/70`）及 `getStorageSize (76)`。
+   * 在 `mount("emulated;0", ...)` 中跳过 `IVoldMountCallback.onVolumeChecking(fuseFd, ...)`（避免 `StorageSessionController` 拉起 FUSE 会话），直接通过 `IVoldListener` 单向回调依次上报 `STATE_CHECKING (1)` → `path="/storage/emulated"` → `internalPath="/data/media"` → `STATE_MOUNTED (2)`，无缝对接 `svbox` 已 bind-mount 的 `/storage/emulated/0 <-> /data/media/0`。
+   * 新增 `--data-dir <userdata14>` 参数，为 `setupAppDir` / `ensureAppDirsCreated` / `prepareUserStorage` 实时在宿主机创建对应应用外部存储目录。
+2. **`binderd/svbox_binderd.c`（修复 Binder 节点引用计数竞态）**：
+   * 根因：`node_inc_refs()` 向发送线程 `direct` 队列投递 `BR_INCREFS`/`BR_ACQUIRE` 后，若快速原生服务端在发送线程消费前就 `BC_FREE_BUFFER` 释放句柄，`node_check_release()` 会立刻向 `owner->inbox` 投递 `BR_RELEASE`/`BR_DECREFS` 并唤醒其他线程抢先析构对象，导致 `system_server` 在 `IVold.mount()` 处 `SIGSEGV (fault addr 0x4)`。
+   * 修复：按 Linux 内核 `binder.c` 语义在 `struct bnode` 增加 `pending_weak_ref` / `pending_strong_ref`，实现 `SV_BC_INCREFS_DONE` 与 `SV_BC_ACQUIRE_DONE` 清标并触发 `node_check_release()`，彻底消除竞态。
+3. **`hap/entry/src/main/cpp/android_runtime.cpp`**：
+   * 移除原版 `system/bin/vold` 启动，向 `svbox-netd` 传入 `--data-dir <dataBase_>`，并配置 `persist.sys.fuse.transcode_enabled=false` / `sys.fuse.transcode_enabled=false`。
+   * 开机自启 `apex/com.android.media.swcodec/bin/mediaswcodec`（不带 `sfLdPath` 以保留 APEX linker namespace 对 `gralloc-mapper` 的解析），彻底解除 `StorageManagerService` Handler 线程在 `MediaCodecList` → `android.hardware.media.c2@1.0::IComponentStore/software` 上的永久阻塞，确保开机自动跑完 `H_BOOT_COMPLETED` / `H_COMPLETE_UNLOCK_USER` / `emulated;0` 自动挂载与 `ACTION_MEDIA_MOUNTED` 广播。
+
+#### B. `HAD-W32` 真机冷启动验收结果
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **冷启动自动挂载** | ~9s 完成启动，`svbox-netd` 自动完成 `reset -> onUserAdded(0) -> onUserStarted(0) -> mount(emulated;0) -> STATE_MOUNTED` |
+| **`dumpsys mount`** | `VolumeInfo{emulated;0}: state=MOUNTED`, `path=/storage/emulated`, `internalPath=/data/media`；`Local unlocked users: [0]`、`System unlocked users: [0]` |
+| **`ExternalStorageProvider`** | `content://com.android.externalstorage.documents/root` 返回 `root_id=primary` (`document_id=primary:`) |
+| **`MediaProvider`** | `content://media/external/images/media` 毫秒级返回零报错；`content://media/external/file` 索引 `volume_name=external_primary` 下 14 个标准目录（`Music/Movies/Download/DCIM/Documents/...`） |
+| **`Files` & `Gallery` 独立窗口** | `Files` (`com.android.documentsui`) 加载全部 7 个根目录（最近/primary/下载/图片/视频/音频/文档），`immersive topBar=#FFFFFF`；`Gallery` (`com.android.gallery3d`) `+358ms` 完成首帧显示，`immersive topBar=#080808 dark=1`；双窗口零白屏、零崩溃、零 ANR |
+
 
 
 
