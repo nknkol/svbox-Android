@@ -3,26 +3,17 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import native, { RuntimeStatus } from 'libentry.so';
 import {
   AndroidAppItem,
-  AppWindowPref,
-  appWindowPrefs,
-  computeShortcutId,
   REFRESH_RATES,
   RESOLUTION_PRESETS,
+  ResolutionPresetItem,
   WmEventItem
 } from '../common/AppWindowPrefs';
-import {
-  pinAndroidAppToDesktop,
-  queryPinnedShortcutIds,
-  removeAndroidAppShortcut,
-  ShortcutOpResult
-} from '../common/DesktopShortcut';
 
-const TAG: string = 'SvboxIndex';
+const TAG: string = 'SvboxMain';
 
 interface ListAppsReply {
   ok?: boolean;
   apps?: AndroidAppItem[];
-  error?: string;
 }
 
 interface PopOutReply {
@@ -37,50 +28,41 @@ interface PopOutReply {
 @Entry
 @Component
 struct Index {
-  // Default to Free Multi-Window Mode ('multiwindow'), switchable live to 'emulator'
-  @State private uiMode: string = 'multiwindow';
+  @StorageLink('mainDecorRightAvoidVp') decorRightAvoidVp: number = 136;
+
+  @State private uiMode: string = 'manager'; // 'manager' (MuMu instance list) | 'emulator' (Display 0)
+  @State private showInstanceSettings: boolean = false;
   @State private running: boolean = false;
   @State private paused: boolean = false;
   @State private connected: boolean = false;
   @State private wmAgentReady: boolean = false;
-  @State private vsyncActive: boolean = false;
-  @State private inputReady: boolean = false;
-  @State private audioActive: boolean = false;
   @State private frames: number = 0;
   @State private fps: number = 0;
-  @State private refreshRate: number = 60;
-  @State private resIdx: number = 0;
   @State private dispW: number = 720;
   @State private dispH: number = 1280;
-  @State private stageW: number = 960;
-  @State private stageH: number = 720;
+  @State private resIdx: number = 0;
+  @State private refreshRate: number = 60;
   @State private cpuPercent: number = 0;
   @State private memMb: number = 0;
   @State private memLimitMb: number = 4096;
   @State private activeProcs: number = 0;
-  @State private profile: string = 'perf';
+  @State private profile: string = 'Balanced';
   @State private gpuMode: string = 'vulkan';
-  @State private surfaceEpoch: number = 0;
   @State private gpuRenderer: string = '';
   @State private cpuset: string = '';
   @State private topology: string = '';
-  @State private statusText: string = '正在初始化 Android 14 自由多窗环境...';
-  @State private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
-  @State private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
-
-  // Multi-window App Launcher state
-  @State private appList: AndroidAppItem[] = [];
-  @State private iconsDir: string = '';
-  @State private searchQuery: string = '';
-  @State private appFilter: string = 'all'; // 'all' | 'user' | 'system'
-  @State private loadingApps: boolean = false;
-  @State private pinnedIds: string[] = [];
-  @State private prefEpoch: number = 0;
+  @State private statusText: string = '就绪';
+  @State private stageW: number = 720;
+  @State private stageH: number = 820;
+  @State private surfaceToggle: boolean = false;
+  @State private appCount: number = 0;
 
   private pollTimer: number = -1;
   private lastLaunchSeq: number = 0;
   private appsFetchedOnce: boolean = false;
   private autoBootTriggered: boolean = false;
+  private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
+  private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
 
   private showToast(msg: string): void {
     try {
@@ -92,11 +74,6 @@ struct Index {
   private getSandboxTempDir(): string {
     const dir: string | undefined = AppStorage.get<string>('sandboxTempDir');
     return dir && dir.length > 0 ? dir : '/data/storage/el2/base/haps/entry/temp';
-  }
-
-  private getSandboxFilesDir(): string {
-    const dir: string | undefined = AppStorage.get<string>('sandboxFilesDir');
-    return dir && dir.length > 0 ? dir : '/data/storage/el2/base/haps/entry/files';
   }
 
   private applyResolutionKey(key: string): boolean {
@@ -113,9 +90,9 @@ struct Index {
   }
 
   private setUiMode(nextMode: string): void {
-    if (nextMode !== 'multiwindow' && nextMode !== 'emulator') return;
+    if (nextMode !== 'manager' && nextMode !== 'emulator') return;
     this.uiMode = nextMode;
-    AppStorage.setOrCreate<string>('activeUiMode', nextMode);
+    AppStorage.setOrCreate<string>('activeUiMode', nextMode === 'emulator' ? 'emulator' : 'multiwindow');
     AppStorage.setOrCreate<string>('requestedUiMode', '');
     try {
       native.setDisplayVisible(0, nextMode === 'emulator');
@@ -124,8 +101,13 @@ struct Index {
       }
     } catch (_e) {
     }
-    if (nextMode === 'multiwindow' && this.wmAgentReady && this.appList.length === 0) {
-      this.refreshApps(false);
+  }
+
+  private openAppsCenterPage(): void {
+    try {
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/AppsPage' });
+    } catch (err) {
+      hilog.error(0x0000, TAG, 'pushUrl AppsPage failed: %{public}s', String(err));
     }
   }
 
@@ -163,10 +145,10 @@ struct Index {
       this.refreshRate = rawHz;
     }
     const reqUi: string | undefined = AppStorage.get<string>('requestedUiMode');
-    if (reqUi === 'emulator' || reqUi === 'multiwindow') {
-      this.uiMode = reqUi;
+    if (reqUi === 'emulator') {
+      this.uiMode = 'emulator';
     }
-    AppStorage.setOrCreate<string>('activeUiMode', this.uiMode);
+    AppStorage.setOrCreate<string>('activeUiMode', this.uiMode === 'emulator' ? 'emulator' : 'multiwindow');
     this.lastLaunchSeq = AppStorage.get<number>('launchSeq') ?? 0;
 
     try {
@@ -176,18 +158,13 @@ struct Index {
     } catch (_e) {
     }
 
-    this.refreshPinnedShortcuts();
-
-    const autoMode: string | undefined = AppStorage.get<string>('autoStart');
-    if (autoMode && (autoMode === 'bootanim' || autoMode === 'full')) {
+    const autoStart: string | undefined = AppStorage.get<string>('autoStart');
+    if (autoStart === 'bootanim' || autoStart === 'full') {
       this.autoBootTriggered = true;
       setTimeout(() => {
-        if (!this.running) {
-          this.launchMode(autoMode);
-        }
-      }, 250);
+        this.launchMode(autoStart);
+      }, 300);
     } else if (!this.autoBootTriggered) {
-      // Default Free Multi-Window Mode: silently boot single shared Android 14 instance
       this.autoBootTriggered = true;
       setTimeout(() => {
         const cur: RuntimeStatus = native.getStatus();
@@ -195,11 +172,11 @@ struct Index {
           this.launchMode('full');
           native.setDisplayVisible(0, this.uiMode === 'emulator');
         }
-      }, 300);
+      }, 350);
     }
 
     this.pollTimer = setInterval(() => {
-      this.onPollTick();
+      this.pollRuntime();
     }, 500);
   }
 
@@ -210,42 +187,41 @@ struct Index {
     }
   }
 
-  private onPollTick(): void {
+  private pollRuntime(): void {
     try {
       const reqUi: string | undefined = AppStorage.get<string>('requestedUiMode');
-      if ((reqUi === 'emulator' || reqUi === 'multiwindow') && reqUi !== this.uiMode) {
-        this.setUiMode(reqUi);
+      if (reqUi === 'emulator' && this.uiMode !== 'emulator') {
+        this.setUiMode('emulator');
+      } else if (reqUi === 'multiwindow' && this.uiMode !== 'manager') {
+        this.setUiMode('manager');
       }
 
-      const curSeq: number = AppStorage.get<number>('launchSeq') ?? 0;
-      if (curSeq !== this.lastLaunchSeq) {
-        this.lastLaunchSeq = curSeq;
-        const nextGpu: string | undefined = AppStorage.get<string>('gpuMode');
-        const gpuChanged: boolean =
-          (nextGpu === 'swiftshader' || nextGpu === 'gles' || nextGpu === 'vulkan') &&
-          nextGpu !== this.gpuMode;
-        if (nextGpu === 'swiftshader' || nextGpu === 'gles' || nextGpu === 'vulkan') {
-          this.gpuMode = nextGpu;
+      const seq: number = AppStorage.get<number>('launchSeq') ?? 0;
+      if (seq > this.lastLaunchSeq) {
+        this.lastLaunchSeq = seq;
+        const reqGpu: string | undefined = AppStorage.get<string>('gpuMode');
+        if (reqGpu === 'swiftshader' || reqGpu === 'gles' || reqGpu === 'vulkan') {
+          this.gpuMode = reqGpu;
+          native.setGpuMode(this.gpuMode);
         }
-        const nextRes: string | undefined = AppStorage.get<string>('resolution');
-        const resChanged: boolean = (nextRes && nextRes.length > 0) ? this.applyResolutionKey(nextRes) : false;
-        const nextHz: number | undefined = AppStorage.get<number>('refreshRate');
-        if (nextHz === 60 || nextHz === 90 || nextHz === 120) {
-          this.refreshRate = nextHz;
+        const reqRes: string | undefined = AppStorage.get<string>('resolution');
+        let resChanged: boolean = false;
+        if (reqRes && reqRes.length > 0) {
+          resChanged = this.applyResolutionKey(reqRes);
+        }
+        const reqHz: number | undefined = AppStorage.get<number>('refreshRate');
+        if (reqHz === 60 || reqHz === 90 || reqHz === 120) {
+          this.refreshRate = reqHz;
           native.setRefreshRate(this.refreshRate);
         }
-        const nextMode: string | undefined = AppStorage.get<string>('autoStart');
-        if (this.running) {
-          native.stopContainer();
-          this.appsFetchedOnce = false;
-        }
-        if (gpuChanged || resChanged) {
-          this.surfaceEpoch++;
-        }
-        if (nextMode === 'bootanim' || nextMode === 'full') {
+        const mode: string | undefined = AppStorage.get<string>('autoStart');
+        if (mode === 'bootanim' || mode === 'full') {
+          if (resChanged) {
+            this.surfaceToggle = !this.surfaceToggle;
+          }
           setTimeout(() => {
-            this.launchMode(nextMode);
-          }, (gpuChanged || resChanged) ? 650 : 400);
+            this.launchMode(mode);
+          }, resChanged ? 150 : 20);
         }
       }
 
@@ -254,33 +230,50 @@ struct Index {
       this.paused = st.paused;
       this.connected = st.connected;
       this.wmAgentReady = st.wmAgentReady;
-      this.vsyncActive = st.vsyncActive;
-      this.inputReady = st.inputReady;
-      this.audioActive = st.audioActive;
       this.frames = st.frames;
       this.fps = st.fps;
+      if (st.width > 0 && st.height > 0) {
+        this.dispW = st.width;
+        this.dispH = st.height;
+      }
       if (st.refreshRate === 60 || st.refreshRate === 90 || st.refreshRate === 120) {
         this.refreshRate = st.refreshRate;
+        AppStorage.setOrCreate<number>('refreshRate', this.refreshRate);
       }
-      this.cpuPercent = Math.round(st.cpuPercent);
+      this.cpuPercent = st.cpuPercent;
       this.memMb = st.memMb;
       this.memLimitMb = st.memLimitMb;
       this.activeProcs = st.activeProcs;
+      this.profile = st.profile;
+      this.gpuMode = st.gpuMode;
       this.gpuRenderer = st.gpuRenderer;
       this.cpuset = st.cpuset;
       this.topology = st.topology;
-      if (st.statusText.length > 0) {
-        this.statusText = st.statusText;
+      this.statusText = st.statusText;
+
+      if (this.wmAgentReady && !this.appsFetchedOnce) {
+        this.appsFetchedOnce = true;
+        this.prefetchApps();
+      }
+      if (!this.running) {
+        this.appsFetchedOnce = false;
+        this.appCount = 0;
       }
 
       if (this.wmAgentReady) {
-        if (!this.appsFetchedOnce && !this.loadingApps) {
-          this.appsFetchedOnce = true;
-          this.refreshApps(false);
-        }
         this.drainWmEvents();
-      } else {
-        this.appsFetchedOnce = false;
+      }
+    } catch (_e) {
+    }
+  }
+
+  private async prefetchApps(): Promise<void> {
+    try {
+      const raw: string = await native.wmRpcAsync('LIST_APPS 1');
+      const rep: ListAppsReply = JSON.parse(raw) as ListAppsReply;
+      if (rep.ok && rep.apps) {
+        this.appCount = rep.apps.length;
+        AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', rep.apps);
       }
     } catch (_e) {
     }
@@ -289,573 +282,610 @@ struct Index {
   private drainWmEvents(): void {
     try {
       const raw: string = native.pollWmEvents();
-      if (!raw || raw.length <= 2) return;
-      const evs: WmEventItem[] = JSON.parse(raw) as WmEventItem[];
-      if (!Array.isArray(evs)) return;
-      for (let i: number = 0; i < evs.length; i++) {
-        const ev: WmEventItem = evs[i];
+      if (!raw || raw === '[]') return;
+      const items: WmEventItem[] = JSON.parse(raw) as WmEventItem[];
+      for (let i: number = 0; i < items.length; i++) {
+        const ev: WmEventItem = items[i];
         if (ev.event === 'CROSS_APP_LAUNCH' && ev.packageName && ev.packageName.length > 0) {
-          hilog.info(0x0000, TAG, 'Cross-app launch -> new OHOS window: pkg=%{public}s taskId=%{public}d',
-            ev.packageName, ev.taskId);
-          this.openAndroidAppWindow(ev.packageName, ev.component ?? '', ev.label ?? ev.packageName, ev.taskId);
+          this.openAndroidAppWindow(ev.packageName, ev.component ?? '', ev.label ?? ev.packageName, ev.taskId ?? -1);
         }
       }
     } catch (_e) {
     }
   }
 
-  private async refreshApps(forceIcons: boolean): Promise<void> {
-    if (!native.isWmAgentReady() || this.loadingApps) return;
-    this.loadingApps = true;
-    try {
-      this.iconsDir = native.getIconsDir();
-      const raw: string = await native.wmRpcAsync(forceIcons ? 'LIST_APPS 1' : 'LIST_APPS 0');
-      const rep: ListAppsReply = JSON.parse(raw) as ListAppsReply;
-      if (rep.ok && Array.isArray(rep.apps)) {
-        const sorted: AndroidAppItem[] = rep.apps.slice();
-        sorted.sort((a: AndroidAppItem, b: AndroidAppItem): number => {
-          if (a.isSystem !== b.isSystem) return a.isSystem ? 1 : -1;
-          return a.label.localeCompare(b.label);
-        });
-        this.appList = sorted;
-        AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', sorted);
-      }
-    } catch (err) {
-      hilog.warn(0x0000, TAG, 'refreshApps error: %{public}s', String(err));
-    } finally {
-      this.loadingApps = false;
-    }
-  }
-
-  private async refreshPinnedShortcuts(): Promise<void> {
-    this.pinnedIds = await queryPinnedShortcutIds();
-  }
-
-  private isAppPinned(pkg: string): boolean {
-    const sid: string = computeShortcutId(pkg);
-    return this.pinnedIds.indexOf(sid) >= 0;
-  }
-
-  private getFilteredApps(): AndroidAppItem[] {
-    const q: string = this.searchQuery.trim().toLowerCase();
-    const out: AndroidAppItem[] = [];
-    for (let i: number = 0; i < this.appList.length; i++) {
-      const a: AndroidAppItem = this.appList[i];
-      if (this.appFilter === 'user' && a.isSystem) continue;
-      if (this.appFilter === 'system' && !a.isSystem) continue;
-      if (q.length > 0) {
-        const hay: string = `${a.label} ${a.packageName}`.toLowerCase();
-        if (hay.indexOf(q) < 0) continue;
-      }
-      out.push(a);
-    }
-    return out;
-  }
-
-  private openAndroidAppWindow(pkg: string, comp: string, label: string, moveTaskId: number = -1): void {
+  private async openAndroidAppWindow(pkg: string, comp: string, label: string, moveTaskId: number): Promise<void> {
     try {
       const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const want: Want = {
         bundleName: 'org.svbox.android',
-        moduleName: 'entry',
         abilityName: 'AppWindowAbility',
         parameters: {
           'androidPkg': pkg,
           'androidComp': comp,
-          'androidLabel': label,
+          'androidLabel': label.length > 0 ? label : pkg,
           'moveTaskId': String(moveTaskId),
-        }
+        },
       };
-      ctx.startAbility(want).catch((err: Error) => {
-        hilog.error(0x0000, TAG, 'startAbility AppWindowAbility failed: %{public}s', String(err));
-        this.showToast(`打开窗口失败: ${String(err)}`);
-      });
+      await ctx.startAbility(want);
     } catch (err) {
-      this.showToast(`打开窗口异常: ${String(err)}`);
+      hilog.error(0x0000, TAG, 'openAndroidAppWindow failed: %{public}s', String(err));
+      this.showToast(`打开应用窗口失败: ${String(err)}`);
     }
   }
 
   private async handlePopOutCurrentEmulatorApp(): Promise<void> {
     if (!this.wmAgentReady) {
-      this.showToast('窗口服务尚未就绪');
+      this.showToast('等待 Android 14 窗口服务就绪');
       return;
     }
-    const slot: number = native.allocDisplaySlot('');
-    if (slot < 1) {
-      this.showToast('独立窗口已达 8 个上限');
+    const probeSlot: number = native.allocDisplaySlot('__popout_probe__');
+    if (probeSlot < 1) {
+      this.showToast('已达到最大 8 个独立窗口上限');
       return;
     }
     try {
-      await native.wmRpcAsync(`CREATE_DISPLAY ${slot} 720 1280 320 ${this.refreshRate}`);
-      const raw: string = await native.wmRpcAsync(`POP_OUT_EMULATOR ${slot}`);
-      const rep: PopOutReply = JSON.parse(raw) as PopOutReply;
-      if (!rep.ok || !rep.packageName) {
-        await native.wmRpcAsync(`DESTROY_DISPLAY ${slot}`);
-        native.releaseDisplaySlot(slot);
-        this.showToast('当前模拟器前台没有可拆出的应用');
-        return;
+      const raw: string = await native.wmRpcAsync('GET_TASKS 0');
+      const parsed: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+      const tasks: Object[] = (parsed['tasks'] as Object[]) ?? [];
+      let targetPkg: string = '';
+      let targetComp: string = '';
+      let targetTid: number = -1;
+      for (let i: number = 0; i < tasks.length; i++) {
+        const t: Record<string, Object> = tasks[i] as Record<string, Object>;
+        const p: string = String(t['packageName'] ?? '');
+        if (p.length === 0 || p === 'com.android.launcher3' || p === 'com.android.systemui') continue;
+        targetPkg = p;
+        targetComp = String(t['component'] ?? '');
+        targetTid = Number(t['taskId'] ?? -1);
+        break;
       }
-      const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const want: Want = {
-        bundleName: 'org.svbox.android',
-        moduleName: 'entry',
-        abilityName: 'AppWindowAbility',
-        parameters: {
-          'androidPkg': rep.packageName,
-          'androidComp': rep.component ?? '',
-          'androidLabel': rep.label ?? rep.packageName,
-          'moveTaskId': String(rep.taskId ?? -1),
-          'preAllocSlot': String(slot),
+      native.releaseDisplaySlot(probeSlot);
+      if (targetPkg.length === 0 || targetTid <= 0) {
+        const popRaw: string = await native.wmRpcAsync('POP_OUT_EMULATOR 1');
+        const pr: PopOutReply = JSON.parse(popRaw) as PopOutReply;
+        if (!pr.ok) {
+          this.showToast('当前模拟器前台没有可拆出的应用');
+          return;
         }
-      };
-      ctx.startAbility(want).catch((_e: Error) => {});
-      this.showToast(`已将「${rep.label ?? rep.packageName}」拆出为独立窗口`);
-    } catch (_e) {
-      native.releaseDisplaySlot(slot);
+        targetPkg = pr.packageName ?? '';
+        targetComp = pr.component ?? '';
+        targetTid = pr.taskId ?? -1;
+      }
+      if (targetPkg.length > 0) {
+        const cached: AndroidAppItem[] = AppStorage.get<AndroidAppItem[]>('androidApps') ?? [];
+        let label: string = targetPkg;
+        for (let i: number = 0; i < cached.length; i++) {
+          if (cached[i].packageName === targetPkg) {
+            label = cached[i].label;
+            break;
+          }
+        }
+        await this.openAndroidAppWindow(targetPkg, targetComp, label, targetTid);
+      }
+    } catch (err) {
+      native.releaseDisplaySlot(probeSlot);
+      this.showToast(`拆出失败: ${String(err)}`);
     }
   }
 
-  private getEffectiveModeLabel(app: AndroidAppItem): string {
-    const _tick: number = this.prefEpoch;
-    const pref: AppWindowPref = appWindowPrefs.getPref(
-      this.getSandboxFilesDir(), app.packageName, app, this.refreshRate
+  private launchMode(mode: string): void {
+    const preset = RESOLUTION_PRESETS[this.resIdx];
+    this.dispW = preset.w;
+    this.dispH = preset.h;
+    native.setGpuMode(this.gpuMode);
+    native.setRefreshRate(this.refreshRate);
+    this.statusText = native.startContainer(
+      this.getSandboxTempDir(),
+      this.svboxPath,
+      this.androidDir,
+      mode,
+      preset.w,
+      preset.h
     );
-    if (_tick < 0) return '';
-    if (pref.mode === 'adaptive') return '自适应';
-    if (pref.mode === 'fixed_landscape') return '固定横';
-    return '固定竖';
   }
 
-  private cycleAppWindowPref(app: AndroidAppItem): void {
-    const filesDir: string = this.getSandboxFilesDir();
-    const cur: AppWindowPref = appWindowPrefs.getPref(filesDir, app.packageName, app, this.refreshRate);
-    if (cur.mode === 'adaptive') {
-      cur.mode = 'fixed_portrait';
-      cur.presetKey = '720x1280';
-      cur.winW = 540;
-      cur.winH = 960;
-    } else if (cur.mode === 'fixed_portrait') {
-      cur.mode = 'fixed_landscape';
-      cur.presetKey = '1280x720';
-      cur.winW = 1280;
-      cur.winH = 760;
-    } else {
-      cur.mode = 'adaptive';
-      cur.winW = 640;
-      cur.winH = 920;
-    }
-    appWindowPrefs.savePref(filesDir, app.packageName, cur);
-    this.prefEpoch++;
-    this.showToast(`${app.label} 窗口模式: ${this.getEffectiveModeLabel(app)}`);
+  private selectRefreshRate(hz: number): void {
+    this.refreshRate = hz;
+    AppStorage.setOrCreate<number>('refreshRate', hz);
+    native.setRefreshRate(hz);
   }
 
-  private async toggleDesktopShortcut(app: AndroidAppItem): Promise<void> {
-    const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    if (this.isAppPinned(app.packageName)) {
-      const rm: ShortcutOpResult = await removeAndroidAppShortcut(ctx, app.packageName);
-      this.showToast(rm.message);
-      await this.refreshPinnedShortcuts();
-      return;
-    }
-    const dir: string = this.iconsDir.length > 0 ? this.iconsDir : native.getIconsDir();
-    const iconPath: string = `${dir}/${app.iconFile.length > 0 ? app.iconFile : (app.packageName + '.png')}`;
-    const res: ShortcutOpResult = await pinAndroidAppToDesktop(ctx, app, iconPath);
-    this.showToast(res.message);
-    await this.refreshPinnedShortcuts();
+  private selectResolution(idx: number): void {
+    if (this.running) return;
+    this.resIdx = idx;
+    this.dispW = RESOLUTION_PRESETS[idx].w;
+    this.dispH = RESOLUTION_PRESETS[idx].h;
+    this.surfaceToggle = !this.surfaceToggle;
   }
 
-  private cycleProfile(): void {
-    const order: string[] = ['eco', 'balanced', 'perf', 'all'];
-    const idx: number = order.indexOf(this.profile);
-    this.profile = order[(idx + 1) % order.length];
-    try {
-      native.setResourceConfig(this.profile, '', this.memLimitMb);
-    } catch (_e) {
-    }
+  private selectGpuMode(mode: string): void {
+    if (this.running) return;
+    this.gpuMode = mode;
+    native.setGpuMode(mode);
   }
 
-  private cycleGpuMode(): void {
-    const order: string[] = ['vulkan', 'gles', 'swiftshader'];
-    const idx: number = order.indexOf(this.gpuMode);
-    this.gpuMode = order[(idx + 1) % order.length];
-    this.surfaceEpoch++;
-    try {
-      native.setGpuMode(this.gpuMode);
-    } catch (_e) {
-    }
-  }
-
-  private cycleRefreshRate(): void {
-    const idx: number = REFRESH_RATES.indexOf(this.refreshRate);
-    this.refreshRate = REFRESH_RATES[(idx + 1) % REFRESH_RATES.length];
-    AppStorage.setOrCreate<number>('refreshRate', this.refreshRate);
-    try {
-      native.setRefreshRate(this.refreshRate);
-    } catch (_e) {
-    }
-  }
-
-  private cycleResolution(): void {
-    this.resIdx = (this.resIdx + 1) % RESOLUTION_PRESETS.length;
-    this.dispW = RESOLUTION_PRESETS[this.resIdx].w;
-    this.dispH = RESOLUTION_PRESETS[this.resIdx].h;
-    this.surfaceEpoch++;
+  private selectProfile(prof: string): void {
+    if (this.running) return;
+    this.profile = prof;
+    native.setResourceConfig(prof, '', this.memLimitMb);
   }
 
   private gpuLabel(): string {
     if (this.gpuMode === 'vulkan') return 'Vulkan';
     if (this.gpuMode === 'gles') return 'GLES';
-    return 'ANGLE-SW';
+    return 'CPU';
   }
 
-  private launchMode(mode: string): void {
-    try {
-      native.setResourceConfig(this.profile, '', this.memLimitMb);
-      native.setGpuMode(this.gpuMode);
-      native.setRefreshRate(this.refreshRate);
-    } catch (_e) {
-    }
-    const tempDir: string = this.getSandboxTempDir();
-    this.statusText = native.startContainer(
-      tempDir,
-      this.svboxPath,
-      this.androidDir,
-      mode,
-      this.dispW,
-      this.dispH
-    );
+  private statusDotColor(): string {
+    if (!this.running) return '#6B7280';
+    if (this.paused) return '#F59E0B';
+    if (this.wmAgentReady) return '#10B981';
+    return '#38BDF8';
   }
 
-  private buildBadgeText(): string {
-    if (this.paused) {
-      return `Paused (0% CPU) · #${this.frames}`;
-    }
-    if (this.wmAgentReady) {
-      return `Android 14 · ${this.gpuLabel()} · ${this.refreshRate}Hz · CPU ${this.cpuPercent}% · ${this.memMb}MB · ${this.appList.length} Apps`;
-    }
-    if (this.connected) {
-      return `${this.gpuLabel()} · ${this.dispW}×${this.dispH} · ${this.fps}/${this.refreshRate}Hz · CPU ${this.cpuPercent}% · ${this.memMb}MB`;
-    }
-    return this.running ? `正在启动 Android 14 (${this.gpuLabel()} · ${this.refreshRate}Hz)...` : 'Idle · Android 14';
+  private statusBadgeLabel(): string {
+    if (!this.running) return '已停止';
+    if (this.paused) return '已暂停';
+    if (this.wmAgentReady) return '运行中';
+    return '启动中';
   }
 
-  build() {
-    Column() {
-      // Top Control Bar with Dual-Mode Switcher
-      Row({ space: 6 }) {
-        Text('svbox-A14')
-          .fontSize(14)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#F3F4F6')
-
-        // Segmented Dual-Mode Switcher
-        Row({ space: 2 }) {
-          Button('自由多窗')
-            .height(26)
-            .fontSize(11)
-            .backgroundColor(this.uiMode === 'multiwindow' ? '#0284C7' : '#262B35')
-            .onClick(() => { this.setUiMode('multiwindow'); })
-          Button('传统模拟器')
-            .height(26)
-            .fontSize(11)
-            .backgroundColor(this.uiMode === 'emulator' ? '#059669' : '#262B35')
-            .onClick(() => { this.setUiMode('emulator'); })
-        }
-        .padding(2)
-        .backgroundColor('#11141B')
-        .borderRadius(8)
-
-        Text(this.buildBadgeText())
-          .fontSize(11)
-          .fontColor(this.paused ? '#FBBF24' : (this.wmAgentReady ? '#34D399' : '#9CA3AF'))
-          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-          .backgroundColor('#1F2937')
-          .borderRadius(6)
-          .maxLines(1)
-
-        Blank()
-
-        Button(`${this.refreshRate}Hz`)
-          .height(28)
-          .fontSize(11)
-          .backgroundColor(this.refreshRate === 120 ? '#059669' : (this.refreshRate === 90 ? '#0284C7' : '#374151'))
-          .onClick(() => { this.cycleRefreshRate(); })
-
-        if (this.uiMode === 'emulator') {
-          Button(RESOLUTION_PRESETS[this.resIdx].label)
-            .height(28)
-            .fontSize(11)
-            .backgroundColor('#374151')
-            .enabled(!this.running)
-            .onClick(() => { this.cycleResolution(); })
-
-          Button(`GPU: ${this.gpuLabel()}`)
-            .height(28)
-            .fontSize(11)
-            .backgroundColor(this.gpuMode === 'vulkan' ? '#7C3AED' : '#374151')
-            .enabled(!this.running)
-            .onClick(() => { this.cycleGpuMode(); })
-
-          Button(`CPU: ${this.profile}`)
-            .height(28)
-            .fontSize(11)
-            .backgroundColor('#374151')
-            .enabled(!this.running)
-            .onClick(() => { this.cycleProfile(); })
-
-          if (this.running) {
-            Button('◀')
-              .height(28)
-              .fontSize(12)
-              .backgroundColor('#374151')
-              .onClick(() => { native.sendNavKey('back'); })
-            Button('●')
-              .height(28)
-              .fontSize(12)
-              .backgroundColor('#374151')
-              .onClick(() => { native.sendNavKey('home'); })
-            Button('■')
-              .height(28)
-              .fontSize(12)
-              .backgroundColor('#374151')
-              .onClick(() => { native.sendNavKey('recents'); })
-            Button('拆出应用')
-              .height(28)
-              .fontSize(11)
-              .backgroundColor('#0284C7')
-              .enabled(this.wmAgentReady)
-              .onClick(() => { this.handlePopOutCurrentEmulatorApp(); })
+  @Builder
+  private buildManagerView() {
+    Row() {
+      // Left Navigation Sidebar (MuMu Player Style)
+      Column({ space: 6 }) {
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.display'))
+              .fontSize(16)
+              .fontColor(['#38BDF8'])
+            Text('实例管理')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor('#F9FAFB')
           }
-        } else {
-          Button('刷新应用')
-            .height(28)
-            .fontSize(11)
-            .backgroundColor('#374151')
-            .enabled(this.wmAgentReady && !this.loadingApps)
-            .onClick(() => { this.refreshApps(true); })
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
         }
+        .width('100%')
+        .height(38)
+        .padding({ left: 12, right: 12 })
+        .borderRadius(9)
+        .backgroundColor('#1C2638')
 
-        if (this.running) {
-          Button(this.paused ? 'Resume' : 'Pause')
-            .height(28)
-            .fontSize(11)
-            .backgroundColor(this.paused ? '#10B981' : '#D97706')
-            .onClick(() => {
-              this.statusText = native.setPaused(!this.paused);
-            })
-        } else {
-          Button('启动 A14')
-            .height(28)
-            .fontSize(11)
-            .backgroundColor('#059669')
-            .onClick(() => {
-              this.launchMode('full');
-              native.setDisplayVisible(0, this.uiMode === 'emulator');
-            })
-        }
-
-        Button('停止')
-          .height(28)
-          .fontSize(11)
-          .backgroundColor('#DC2626')
-          .enabled(this.running)
-          .onClick(() => {
-            this.statusText = native.stopContainer();
-            this.appList = [];
-            this.appsFetchedOnce = false;
-          })
-      }
-      .width('100%')
-      .height(48)
-      .padding({ left: 12, right: 12 })
-      .backgroundColor('#181B22')
-      .alignItems(VerticalAlign.Center)
-
-      // Main Content Area: Free Multi-Window Launcher OR Classic Emulator Display 0
-      Stack({ alignContent: Alignment.Center }) {
-        // Keep Display 0 XComponent mounted when in emulator mode (hidden in multiwindow to save GPU)
-        if (this.uiMode === 'emulator') {
-          if (this.surfaceEpoch % 2 === 0) {
-            XComponent({
-              id: 'svbox_display_0',
-              type: XComponentType.SURFACE,
-              libraryname: 'entry'
-            })
-              .focusable(true)
-              .defaultFocus(true)
-              .width(this.computeFitWidth())
-              .height(this.computeFitHeight())
-              .backgroundColor('#000000')
-          } else {
-            XComponent({
-              id: 'svbox_android_surface_b',
-              type: XComponentType.SURFACE,
-              libraryname: 'entry'
-            })
-              .focusable(true)
-              .defaultFocus(true)
-              .width(this.computeFitWidth())
-              .height(this.computeFitHeight())
-              .backgroundColor('#000000')
-          }
-        } else {
-          // Free Multi-Window Mode: Native HarmonyOS PC App Launcher
-          Column({ space: 12 }) {
-            // Search & Filter Bar
-            Row({ space: 10 }) {
-              TextInput({ placeholder: '搜索 Android 应用名称或包名...', text: this.searchQuery })
-                .height(34)
-                .layoutWeight(1)
-                .fontSize(13)
-                .fontColor('#F3F4F6')
-                .placeholderColor('#6B7280')
-                .backgroundColor('#1A1E26')
-                .borderRadius(8)
-                .onChange((val: string) => {
-                  this.searchQuery = val;
-                })
-
-              Row({ space: 4 }) {
-                Button('全部')
-                  .height(30)
-                  .fontSize(11)
-                  .backgroundColor(this.appFilter === 'all' ? '#0284C7' : '#262B35')
-                  .onClick(() => { this.appFilter = 'all'; })
-                Button('第三方')
-                  .height(30)
-                  .fontSize(11)
-                  .backgroundColor(this.appFilter === 'user' ? '#0284C7' : '#262B35')
-                  .onClick(() => { this.appFilter = 'user'; })
-                Button('系统')
-                  .height(30)
-                  .fontSize(11)
-                  .backgroundColor(this.appFilter === 'system' ? '#0284C7' : '#262B35')
-                  .onClick(() => { this.appFilter = 'system'; })
-              }
-
-              Text(`桌面图标 ${this.pinnedIds.length}/10`)
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+              .fontSize(16)
+              .fontColor(['#9CA3AF'])
+            Text('应用中心')
+              .fontSize(13)
+              .fontColor('#D1D5DB')
+            Blank()
+            if (this.appCount > 0) {
+              Text(`${this.appCount}`)
                 .fontSize(11)
                 .fontColor('#93C5FD')
-                .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-                .backgroundColor('#172554')
-                .borderRadius(8)
-            }
-            .width('100%')
-            .alignItems(VerticalAlign.Center)
-
-            if (!this.wmAgentReady) {
-              Column({ space: 12 }) {
-                LoadingProgress()
-                  .width(42)
-                  .height(42)
-                  .color('#38BDF8')
-                Text(this.running ? 'Android 14 正在后台启动，应用列表即将就绪...' : '点击右上角「启动 A14」启动容器')
-                  .fontSize(14)
-                  .fontColor('#D1D5DB')
-                Text('单实例共享内核 · 点击任意应用即开独立鸿蒙窗口 · 支持跨应用自动弹新窗与桌面快捷方式')
-                  .fontSize(12)
-                  .fontColor('#6B7280')
-              }
-              .width('100%')
-              .layoutWeight(1)
-              .justifyContent(FlexAlign.Center)
-            } else if (this.getFilteredApps().length === 0) {
-              Column({ space: 8 }) {
-                Text(this.loadingApps ? '正在同步应用列表与图标...' : '暂无匹配应用')
-                  .fontSize(14)
-                  .fontColor('#9CA3AF')
-              }
-              .width('100%')
-              .layoutWeight(1)
-              .justifyContent(FlexAlign.Center)
-            } else {
-              Grid() {
-                ForEach(
-                  this.getFilteredApps(),
-                  (app: AndroidAppItem) => {
-                    GridItem() {
-                      Column({ space: 6 }) {
-                        // App Icon + Tap to open independent HarmonyOS window
-                        Column({ space: 6 }) {
-                          if (this.iconsDir.length > 0 && app.iconFile.length > 0) {
-                            Image(`file://${this.iconsDir}/${app.iconFile}`)
-                              .width(52)
-                              .height(52)
-                              .borderRadius(12)
-                              .objectFit(ImageFit.Contain)
-                          } else {
-                            Row() {
-                              Text(app.label.length > 0 ? app.label.substring(0, 1).toUpperCase() : 'A')
-                                .fontSize(22)
-                                .fontWeight(FontWeight.Bold)
-                                .fontColor('#F9FAFB')
-                            }
-                            .width(52)
-                            .height(52)
-                            .borderRadius(12)
-                            .backgroundColor('#1E3A8A')
-                            .justifyContent(FlexAlign.Center)
-                            .alignItems(VerticalAlign.Center)
-                          }
-
-                          Text(app.label)
-                            .fontSize(12)
-                            .fontWeight(FontWeight.Medium)
-                            .fontColor('#F3F4F6')
-                            .maxLines(1)
-                            .textOverflow({ overflow: TextOverflow.Ellipsis })
-                            .textAlign(TextAlign.Center)
-                            .width('100%')
-                        }
-                        .width('100%')
-                        .alignItems(HorizontalAlign.Center)
-                        .onClick(() => {
-                          this.openAndroidAppWindow(app.packageName, app.component, app.label, -1);
-                        })
-
-                        // Quick Action Row: Per-App Window Mode & Desktop Shortcut
-                        Row({ space: 4 }) {
-                          Button(this.getEffectiveModeLabel(app))
-                            .height(22)
-                            .fontSize(10)
-                            .padding({ left: 6, right: 6 })
-                            .backgroundColor('#272C36')
-                            .onClick(() => { this.cycleAppWindowPref(app); })
-
-                          Button(this.isAppPinned(app.packageName) ? '移桌' : '加桌')
-                            .height(22)
-                            .fontSize(10)
-                            .padding({ left: 6, right: 6 })
-                            .backgroundColor(this.isAppPinned(app.packageName) ? '#065F46' : '#1E3A8A')
-                            .onClick(() => { this.toggleDesktopShortcut(app); })
-                        }
-                        .justifyContent(FlexAlign.Center)
-                      }
-                      .width('100%')
-                      .padding(10)
-                      .backgroundColor('#161A22')
-                      .borderRadius(12)
-                      .border({ width: 1, color: '#242A36' })
-                    }
-                  },
-                  (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
-                )
-              }
-              .columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr')
-              .columnsGap(12)
-              .rowsGap(12)
-              .width('100%')
-              .layoutWeight(1)
             }
           }
           .width('100%')
-          .height('100%')
-          .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+          .alignItems(VerticalAlign.Center)
+        }
+        .width('100%')
+        .height(38)
+        .padding({ left: 12, right: 12 })
+        .borderRadius(9)
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          this.openAppsCenterPage();
+        })
+
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.phone'))
+              .fontSize(16)
+              .fontColor(['#9CA3AF'])
+            Text('传统模拟器')
+              .fontSize(13)
+              .fontColor('#D1D5DB')
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .width('100%')
+        .height(38)
+        .padding({ left: 12, right: 12 })
+        .borderRadius(9)
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          this.setUiMode('emulator');
+        })
+
+        Blank()
+
+        // Host GPU & Runtime telemetry card at bottom of sidebar
+        Column({ space: 4 }) {
+          Text('宿主引擎')
+            .fontSize(10)
+            .fontColor('#6B7280')
+          Text(this.gpuRenderer.length > 0 ? 'Maleoon 916 · Vulkan' : `GPU: ${this.gpuLabel()}`)
+            .fontSize(11)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#D1D5DB')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(`CPU ${Math.round(this.cpuPercent)}% · ${this.memMb}MB`)
+            .fontSize(10)
+            .fontColor('#9CA3AF')
+        }
+        .width('100%')
+        .padding(10)
+        .backgroundColor('#141821')
+        .borderRadius(9)
+        .border({ width: 1, color: '#202634' })
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width(176)
+      .height('100%')
+      .padding({ left: 12, right: 12, top: 14, bottom: 14 })
+      .backgroundColor('#10131A')
+      .border({ width: { right: 1 }, color: '#1E2430' })
+
+      // Right Main Area: MuMu-style Instance List
+      Column({ space: 14 }) {
+        // Section Header
+        Row() {
+          Column({ space: 2 }) {
+            Text('Android 实例列表')
+              .fontSize(16)
+              .fontWeight(600)
+              .fontColor('#F9FAFB')
+            Text('单实例共享内核 · 独立应用窗口与传统模拟器无缝共用')
+              .fontSize(12)
+              .fontColor('#6B7280')
+          }
+          .alignItems(HorizontalAlign.Start)
+
+          Blank()
+
+          // Quick global refresh rate toggle pill
+          Row({ space: 3 }) {
+            ForEach(REFRESH_RATES, (hz: number) => {
+              Button(`${hz}Hz`)
+                .height(26)
+                .fontSize(11)
+                .fontColor(this.refreshRate === hz ? '#FFFFFF' : '#9CA3AF')
+                .backgroundColor(this.refreshRate === hz ? '#0284C7' : Color.Transparent)
+                .borderRadius(6)
+                .padding({ left: 10, right: 10 })
+                .onClick(() => { this.selectRefreshRate(hz); })
+            })
+          }
+          .padding(3)
+          .backgroundColor('#161B24')
+          .borderRadius(8)
+          .border({ width: 1, color: '#242B38' })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        // Instance Card (MuMu Row Style)
+        Column({ space: 0 }) {
+          Row({ space: 14 }) {
+            // Left: Instance OS Icon Badge
+            Stack({ alignContent: Alignment.Center }) {
+              Column()
+                .width(44)
+                .height(44)
+                .borderRadius(11)
+                .backgroundColor(this.running ? '#172554' : '#1E232E')
+              SymbolGlyph($r('sys.symbol.pad_fill'))
+                .fontSize(22)
+                .fontColor([this.running ? '#38BDF8' : '#6B7280'])
+            }
+
+            // Middle: Instance Name, Status & Spec Metadata
+            Column({ space: 5 }) {
+              Row({ space: 8 }) {
+                Text('Android 14 · 默认实例')
+                  .fontSize(15)
+                  .fontWeight(600)
+                  .fontColor('#F9FAFB')
+
+                Row({ space: 5 }) {
+                  Circle({ width: 7, height: 7 })
+                    .fill(this.statusDotColor())
+                  Text(this.statusBadgeLabel())
+                    .fontSize(11)
+                    .fontColor(this.statusDotColor())
+                }
+                .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+                .backgroundColor('#1C222E')
+                .borderRadius(10)
+
+                Text('API 34')
+                  .fontSize(10)
+                  .fontColor('#9CA3AF')
+                  .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                  .backgroundColor('#1C222E')
+                  .borderRadius(5)
+              }
+              .alignItems(VerticalAlign.Center)
+
+              Text(
+                `${this.gpuLabel()} · ${this.refreshRate}Hz · 模拟器 ${RESOLUTION_PRESETS[this.resIdx].w}×${RESOLUTION_PRESETS[this.resIdx].h} · 调度 ${this.profile}` +
+                (this.running ? ` · ${this.activeProcs} 进程` : '')
+              )
+                .fontSize(12)
+                .fontColor('#9CA3AF')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            // Right: Action Buttons (100% native SymbolGlyph)
+            Row({ space: 8 }) {
+              if (!this.running) {
+                Button({ type: ButtonType.Normal }) {
+                  Row({ space: 6 }) {
+                    SymbolGlyph($r('sys.symbol.play_fill'))
+                      .fontSize(14)
+                      .fontColor(['#FFFFFF'])
+                    Text('启动')
+                      .fontSize(13)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor('#FFFFFF')
+                  }
+                }
+                .height(34)
+                .padding({ left: 16, right: 16 })
+                .borderRadius(8)
+                .backgroundColor('#059669')
+                .onClick(() => {
+                  this.launchMode('full');
+                  native.setDisplayVisible(0, false);
+                })
+              } else {
+                Button({ type: ButtonType.Normal }) {
+                  Row({ space: 6 }) {
+                    SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+                      .fontSize(14)
+                      .fontColor(['#FFFFFF'])
+                    Text('应用列表')
+                      .fontSize(13)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor('#FFFFFF')
+                  }
+                }
+                .height(34)
+                .padding({ left: 14, right: 14 })
+                .borderRadius(8)
+                .backgroundColor('#2563EB')
+                .onClick(() => {
+                  this.openAppsCenterPage();
+                })
+
+                Button({ type: ButtonType.Normal }) {
+                  Row({ space: 5 }) {
+                    SymbolGlyph($r('sys.symbol.phone'))
+                      .fontSize(14)
+                      .fontColor(['#E5E7EB'])
+                    Text('桌面')
+                      .fontSize(12)
+                      .fontColor('#E5E7EB')
+                  }
+                }
+                .height(34)
+                .padding({ left: 12, right: 12 })
+                .borderRadius(8)
+                .backgroundColor('#232A37')
+                .onClick(() => {
+                  this.setUiMode('emulator');
+                })
+
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph(this.paused ? $r('sys.symbol.play_fill') : $r('sys.symbol.pause_fill'))
+                    .fontSize(15)
+                    .fontColor([this.paused ? '#34D399' : '#FBBF24'])
+                }
+                .width(34)
+                .height(34)
+                .borderRadius(8)
+                .backgroundColor('#232A37')
+                .onClick(() => {
+                  this.statusText = native.setPaused(!this.paused);
+                })
+
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph($r('sys.symbol.stop_circle_fill'))
+                    .fontSize(16)
+                    .fontColor(['#F87171'])
+                }
+                .width(34)
+                .height(34)
+                .borderRadius(8)
+                .backgroundColor('#2A1D22')
+                .onClick(() => {
+                  this.statusText = native.stopContainer();
+                  this.appCount = 0;
+                  this.appsFetchedOnce = false;
+                  AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', []);
+                })
+              }
+
+              Button({ type: ButtonType.Normal }) {
+                SymbolGlyph($r('sys.symbol.gearshape'))
+                  .fontSize(16)
+                  .fontColor([this.showInstanceSettings ? '#38BDF8' : '#9CA3AF'])
+              }
+              .width(34)
+              .height(34)
+              .borderRadius(8)
+              .backgroundColor(this.showInstanceSettings ? '#1C2A3E' : '#232A37')
+              .onClick(() => {
+                this.showInstanceSettings = !this.showInstanceSettings;
+              })
+            }
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 16, bottom: 16 })
+          .alignItems(VerticalAlign.Center)
+
+          // Expandable Inline Instance Settings Panel
+          if (this.showInstanceSettings) {
+            Column({ space: 12 }) {
+              Divider().color('#222836')
+
+              // Resolution Presets (for Classic Emulator Display 0)
+              Row({ space: 10 }) {
+                Text('模拟器分辨率')
+                  .fontSize(12)
+                  .fontColor('#9CA3AF')
+                  .width(84)
+                Row({ space: 6 }) {
+                  ForEach(RESOLUTION_PRESETS, (item: ResolutionPresetItem, idx: number) => {
+                    Button(item.label)
+                      .height(26)
+                      .fontSize(11)
+                      .fontColor(this.resIdx === idx ? '#FFFFFF' : '#9CA3AF')
+                      .backgroundColor(this.resIdx === idx ? '#2563EB' : '#1E2430')
+                      .borderRadius(6)
+                      .padding({ left: 9, right: 9 })
+                      .enabled(!this.running)
+                      .onClick(() => { this.selectResolution(idx); })
+                  })
+                }
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+
+              // GPU & CPU Profile Row
+              Row({ space: 20 }) {
+                Row({ space: 10 }) {
+                  Text('图形引擎')
+                    .fontSize(12)
+                    .fontColor('#9CA3AF')
+                    .width(84)
+                  Row({ space: 6 }) {
+                    ForEach(['vulkan', 'gles', 'swiftshader'], (m: string) => {
+                      Button(m === 'vulkan' ? 'Vulkan' : (m === 'gles' ? 'GLES' : 'CPU'))
+                        .height(26)
+                        .fontSize(11)
+                        .fontColor(this.gpuMode === m ? '#FFFFFF' : '#9CA3AF')
+                        .backgroundColor(this.gpuMode === m ? '#7C3AED' : '#1E2430')
+                        .borderRadius(6)
+                        .padding({ left: 10, right: 10 })
+                        .enabled(!this.running)
+                        .onClick(() => { this.selectGpuMode(m); })
+                    })
+                  }
+                }
+
+                Row({ space: 10 }) {
+                  Text('性能模式')
+                    .fontSize(12)
+                    .fontColor('#9CA3AF')
+                  Row({ space: 6 }) {
+                    ForEach(['Balanced', 'Performance', 'Eco'], (p: string) => {
+                      Button(p === 'Balanced' ? '均衡' : (p === 'Performance' ? '性能' : '节能'))
+                        .height(26)
+                        .fontSize(11)
+                        .fontColor(this.profile === p ? '#FFFFFF' : '#9CA3AF')
+                        .backgroundColor(this.profile === p ? '#0284C7' : '#1E2430')
+                        .borderRadius(6)
+                        .padding({ left: 10, right: 10 })
+                        .enabled(!this.running)
+                        .onClick(() => { this.selectProfile(p); })
+                    })
+                  }
+                }
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+
+              if (this.running) {
+                Text('提示：刷新率可随时热切换；分辨率、图形引擎与性能模式需在停止实例后修改。')
+                  .fontSize(11)
+                  .fontColor('#6B7280')
+              }
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, bottom: 16 })
+            .alignItems(HorizontalAlign.Start)
+          }
+        }
+        .width('100%')
+        .backgroundColor('#151922')
+        .borderRadius(12)
+        .border({ width: 1, color: '#242B3A' })
+
+        Blank()
+
+        // Compact Footer Runtime Status Bar
+        Row({ space: 12 }) {
+          Text(this.statusText)
+            .fontSize(11)
+            .fontColor('#9CA3AF')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+
+          if (this.cpuset.length > 0 || this.topology.length > 0) {
+            Text(`CPU[${this.cpuset.length > 0 ? this.cpuset : 'all'}] · ${this.topology}`)
+              .fontSize(11)
+              .fontColor('#6B7280')
+              .maxLines(1)
+          }
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .backgroundColor('#131720')
+        .borderRadius(8)
+        .border({ width: 1, color: '#1F2532' })
+      }
+      .layoutWeight(1)
+      .height('100%')
+      .padding({ left: 18, right: 18, top: 16, bottom: 14 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+  }
+
+  @Builder
+  private buildEmulatorView() {
+    Column() {
+      // Emulator Viewport (Display 0)
+      Stack({ alignContent: Alignment.Center }) {
+        if (!this.surfaceToggle) {
+          XComponent({
+            id: 'svbox_android_surface',
+            type: XComponentType.SURFACE,
+            libraryname: 'entry'
+          })
+            .focusable(true)
+            .defaultFocus(true)
+            .width(this.computeFitWidth())
+            .height(this.computeFitHeight())
+            .backgroundColor('#000000')
+        } else {
+          XComponent({
+            id: 'svbox_android_surface_b',
+            type: XComponentType.SURFACE,
+            libraryname: 'entry'
+          })
+            .focusable(true)
+            .defaultFocus(true)
+            .width(this.computeFitWidth())
+            .height(this.computeFitHeight())
+            .backgroundColor('#000000')
         }
       }
       .width('100%')
       .layoutWeight(1)
-      .backgroundColor('#0D0F14')
+      .backgroundColor('#0B0D12')
       .onAreaChange((_oldVal: Area, newVal: Area) => {
         const w: number = Number(newVal.width);
         const h: number = Number(newVal.height);
@@ -865,30 +895,150 @@ struct Index {
         }
       })
 
-      // Bottom Status Bar
-      Row({ space: 12 }) {
-        Text(this.statusText)
-          .fontSize(11)
-          .fontColor('#9CA3AF')
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-
-        if (this.cpuset.length > 0 || this.topology.length > 0 || this.gpuRenderer.length > 0) {
-          Text(`${this.gpuRenderer.length > 0 ? this.gpuRenderer + ' · ' : ''}CPU[${this.cpuset.length > 0 ? this.cpuset : 'all'}] · ${this.topology} · ${this.activeProcs} procs`)
-            .fontSize(11)
-            .fontColor('#6B7280')
-            .maxLines(1)
+      // Clean Android Nav Dock (100% HarmonyOS SymbolGlyph)
+      Row({ space: 20 }) {
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(17)
+            .fontColor(['#E5E7EB'])
         }
+        .width(42)
+        .height(30)
+        .borderRadius(7)
+        .backgroundColor('#1F2530')
+        .onClick(() => { native.sendNavKey('back'); })
+
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.house'))
+            .fontSize(16)
+            .fontColor(['#E5E7EB'])
+        }
+        .width(42)
+        .height(30)
+        .borderRadius(7)
+        .backgroundColor('#1F2530')
+        .onClick(() => { native.sendNavKey('home'); })
+
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.rectangle_on_rectangle'))
+            .fontSize(15)
+            .fontColor(['#E5E7EB'])
+        }
+        .width(42)
+        .height(30)
+        .borderRadius(7)
+        .backgroundColor('#1F2530')
+        .onClick(() => { native.sendNavKey('recents'); })
       }
       .width('100%')
-      .height(28)
-      .padding({ left: 14, right: 14 })
-      .backgroundColor('#181B22')
+      .height(42)
+      .backgroundColor('#13161D')
+      .border({ width: { top: 1 }, color: '#222733' })
+      .justifyContent(FlexAlign.Center)
       .alignItems(VerticalAlign.Center)
     }
     .width('100%')
+    .layoutWeight(1)
+  }
+
+  build() {
+    Column() {
+      // Single Integrated HarmonyOS PC Title Bar (44vp, native 3-button avoidance)
+      Row({ space: 10 }) {
+        if (this.uiMode === 'emulator') {
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: 4 }) {
+              SymbolGlyph($r('sys.symbol.chevron_left'))
+                .fontSize(15)
+                .fontColor(['#E5E7EB'])
+              Text('实例管理')
+                .fontSize(12)
+                .fontColor('#E5E7EB')
+            }
+          }
+          .height(28)
+          .padding({ left: 8, right: 10 })
+          .borderRadius(7)
+          .backgroundColor('#1E2430')
+          .onClick(() => {
+            this.setUiMode('manager');
+          })
+
+          Text(`传统模拟器 · ${this.dispW}×${this.dispH} · ${this.fps}/${this.refreshRate}Hz`)
+            .fontSize(12)
+            .fontColor('#9CA3AF')
+            .maxLines(1)
+
+          Blank()
+
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: 5 }) {
+              SymbolGlyph($r('sys.symbol.arrow_up_right'))
+                .fontSize(13)
+                .fontColor(['#FFFFFF'])
+              Text('拆出独立窗')
+                .fontSize(12)
+                .fontColor('#FFFFFF')
+            }
+          }
+          .height(28)
+          .padding({ left: 10, right: 10 })
+          .borderRadius(7)
+          .backgroundColor('#0284C7')
+          .enabled(this.wmAgentReady)
+          .onClick(() => {
+            this.handlePopOutCurrentEmulatorApp();
+          })
+        } else {
+          Row({ space: 8 }) {
+            SymbolGlyph($r('sys.symbol.pad_fill'))
+              .fontSize(17)
+              .fontColor(['#38BDF8'])
+            Text('svbox Android')
+              .fontSize(14)
+              .fontWeight(600)
+              .fontColor('#F9FAFB')
+            Text('Android 14')
+              .fontSize(10)
+              .fontColor('#93C5FD')
+              .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+              .backgroundColor('#172554')
+              .borderRadius(5)
+          }
+          .alignItems(VerticalAlign.Center)
+
+          Blank()
+
+          if (this.running) {
+            Row({ space: 5 }) {
+              SymbolGlyph($r('sys.symbol.bolt_fill'))
+                .fontSize(12)
+                .fontColor(['#34D399'])
+              Text(`${this.refreshRate}Hz`)
+                .fontSize(11)
+                .fontColor('#D1D5DB')
+            }
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .backgroundColor('#1A202C')
+            .borderRadius(6)
+          }
+        }
+      }
+      .width('100%')
+      .height(44)
+      .padding({ left: 14, right: this.decorRightAvoidVp })
+      .backgroundColor('#13161D')
+      .border({ width: { bottom: 1 }, color: '#222733' })
+      .alignItems(VerticalAlign.Center)
+
+      if (this.uiMode === 'emulator') {
+        this.buildEmulatorView()
+      } else {
+        this.buildManagerView()
+      }
+    }
+    .width('100%')
     .height('100%')
-    .backgroundColor('#0D0F14')
+    .backgroundColor('#0E1117')
   }
 }

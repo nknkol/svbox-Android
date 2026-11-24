@@ -1344,6 +1344,46 @@ def main() -> None:
         "}\n",
         "VkEmulation::createSecondaryDisplay impl",
     )
+    patch_file(
+        vkops_cpp,
+        "    if (x != 0 || y != 0 || w != colorBufferInfo->imageCreateInfoShallow.extent.width ||\n"
+        "        h != colorBufferInfo->imageCreateInfoShallow.extent.height) {\n"
+        "        ERR(\"Failed to read from ColorBuffer:%d, unhandled subrect.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n\n"
+        "    VkDeviceSize bufferCopySize = 0;\n"
+        "    std::vector<VkBufferImageCopy> bufferImageCopies;\n"
+        "    if (!getFormatTransferInfo(colorBufferInfo->imageCreateInfoShallow.format,\n"
+        "                               colorBufferInfo->imageCreateInfoShallow.extent.width,\n"
+        "                               colorBufferInfo->imageCreateInfoShallow.extent.height,\n"
+        "                               &bufferCopySize, &bufferImageCopies)) {\n"
+        "        ERR(\"Failed to read ColorBuffer:%d, unable to get transfer info.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n",
+        "    const uint32_t extW = colorBufferInfo->imageCreateInfoShallow.extent.width;\n"
+        "    const uint32_t extH = colorBufferInfo->imageCreateInfoShallow.extent.height;\n"
+        "    const bool isSubrect = (x != 0 || y != 0 || w != extW || h != extH);\n"
+        "    if (w == 0 || h == 0 || x + w > extW || y + h > extH) {\n"
+        "        ERR(\"Failed to read from ColorBuffer:%d, out-of-bounds subrect.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n\n"
+        "    VkDeviceSize bufferCopySize = 0;\n"
+        "    std::vector<VkBufferImageCopy> bufferImageCopies;\n"
+        "    if (!getFormatTransferInfo(colorBufferInfo->imageCreateInfoShallow.format, w, h,\n"
+        "                               &bufferCopySize, &bufferImageCopies)) {\n"
+        "        ERR(\"Failed to read ColorBuffer:%d, unable to get transfer info.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n"
+        "    if (isSubrect) {\n"
+        "        if (bufferImageCopies.size() != 1) {\n"
+        "            ERR(\"Failed to read from ColorBuffer:%d, unhandled multi-plane subrect.\", colorBufferHandle);\n"
+        "            return false;\n"
+        "        }\n"
+        "        bufferImageCopies[0].imageOffset.x = static_cast<int32_t>(x);\n"
+        "        bufferImageCopies[0].imageOffset.y = static_cast<int32_t>(y);\n"
+        "    }\n",
+        "VkEmulation::readColorBufferToBytesLocked single-plane subrect support",
+    )
 
 
 if __name__ == "__main__":

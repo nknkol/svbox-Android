@@ -39,6 +39,7 @@ typedef struct SvboxGfxDisplayStats {
     uint32_t lastCb;
     uint64_t framesPosted;
     int32_t fps;
+    uint32_t topBarColor; /* 0xAARRGGBB sampled from top edge (0 if unavailable) */
 } SvboxGfxDisplayStats;
 
 /* Initialize gfxstream host renderer and start AF_UNIX pipe server on sockPath.

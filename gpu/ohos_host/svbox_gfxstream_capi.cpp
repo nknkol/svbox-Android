@@ -127,7 +127,9 @@ struct SecondaryDisplaySlot {
     std::atomic<bool> visible{true};
     std::atomic<uint64_t> framesPosted{0};
     std::atomic<int32_t> fps{0};
+    std::atomic<uint32_t> topBarColor{0};
     std::chrono::steady_clock::time_point fpsWindowStart;
+    std::chrono::steady_clock::time_point lastColorSample;
     int32_t fpsFrames = 0;
 };
 
@@ -947,6 +949,7 @@ void svbox_gfx_clear_display_window(int32_t displaySlot) {
     sec.fbW = 0;
     sec.fbH = 0;
     sec.fps.store(0);
+    sec.topBarColor.store(0);
 }
 
 void svbox_gfx_set_display_visible(int32_t displaySlot, int visible) {
@@ -1032,6 +1035,40 @@ int svbox_gfx_present_cb(int32_t displaySlot, uint32_t cbHandle, int32_t width, 
                 GFX_LOGI("slot %d: presented frame #%llu (cb=0x%x, %dx%d)",
                          displaySlot, static_cast<unsigned long long>(total), cbHandle, sec.fbW, sec.fbH);
             }
+            // Periodic 1-scanline top-edge color sample for immersive titlebar tinting
+            auto colorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now - sec.lastColorSample).count();
+            if (sec.fbW >= 32 && sec.fbH >= 16 &&
+                (total == 2 || total == 10 || total == 25 || colorMs >= 450)) {
+                sec.lastColorSample = now;
+                const uint32_t rowBytes = static_cast<uint32_t>(sec.fbW) * 4u;
+                std::vector<uint8_t> row(rowBytes, 0);
+                fb->readColorBuffer(cbHandle, 0, 4, sec.fbW, 1, 0x1908 /*GL_RGBA*/,
+                                    0x1401 /*GL_UNSIGNED_BYTE*/, row.data(), rowBytes);
+                uint8_t rs[16], gs[16], bs[16];
+                int cnt = 0;
+                for (int k = 0; k < 16; ++k) {
+                    int x = ((k + 1) * sec.fbW) / 17;
+                    if (x < 0) x = 0;
+                    if (x >= sec.fbW) x = sec.fbW - 1;
+                    const uint8_t* px = row.data() + x * 4;
+                    if (px[3] >= 16) {
+                        rs[cnt] = px[0];
+                        gs[cnt] = px[1];
+                        bs[cnt] = px[2];
+                        cnt++;
+                    }
+                }
+                if (cnt > 0) {
+                    std::sort(rs, rs + cnt);
+                    std::sort(gs, gs + cnt);
+                    std::sort(bs, bs + cnt);
+                    uint32_t r = rs[cnt / 2];
+                    uint32_t g = gs[cnt / 2];
+                    uint32_t b = bs[cnt / 2];
+                    sec.topBarColor.store(0xFF000000u | (r << 16) | (g << 8) | b);
+                }
+            }
             return 0;
         }
     }
@@ -1069,6 +1106,7 @@ void svbox_gfx_get_display_stats(int32_t displaySlot, SvboxGfxDisplayStats* outS
         sec.fps.store(0);
     }
     outStats->fps = sec.fps.load();
+    outStats->topBarColor = sec.topBarColor.load();
 }
 
 int svbox_gfx_read_display_rgba(int32_t displaySlot, void* outRgba, uint32_t bufBytes,

@@ -491,6 +491,7 @@ napi_value GetDisplayStatsNapi(napi_env env, napi_callback_info info) {
     setI32("height", ds.height);
     setI64("framesPosted", static_cast<int64_t>(ds.framesPosted));
     setI32("fps", ds.fps);
+    setI64("topBarColor", static_cast<int64_t>(ds.topBarColor));
     return obj;
 }
 

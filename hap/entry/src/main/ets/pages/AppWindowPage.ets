@@ -1,17 +1,23 @@
-import { common, Want } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { window } from '@kit.ArkUI';
 import native, { DisplayStats, RuntimeStatus } from 'libentry.so';
 import {
   AndroidAppItem,
   AppWindowPref,
   appWindowPrefs,
+  computeAdaptiveDpi,
   computeDpiForSize,
   findPresetByKey,
-  REFRESH_RATES,
-  RESOLUTION_PRESETS,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
-import { pinAndroidAppToDesktop, ShortcutOpResult } from '../common/DesktopShortcut';
+import {
+  applyMissionIconAndQuickBar,
+  argbToHex,
+  getSlotWindow,
+  isColorDark,
+  updateDecorButtonTheme
+} from '../common/WindowHelper';
 
 const TAG: string = 'SvboxAppPage';
 
@@ -32,8 +38,10 @@ struct AppWindowPage {
   @LocalStorageProp('relaunchSeq') @Watch('onRelaunchSeq') relaunchSeq: number = 0;
   @LocalStorageProp('sandboxTempDir') sandboxTempDir: string = '';
   @LocalStorageProp('sandboxFilesDir') sandboxFilesDir: string = '';
-  @LocalStorageProp('winPxW') @Watch('onWindowSizeChanged') winPxW: number = 640;
-  @LocalStorageProp('winPxH') @Watch('onWindowSizeChanged') winPxH: number = 920;
+  @LocalStorageProp('winPxW') @Watch('onWindowSizeChanged') winPxW: number = 860;
+  @LocalStorageProp('winPxH') @Watch('onWindowSizeChanged') winPxH: number = 1380;
+  @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 136;
+  @LocalStorageProp('iconSetupStarted') iconSetupStarted: boolean = false;
 
   @State private winMode: string = 'adaptive';
   @State private presetKey: string = '720x1280';
@@ -44,24 +52,19 @@ struct AppWindowPage {
   @State private stageVpH: number = 0;
   @State private stageReady: boolean = false;
   @State private ready: boolean = false;
-  @State private fps: number = 0;
-  @State private frames: number = 0;
-  @State private bannerText: string = '正在初始化 Android 14 独立窗口...';
+  @State private bannerText: string = '正在初始化 Android 14 应用窗口...';
   @State private iconUri: string = '';
+  @State private topBarHex: string = '#161920';
+  @State private isDarkBar: boolean = true;
 
   private bootPollTimer: number = -1;
   private resizeDebounceTimer: number = -1;
   private displayCreated: boolean = false;
+  private iconApplied: boolean = false;
+  private lastSampledArgb: number = 0;
   private curAppMeta: AndroidAppItem | undefined = undefined;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
   private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
-
-  private showToast(msg: string): void {
-    try {
-      this.getUIContext().getPromptAction().showToast({ message: msg, duration: 2000 });
-    } catch (_e) {
-    }
-  }
 
   private lookupAppMeta(): AndroidAppItem | undefined {
     const cached: AndroidAppItem[] | undefined = AppStorage.get<AndroidAppItem[]>('androidApps');
@@ -76,8 +79,8 @@ struct AppWindowPage {
   }
 
   private computeAdaptiveTargetSize(): number[] {
-    let physW: number = 720;
-    let physH: number = 1080;
+    let physW: number = 860;
+    let physH: number = 1300;
     if (this.stageVpW > 100 && this.stageVpH > 100) {
       try {
         const uiCtx = this.getUIContext();
@@ -89,12 +92,12 @@ struct AppWindowPage {
       }
     } else if (this.winPxW > 200 && this.winPxH > 260) {
       physW = this.winPxW;
-      physH = Math.max(320, this.winPxH - 160);
+      physH = Math.max(320, this.winPxH - 80);
     }
 
-    // Uniform scale down only if longer side exceeds 1600px, preserving exact 1:1 aspect ratio
+    // Uniform scale down only if longer side exceeds 2400px, keeping 1:1 aspect ratio
     const maxSide: number = Math.max(physW, physH);
-    const scale: number = maxSide > 1600 ? (1600 / maxSide) : 1.0;
+    const scale: number = maxSide > 2400 ? (2400 / maxSide) : 1.0;
     let targetW: number = Math.max(320, Math.round(physW * scale));
     let targetH: number = Math.max(320, Math.round(physH * scale));
     targetW = targetW - (targetW % 2);
@@ -127,6 +130,16 @@ struct AppWindowPage {
     const iconsDir: string = native.getIconsDir();
     if (iconsDir.length > 0 && this.androidPkg.length > 0) {
       this.iconUri = `file://${iconsDir}/${this.androidPkg}.png`;
+      if (!this.iconApplied && !this.iconSetupStarted) {
+        const win: window.Window | undefined = getSlotWindow(this.displaySlot);
+        const ctx: common.UIAbilityContext | undefined =
+          this.getUIContext().getHostContext() as common.UIAbilityContext;
+        if (win && ctx) {
+          this.iconApplied = true;
+          const label: string = this.androidLabel.length > 0 ? this.androidLabel : this.androidPkg;
+          applyMissionIconAndQuickBar(ctx, win, this.androidPkg, label, `${iconsDir}/${this.androidPkg}.png`);
+        }
+      }
     }
   }
 
@@ -135,8 +148,8 @@ struct AppWindowPage {
       mode: this.winMode,
       presetKey: this.presetKey,
       refreshRate: this.curHz,
-      winW: this.winPxW > 200 ? this.winPxW : 640,
-      winH: this.winPxH > 200 ? this.winPxH : 920,
+      winW: this.winPxW > 200 ? this.winPxW : 860,
+      winH: this.winPxH > 200 ? this.winPxH : 1380,
     });
   }
 
@@ -147,7 +160,7 @@ struct AppWindowPage {
     } catch (_e) {
     }
 
-    // Support direct cold-launch from HarmonyOS desktop shortcut even if EntryAbility isn't running yet
+    // Direct cold-launch from HarmonyOS desktop shortcut even if EntryAbility isn't running yet
     const st: RuntimeStatus = native.getStatus();
     if (!st.running) {
       this.bannerText = `正在启动 Android 14 并打开「${this.androidLabel}」...`;
@@ -165,7 +178,7 @@ struct AppWindowPage {
 
     this.bootPollTimer = setInterval(() => {
       this.tickStatus();
-    }, 400);
+    }, 350);
     this.tickStatus();
   }
 
@@ -177,6 +190,20 @@ struct AppWindowPage {
     if (this.resizeDebounceTimer !== -1) {
       clearTimeout(this.resizeDebounceTimer);
       this.resizeDebounceTimer = -1;
+    }
+  }
+
+  private applySampledTopColor(argb: number): void {
+    if (argb === 0 || argb === this.lastSampledArgb) return;
+    this.lastSampledArgb = argb;
+    const hex: string = argbToHex(argb);
+    const dark: boolean = isColorDark(argb);
+    this.topBarHex = hex;
+    hilog.info(0x0000, TAG, 'immersive topBar slot=%{public}d color=%{public}s dark=%{public}d',
+      this.displaySlot, hex, dark ? 1 : 0);
+    if (dark !== this.isDarkBar) {
+      this.isDarkBar = dark;
+      updateDecorButtonTheme(getSlotWindow(this.displaySlot), dark);
     }
   }
 
@@ -200,11 +227,12 @@ struct AppWindowPage {
         return;
       }
       const ds: DisplayStats = native.getDisplayStats(this.displaySlot);
-      this.frames = ds.framesPosted;
-      this.fps = ds.fps;
       if (ds.width > 0 && ds.height > 0 && this.winMode === 'adaptive') {
         this.dispW = ds.width;
         this.dispH = ds.height;
+      }
+      if (ds.topBarColor && ds.topBarColor !== 0) {
+        this.applySampledTopColor(ds.topBarColor);
       }
     } catch (_e) {
     }
@@ -213,8 +241,10 @@ struct AppWindowPage {
   private async createAndLaunchDisplay(): Promise<void> {
     if (this.displayCreated || this.displaySlot < 1) return;
     this.displayCreated = true;
-    const dpi: number = computeDpiForSize(this.dispW, this.dispH);
-    this.bannerText = `正在创建独立屏幕 #${this.displaySlot} (${this.dispW}×${this.dispH}@${this.curHz}Hz)...`;
+    const dpi: number = this.winMode === 'adaptive'
+      ? computeAdaptiveDpi(this.dispW, this.dispH)
+      : computeDpiForSize(this.dispW, this.dispH);
+    this.bannerText = `正在打开「${this.androidLabel}」...`;
     try {
       const createJson: string = await native.wmRpcAsync(
         `CREATE_DISPLAY ${this.displaySlot} ${this.dispW} ${this.dispH} ${dpi} ${this.curHz} ${this.androidPkg}`
@@ -274,7 +304,7 @@ struct AppWindowPage {
     const targetW: number = sz[0];
     const targetH: number = sz[1];
     if (Math.abs(targetW - this.dispW) < 4 && Math.abs(targetH - this.dispH) < 4) return;
-    const dpi: number = computeDpiForSize(targetW, targetH);
+    const dpi: number = computeAdaptiveDpi(targetW, targetH);
     this.dispW = targetW;
     this.dispH = targetH;
     try {
@@ -283,11 +313,34 @@ struct AppWindowPage {
     }
   }
 
-  private async applyFixedPreset(key: string): Promise<void> {
-    const preset: ResolutionPresetItem = findPresetByKey(key);
+  private async toggleOrientation(): Promise<void> {
+    const win: window.Window | undefined = getSlotWindow(this.displaySlot);
+    const isLandscapeNow: boolean = this.dispW > this.dispH;
+    if (this.winMode === 'adaptive') {
+      const targetWinW: number = isLandscapeNow ? 860 : 1480;
+      const targetWinH: number = isLandscapeNow ? 1380 : 940;
+      if (win) {
+        try {
+          await win.resize(targetWinW, targetWinH);
+        } catch (_e) {
+        }
+      }
+      return;
+    }
+
+    // Fixed mode: switch between fixed_portrait (720x1280) and fixed_landscape (1280x720)
+    const nextKey: string = isLandscapeNow ? '720x1280' : '1280x720';
+    this.winMode = isLandscapeNow ? 'fixed_portrait' : 'fixed_landscape';
+    const preset: ResolutionPresetItem = findPresetByKey(nextKey);
     this.presetKey = preset.key;
     this.dispW = preset.w;
     this.dispH = preset.h;
+    if (win) {
+      try {
+        await win.resize(isLandscapeNow ? 860 : 1480, isLandscapeNow ? 1380 : 940);
+      } catch (_e) {
+      }
+    }
     this.persistPref();
     if (this.ready && this.displaySlot >= 1) {
       const dpi: number = computeDpiForSize(preset.w, preset.h);
@@ -298,99 +351,11 @@ struct AppWindowPage {
     }
   }
 
-  private cycleWindowMode(): void {
-    if (this.winMode === 'adaptive') {
-      this.winMode = 'fixed_portrait';
-      this.applyFixedPreset('720x1280');
-      this.showToast('已切换为固定竖屏 (720×1280)');
-    } else if (this.winMode === 'fixed_portrait') {
-      this.winMode = 'fixed_landscape';
-      this.applyFixedPreset('1280x720');
-      this.showToast('已切换为固定横屏 (1280×720)');
-    } else {
-      this.winMode = 'adaptive';
-      this.persistPref();
-      this.applyAdaptiveResize();
-      this.showToast('已切换为自适应窗口实时重排');
-    }
-  }
-
-  private cycleFixedPreset(): void {
-    let curIdx: number = 0;
-    for (let i: number = 0; i < RESOLUTION_PRESETS.length; i++) {
-      if (RESOLUTION_PRESETS[i].key === this.presetKey) {
-        curIdx = i;
-        break;
-      }
-    }
-    const next: ResolutionPresetItem = RESOLUTION_PRESETS[(curIdx + 1) % RESOLUTION_PRESETS.length];
-    this.winMode = next.w > next.h ? 'fixed_landscape' : 'fixed_portrait';
-    this.applyFixedPreset(next.key);
-    this.showToast(`分辨率已切至 ${next.label}`);
-  }
-
-  private cycleRefreshRate(): void {
-    const idx: number = REFRESH_RATES.indexOf(this.curHz);
-    this.curHz = REFRESH_RATES[(idx + 1) % REFRESH_RATES.length];
-    this.persistPref();
-    try {
-      native.setDisplayRefreshRate(this.displaySlot, this.curHz);
-    } catch (_e) {
-    }
-    this.showToast(`窗口刷新率: ${this.curHz}Hz`);
-  }
-
-  private async handlePinToDesktop(): Promise<void> {
-    const iconsDir: string = native.getIconsDir();
-    const iconPath: string = `${iconsDir}/${this.androidPkg}.png`;
-    const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    const item: AndroidAppItem = this.curAppMeta ?? {
-      packageName: this.androidPkg,
-      component: this.androidComp,
-      label: this.androidLabel,
-      iconFile: `${this.androidPkg}.png`,
-      resizeable: this.winMode === 'adaptive',
-      isGame: false,
-      isSystem: false,
-      orientation: -1,
-      defaultMode: this.winMode,
-    };
-    const res: ShortcutOpResult = await pinAndroidAppToDesktop(ctx, item, iconPath);
-    this.showToast(res.message);
-  }
-
-  private async handlePullBackToEmulator(): Promise<void> {
-    try {
-      await native.wmRpcAsync(`PULL_BACK_TO_EMULATOR ${this.displaySlot}`);
-      const storage: LocalStorage | undefined = this.getUIContext().getSharedLocalStorage();
-      if (storage) {
-        storage.setOrCreate<boolean>('pulledBack', true);
-      }
-      AppStorage.setOrCreate<string>('requestedUiMode', 'emulator');
-      const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const want: Want = {
-        bundleName: 'org.svbox.android',
-        moduleName: 'entry',
-        abilityName: 'EntryAbility',
-        parameters: { 'uiMode': 'emulator' }
-      };
-      ctx.startAbility(want).catch((_err: Error) => {});
-      ctx.terminateSelf().catch((_err: Error) => {});
-    } catch (_e) {
-    }
-  }
-
-  private modeBadgeLabel(): string {
-    if (this.winMode === 'adaptive') return '自适应';
-    if (this.winMode === 'fixed_landscape') return '固定横';
-    return '固定竖';
-  }
-
   private computeFitWidth(): number {
     if (!this.stageReady || this.stageVpW <= 0 || this.stageVpH <= 0) {
       return 120;
     }
-    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.98;
+    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.99;
     const padW: number = Math.max(120, this.stageVpW * scaleFactor);
     const padH: number = Math.max(120, this.stageVpH * scaleFactor);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
@@ -404,7 +369,7 @@ struct AppWindowPage {
     if (!this.stageReady || this.stageVpW <= 0 || this.stageVpH <= 0) {
       return 120;
     }
-    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.98;
+    const scaleFactor: number = this.winMode === 'adaptive' ? 1.0 : 0.99;
     const padW: number = Math.max(120, this.stageVpW * scaleFactor);
     const padH: number = Math.max(120, this.stageVpH * scaleFactor);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
@@ -414,24 +379,41 @@ struct AppWindowPage {
     return Math.max(120, Math.round(padW / aspect));
   }
 
+  private titleInkColor(): string {
+    return this.isDarkBar ? '#F3F4F6' : '#181C24';
+  }
+
+  private buttonHoverBg(): string {
+    return this.isDarkBar ? '#1FFFFFFF' : '#14000000';
+  }
+
   build() {
     Column() {
-      // Compact HarmonyOS PC native chrome bar for single-app window
+      // Single Immersive System-Integrated Title Bar (38vp, dynamically tinted to Android app top bar)
       Row({ space: 6 }) {
-        Button('◀')
-          .height(26)
-          .fontSize(11)
-          .backgroundColor('#272C36')
-          .onClick(() => {
-            if (this.ready) {
-              native.wmRpcAsync(`SEND_KEY ${this.displaySlot} 4`);
-            }
-          })
+        // Back button (native HarmonyOS SymbolGlyph)
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(16)
+            .fontColor([this.titleInkColor()])
+        }
+        .width(28)
+        .height(28)
+        .borderRadius(6)
+        .backgroundColor(Color.Transparent)
+        .stateStyles({
+          pressed: { .backgroundColor(this.buttonHoverBg()) }
+        })
+        .onClick(() => {
+          if (this.ready) {
+            native.wmRpcAsync(`SEND_KEY ${this.displaySlot} 4`);
+          }
+        })
 
         if (this.iconUri.length > 0) {
           Image(this.iconUri)
-            .width(20)
-            .height(20)
+            .width(18)
+            .height(18)
             .borderRadius(4)
             .objectFit(ImageFit.Contain)
         }
@@ -439,67 +421,35 @@ struct AppWindowPage {
         Text(this.androidLabel.length > 0 ? this.androidLabel : this.androidPkg)
           .fontSize(13)
           .fontWeight(FontWeight.Medium)
-          .fontColor('#F3F4F6')
+          .fontColor(this.titleInkColor())
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 160 })
-
-        Text(`${this.dispW}×${this.dispH} · ${this.fps}/${this.curHz}Hz`)
-          .fontSize(10)
-          .fontColor('#9CA3AF')
-          .padding({ left: 6, right: 6, top: 3, bottom: 3 })
-          .backgroundColor('#1F242D')
-          .borderRadius(4)
-          .maxLines(1)
+          .constraintSize({ maxWidth: 220 })
 
         Blank()
 
-        Button(this.modeBadgeLabel())
-          .height(26)
-          .fontSize(11)
-          .backgroundColor(this.winMode === 'adaptive' ? '#0284C7' : '#4B5563')
-          .onClick(() => {
-            this.cycleWindowMode();
-          })
-
-        if (this.winMode !== 'adaptive') {
-          Button(findPresetByKey(this.presetKey).label)
-            .height(26)
-            .fontSize(10)
-            .backgroundColor('#374151')
-            .onClick(() => {
-              this.cycleFixedPreset();
-            })
+        // Single Portrait/Landscape toggle button placed directly left of system 3-button area
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.screen_rotation'))
+            .fontSize(16)
+            .fontColor([this.titleInkColor()])
         }
-
-        Button(`${this.curHz}Hz`)
-          .height(26)
-          .fontSize(11)
-          .backgroundColor(this.curHz === 120 ? '#059669' : (this.curHz === 90 ? '#0284C7' : '#374151'))
-          .onClick(() => {
-            this.cycleRefreshRate();
-          })
-
-        Button('加桌')
-          .height(26)
-          .fontSize(11)
-          .backgroundColor('#374151')
-          .onClick(() => {
-            this.handlePinToDesktop();
-          })
-
-        Button('收回')
-          .height(26)
-          .fontSize(11)
-          .backgroundColor('#374151')
-          .onClick(() => {
-            this.handlePullBackToEmulator();
-          })
+        .width(28)
+        .height(28)
+        .borderRadius(6)
+        .backgroundColor(Color.Transparent)
+        .stateStyles({
+          pressed: { .backgroundColor(this.buttonHoverBg()) }
+        })
+        .onClick(() => {
+          this.toggleOrientation();
+        })
       }
       .width('100%')
-      .height(40)
-      .padding({ left: 10, right: 10 })
-      .backgroundColor('#161920')
+      .height(38)
+      .padding({ left: 8, right: this.decorRightAvoidVp })
+      .backgroundColor(this.topBarHex)
+      .animation({ duration: 220, curve: Curve.EaseOut })
       .alignItems(VerticalAlign.Center)
 
       // Zero-copy Vulkan surface viewport for this Android VirtualDisplay
@@ -518,8 +468,8 @@ struct AppWindowPage {
         if (!this.ready || this.bannerText.length > 0) {
           Column({ space: 10 }) {
             LoadingProgress()
-              .width(36)
-              .height(36)
+              .width(34)
+              .height(34)
               .color('#38BDF8')
             Text(this.bannerText.length > 0 ? this.bannerText : '正在渲染...')
               .fontSize(13)
@@ -532,7 +482,8 @@ struct AppWindowPage {
       }
       .width('100%')
       .layoutWeight(1)
-      .backgroundColor('#0B0D12')
+      .backgroundColor(this.topBarHex)
+      .animation({ duration: 220, curve: Curve.EaseOut })
       .onAreaChange((_oldVal: Area, newVal: Area) => {
         const w: number = Number(newVal.width);
         const h: number = Number(newVal.height);
@@ -556,6 +507,6 @@ struct AppWindowPage {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#0B0D12')
+    .backgroundColor(this.topBarHex)
   }
 }

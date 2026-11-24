@@ -31,6 +31,7 @@ export interface DisplayStats {
   height: number;
   framesPosted: number;
   fps: number;
+  topBarColor: number;
 }
 
 export const startContainer: (

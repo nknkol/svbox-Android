@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 import native from 'libentry.so';
+import { applyImmersiveDecor } from '../common/WindowHelper';
 
 const TAG = 'SvboxAndroid';
 
@@ -155,6 +156,11 @@ export default class EntryAbility extends UIAbility {
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
         hilog.error(0x0000, TAG, 'Failed to load Index: %{public}s', JSON.stringify(err));
+        return;
+      }
+      if (this.mainWindow) {
+        const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 44, true);
+        AppStorage.setOrCreate<number>('mainDecorRightAvoidVp', rightAvoid);
       }
     });
   }

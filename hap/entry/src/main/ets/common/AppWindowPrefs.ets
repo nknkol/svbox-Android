@@ -55,11 +55,17 @@ export function computeDpiForSize(w: number, h: number): number {
   if (w === 1280 && h === 720) return 240;
   if (w === 1600 && h === 900) return 280;
   if (w === 1920 && h === 1080) return 320;
-  const shortSide: number = Math.min(w, h);
-  let dpi: number = Math.floor((shortSide * 280) / 720);
-  if (dpi < 160) dpi = 160;
-  if (dpi > 480) dpi = 480;
-  return dpi;
+  return computeAdaptiveDpi(w, h);
+}
+
+/**
+ * Fixed PC-style desktop density for freeform adaptive windows.
+ * Keeping DPI constant (~240 dpi) means resizing a window larger expands Android's
+ * logical dp workspace (triggering sw600dp+ Tablet/PC dual-pane layouts) rather than
+ * magnifying phone UI.
+ */
+export function computeAdaptiveDpi(_w: number, _h: number): number {
+  return 240;
 }
 
 export function computeShortcutId(pkg: string): string {
@@ -92,12 +98,12 @@ export function defaultPrefForApp(app: AndroidAppItem | undefined, globalHz: num
   const mode: string = app ? app.defaultMode : 'adaptive';
   const hz: number = (globalHz === 60 || globalHz === 90 || globalHz === 120) ? globalHz : 60;
   if (mode === 'fixed_landscape') {
-    return { mode: 'fixed_landscape', presetKey: '1280x720', refreshRate: hz, winW: 1600, winH: 980 };
+    return { mode: 'fixed_landscape', presetKey: '1280x720', refreshRate: hz, winW: 1480, winH: 940 };
   }
   if (mode === 'fixed_portrait') {
-    return { mode: 'fixed_portrait', presetKey: '720x1280', refreshRate: hz, winW: 900, winH: 1520 };
+    return { mode: 'fixed_portrait', presetKey: '720x1280', refreshRate: hz, winW: 860, winH: 1380 };
   }
-  return { mode: 'adaptive', presetKey: '720x1280', refreshRate: hz, winW: 960, winH: 1440 };
+  return { mode: 'adaptive', presetKey: '720x1280', refreshRate: hz, winW: 860, winH: 1380 };
 }
 
 interface PrefRecordEntry {
