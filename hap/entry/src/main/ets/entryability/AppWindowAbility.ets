@@ -90,14 +90,9 @@ export default class AppWindowAbility extends UIAbility {
     try {
       const win: window.Window = windowStage.getMainWindowSync();
       this.mainWindow = win;
-      const label: string = this.localStorage.get<string>('androidLabel') ?? this.androidPkg;
       const globalHz: number = AppStorage.get<number>('refreshRate') ?? 60;
       const pref: AppWindowPref = appWindowPrefs.getPref(this.context.filesDir, this.androidPkg, undefined, globalHz);
 
-      try {
-        win.setWindowTitle(label);
-      } catch (_e) {
-      }
       try {
         win.resize(pref.winW, pref.winH);
       } catch (_e) {
@@ -130,6 +125,12 @@ export default class AppWindowAbility extends UIAbility {
     windowStage.loadContent('pages/AppWindowPage', this.localStorage, (err) => {
       if (err.code) {
         hilog.error(0x0000, TAG, 'Failed to load AppWindowPage: %{public}s', JSON.stringify(err));
+        return;
+      }
+      try {
+        const title: string = this.localStorage.get<string>('androidLabel') ?? this.androidPkg;
+        this.mainWindow?.setWindowTitle(title);
+      } catch (_e) {
       }
     });
   }
