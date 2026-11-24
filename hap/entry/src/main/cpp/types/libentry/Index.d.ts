@@ -2,6 +2,7 @@ export interface RuntimeStatus {
   running: boolean;
   paused: boolean;
   connected: boolean;
+  wmAgentReady: boolean;
   vsyncActive: boolean;
   inputReady: boolean;
   audioActive: boolean;
@@ -22,6 +23,16 @@ export interface RuntimeStatus {
   statusText: string;
 }
 
+export interface DisplayStats {
+  displaySlot: number;
+  attached: number;
+  visible: number;
+  width: number;
+  height: number;
+  framesPosted: number;
+  fps: number;
+}
+
 export const startContainer: (
   sandboxTempDir: string,
   svboxPath: string,
@@ -35,13 +46,25 @@ export const attachHwcSocket: (sockPath: string, width: number, height: number) 
 export const stopContainer: () => string;
 export const sendNavKey: (key: string) => boolean;
 export const sendScroll: (x: number, y: number, deltaY: number) => boolean;
+export const sendDisplayScroll: (slot: number, x: number, y: number, deltaY: number) => boolean;
 export const setResourceConfig: (profile: string, cpuset: string, memMb: number) => boolean;
 export const setGpuMode: (gpuMode: string) => boolean;
 export const setRefreshRate: (hz: number) => boolean;
+export const setDisplayRefreshRate: (slot: number, hz: number) => boolean;
 export const setPaused: (paused: boolean) => string;
 export const setVisible: (visible: boolean) => boolean;
+export const setDisplayVisible: (slot: number, visible: boolean) => boolean;
 export const saveRawSnapshot: (path: string, width: number, height: number, pixels: ArrayBuffer) => boolean;
 export const runGuestCmd: (cmd: string, outPath: string) => boolean;
 export const dumpProcs: (outPath: string) => boolean;
 export const injectTap: (x: number, y: number) => boolean;
+export const isWmAgentReady: () => boolean;
+export const getIconsDir: () => string;
+export const wmRpc: (cmd: string) => string;
+export const wmRpcAsync: (cmd: string) => Promise<string>;
+export const allocDisplaySlot: (pkg: string) => number;
+export const findDisplaySlot: (pkg: string) => number;
+export const releaseDisplaySlot: (slot: number) => boolean;
+export const pollWmEvents: () => string;
+export const getDisplayStats: (slot: number) => DisplayStats;
 export const getStatus: () => RuntimeStatus;

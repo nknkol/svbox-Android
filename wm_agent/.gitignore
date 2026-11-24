@@ -1,0 +1,4 @@
+.tools/
+build/
+svbox-wm-agent.jar
+libsvbox_wm_jni.so

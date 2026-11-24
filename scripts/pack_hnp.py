@@ -37,6 +37,8 @@ def main() -> None:
         (os.path.join(repo, "audio_hal", "audio.primary.svbox.so"), "svbox_0.1.0/bin/audio.primary.svbox.so"),
         (os.path.join(repo, "audio_hal", "svbox-audio-service"), "svbox_0.1.0/bin/svbox-audio-service"),
         (os.path.join(repo, "camera_stub", "svbox-cameraserver"), "svbox_0.1.0/bin/svbox-cameraserver"),
+        (os.path.join(repo, "wm_agent", "libsvbox_wm_jni.so"), "svbox_0.1.0/bin/libsvbox_wm_jni.so"),
+        (os.path.join(repo, "wm_agent", "svbox-wm-agent.jar"), "svbox_0.1.0/bin/svbox-wm-agent.jar"),
     ]
 
     guest_gpu_dir = os.path.join(repo, "gpu", "build_guest", "out", "lib64")

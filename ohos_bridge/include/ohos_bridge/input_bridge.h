@@ -16,22 +16,29 @@ class InputBridge {
 public:
     static InputBridge& Instance();
 
+    static constexpr int kMaxSecondaryDisplays = 8;
+
     void Start(const std::string& touchSockPath,
                const std::string& kbdSockPath,
                int32_t displayW,
                int32_t displayH,
                const std::string& gamepadSockPath = "",
                bool mapEscToBack = true);
+    void StartSecondaryTouch(int displaySlot, const std::string& sockPath);
     void Stop();
 
     void SetSurfaceSize(int32_t surfaceW, int32_t surfaceH);
+    void SetDisplaySurfaceSize(int displaySlot, int32_t surfaceW, int32_t surfaceH);
 
     // Touch: action 0=down, 1=move, 2=up, 3=cancel
     void InjectTouch(int32_t fingerId, int action, float x, float y);
+    void InjectTouchForDisplay(int displaySlot, int32_t fingerId, int action, float x, float y);
     // Mouse: action 1=press, 2=release, 3=move, 4=cancel; button 1=left, 2=right, 4=middle
     void InjectMouse(int action, int button, float x, float y);
+    void InjectMouseForDisplay(int displaySlot, int action, int button, float x, float y);
     // Scroll wheel: deltaY > 0 scrolls down (swipe up), < 0 scrolls up
     void InjectScroll(float x, float y, float deltaY);
+    void InjectScrollForDisplay(int displaySlot, float x, float y, float deltaY);
     // HarmonyOS OH_NativeXComponent_KeyCode -> Linux KEY_*
     void InjectOhosKey(int32_t ohosKeyCode, bool down);
     // Direct Linux evdev KEY_* injection
@@ -60,11 +67,22 @@ private:
 
     struct EvdevServer {
         DevKind kind = DevKind::Touch;
+        int displaySlot = 0; // 0 = primary, 1..8 = secondary touch displays
         std::string sockPath;
         int listenFd = -1;
         std::thread thread;
         std::mutex clientsMu;
         std::vector<int> streamFds;
+    };
+
+    struct TouchChannelState {
+        std::mutex mu;
+        std::atomic<int32_t> surfaceW{720};
+        std::atomic<int32_t> surfaceH{1280};
+        bool mouseLeftDown = false;
+        int32_t nextTrackingId = 1;
+        int32_t slotFinger[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
+        int32_t slotTrack[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
     };
 
     void RunServer(EvdevServer* srv);
@@ -74,6 +92,7 @@ private:
     void DetachGameControllerKit();
     int MapCoordX(float x) const;
     int MapCoordY(float y) const;
+    int MapSecondaryCoord(float coord, int32_t surfaceSpan) const;
     uint16_t MapOhosKeyToLinux(int32_t ohosKeyCode) const;
 
     std::atomic<bool> running_{false};
@@ -91,6 +110,8 @@ private:
     EvdevServer touchSrv_;
     EvdevServer kbdSrv_;
     EvdevServer gamepadSrv_;
+    EvdevServer secondaryTouchSrvs_[kMaxSecondaryDisplays];
+    TouchChannelState secondaryTouchState_[kMaxSecondaryDisplays];
 
     void* gckHandle_ = nullptr;
 

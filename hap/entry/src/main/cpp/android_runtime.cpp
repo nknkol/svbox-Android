@@ -731,11 +731,208 @@ std::string AndroidRuntime::SetPaused(bool paused) {
 }
 
 void AndroidRuntime::SetVisible(bool visible) {
+    SetDisplayVisible(0, visible);
+}
+
+void AndroidRuntime::OnDisplaySurfaceChanged(int32_t displaySlot, OHNativeWindow* window,
+                                             int32_t w, int32_t h) {
+    if (displaySlot == 0) {
+        OnSurfaceChanged(window, w, h);
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
+    GfxstreamBridge::Instance().SetDisplayWindow(displaySlot, window, w, h);
+}
+
+void AndroidRuntime::OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWindow* window) {
+    if (displaySlot == 0) {
+        OnSurfaceDestroyed(window);
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
+    GfxstreamBridge::Instance().ClearDisplayWindow(displaySlot);
+}
+
+void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
     const bool show = visible && !paused_.load();
-    if (UseGfxstream()) {
-        GfxstreamBridge::Instance().SetVisible(show);
-    } else {
-        HwcRenderer::Instance().SetVisible(show);
+    if (displaySlot == 0) {
+        if (UseGfxstream()) {
+            GfxstreamBridge::Instance().SetVisible(show);
+        } else {
+            HwcRenderer::Instance().SetVisible(show);
+        }
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
+    GfxstreamBridge::Instance().SetDisplayVisible(displaySlot, show);
+}
+
+std::string AndroidRuntime::IconsHostDir() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return iconsHostDir_;
+}
+
+std::string AndroidRuntime::WmRpc(const std::string& cmd, int timeoutMs) {
+    std::string sockPath;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sockPath = wmSockPath_;
+    }
+    if (!running_.load() || sockPath.empty() || !FileExists(sockPath)) {
+        return "{\"ok\":false,\"error\":\"wm_agent not ready\"}";
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return "{\"ok\":false,\"error\":\"socket failed\"}";
+    }
+    struct timeval tv = { timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_un sa = {};
+    sa.sun_family = AF_UNIX;
+    std::strncpy(sa.sun_path, sockPath.c_str(), sizeof(sa.sun_path) - 1);
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
+        close(fd);
+        return "{\"ok\":false,\"error\":\"connect wm_agent failed\"}";
+    }
+    std::string line = cmd + "\n";
+    size_t sent = 0;
+    while (sent < line.size()) {
+        ssize_t w = send(fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL);
+        if (w > 0) {
+            sent += static_cast<size_t>(w);
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        close(fd);
+        return "{\"ok\":false,\"error\":\"send wm_agent failed\"}";
+    }
+    std::string resp;
+    char buf[4096];
+    while (true) {
+        ssize_t r = recv(fd, buf, sizeof(buf), 0);
+        if (r > 0) {
+            for (ssize_t i = 0; i < r; ++i) {
+                if (buf[i] == '\n') {
+                    close(fd);
+                    return resp.empty() ? "{\"ok\":false,\"error\":\"empty\"}" : resp;
+                }
+                if (buf[i] != '\r') resp.push_back(buf[i]);
+            }
+            if (resp.size() > 512 * 1024) break;
+        } else if (r < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(fd);
+    return resp.empty() ? "{\"ok\":false,\"error\":\"timeout\"}" : resp;
+}
+
+int32_t AndroidRuntime::AllocDisplaySlotForPkg(const std::string& pkg) {
+    std::lock_guard<std::mutex> lk(slotMapMu_);
+    if (!pkg.empty()) {
+        for (int32_t i = 1; i <= 8; ++i) {
+            if (slotPkg_[i] == pkg) return i;
+        }
+    }
+    for (int32_t i = 1; i <= 8; ++i) {
+        if (slotPkg_[i].empty()) {
+            slotPkg_[i] = pkg.empty() ? ("__slot_" + std::to_string(i)) : pkg;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int32_t AndroidRuntime::FindDisplaySlotForPkg(const std::string& pkg) const {
+    if (pkg.empty()) return -1;
+    std::lock_guard<std::mutex> lk(slotMapMu_);
+    for (int32_t i = 1; i <= 8; ++i) {
+        if (slotPkg_[i] == pkg) return i;
+    }
+    return -1;
+}
+
+void AndroidRuntime::ReleaseDisplaySlot(int32_t slot) {
+    if (slot < 1 || slot > 8) return;
+    {
+        std::lock_guard<std::mutex> lk(slotMapMu_);
+        slotPkg_[slot].clear();
+    }
+    GfxstreamBridge::Instance().ClearDisplayWindow(slot);
+}
+
+std::string AndroidRuntime::PollWmEventsJson() {
+    std::vector<std::string> batch;
+    {
+        std::lock_guard<std::mutex> lk(wmEventMu_);
+        batch.swap(wmEventQueue_);
+    }
+    std::string out = "[";
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        out += batch[i];
+    }
+    out.push_back(']');
+    return out;
+}
+
+SvboxGfxDisplayStats AndroidRuntime::GetDisplayStats(int32_t displaySlot) const {
+    return GfxstreamBridge::Instance().GetDisplayStats(displaySlot);
+}
+
+void AndroidRuntime::WmEventLoop(std::string sockPath) {
+    while (running_.load()) {
+        if (!FileExists(sockPath)) {
+            if (!SleepCancelableMs(250)) return;
+            continue;
+        }
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            if (!SleepCancelableMs(500)) return;
+            continue;
+        }
+        struct sockaddr_un sa = {};
+        sa.sun_family = AF_UNIX;
+        std::strncpy(sa.sun_path, sockPath.c_str(), sizeof(sa.sun_path) - 1);
+        if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
+            close(fd);
+            if (!SleepCancelableMs(300)) return;
+            continue;
+        }
+        const char* sub = "SUBSCRIBE_EVENTS\n";
+        (void)send(fd, sub, std::strlen(sub), MSG_NOSIGNAL);
+
+        std::string lineBuf;
+        char buf[4096];
+        while (running_.load()) {
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            int pr = poll(&pfd, 1, 250);
+            if (pr == 0) continue;
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            ssize_t r = recv(fd, buf, sizeof(buf), 0);
+            if (r <= 0) break;
+            for (ssize_t i = 0; i < r; ++i) {
+                if (buf[i] == '\n') {
+                    if (!lineBuf.empty() && lineBuf.find("\"event\"") != std::string::npos) {
+                        std::lock_guard<std::mutex> lk(wmEventMu_);
+                        if (wmEventQueue_.size() < 64) {
+                            wmEventQueue_.push_back(lineBuf);
+                        }
+                    }
+                    lineBuf.clear();
+                } else if (buf[i] != '\r') {
+                    lineBuf.push_back(buf[i]);
+                }
+            }
+        }
+        close(fd);
+        if (!SleepCancelableMs(500)) return;
     }
 }
 
@@ -877,6 +1074,11 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--vdev", "/dev/bus/usb/001/002:" + sockDir + "/usb_001_002.sock:chr",
         "--vdev", "/dev/ttyUSB0:" + sockDir + "/ttyusb0.sock:chr",
     };
+    for (int i = 1; i <= InputBridge::kMaxSecondaryDisplays; ++i) {
+        vdevsAndEnv.push_back("--vdev");
+        vdevsAndEnv.push_back("/dev/input/event" + std::to_string(9 + i) + ":" +
+                              sockDir + "/input_touch_" + std::to_string(i) + ".sock:chr");
+    }
     if (!netSockPath_.empty()) {
         vdevsAndEnv.push_back("--net-sock");
         vdevsAndEnv.push_back(netSockPath_);
@@ -1863,6 +2065,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     WriteFile(runBase_ + "/dev_input/event0", "");
     WriteFile(runBase_ + "/dev_input/event1", "");
     WriteFile(runBase_ + "/dev_input/event2", "");
+    for (int i = 1; i <= InputBridge::kMaxSecondaryDisplays; ++i) {
+        WriteFile(runBase_ + "/dev_input/event" + std::to_string(9 + i), "");
+    }
     WriteFile(runBase_ + "/dev_bus_usb/001/002", "");
     WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
 
@@ -1935,6 +2140,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     unlink((ipcDir + "/hwcomposer.sock").c_str());
     unlink((ipcDir + "/gfxstream.sock").c_str());
+    unlink((ipcDir + "/gfxstream.sock.present").c_str());
+    unlink((ipcDir + "/wm_agent.sock").c_str());
     unlink((ipcDir + "/audio.sock").c_str());
     unlink((sockDir + "/binder.sock").c_str());
     unlink((sockDir + "/hwbinder.sock").c_str());
@@ -1946,6 +2153,16 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     unlink((sockDir + "/mdns").c_str());
     unlink((sockDir + "/input_touch.sock").c_str());
     unlink((sockDir + "/input_kbd.sock").c_str());
+    for (int i = 1; i <= InputBridge::kMaxSecondaryDisplays; ++i) {
+        unlink((sockDir + "/input_touch_" + std::to_string(i) + ".sock").c_str());
+    }
+    MkdirP(ipcDir + "/icons");
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        wmSockPath_ = ipcDir + "/wm_agent.sock";
+        iconsHostDir_ = ipcDir + "/icons";
+    }
+    wmAgentReady_.store(false);
 
     const std::string logDir = androidDir_ + "/hap_logs";
     MkdirP(logDir);
@@ -2070,6 +2287,15 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "touch.orientationAware = 1\n"
             "device.internal = 1\n");
         chmod(idcDst.c_str(), 0644);
+        for (int slot = 1; slot <= 8; ++slot) {
+            const std::string secIdc = injectLayer_ + "/system/usr/idc/svbox-touchscreen-" +
+                                       std::to_string(slot) + ".idc";
+            WriteFile(secIdc,
+                "touch.deviceType = touchScreen\n"
+                "touch.orientationAware = 0\n"
+                "device.internal = 0\n");
+            chmod(secIdc.c_str(), 0644);
+        }
 
         if (!audioHalPath_.empty() && FileExists(audioHalPath_)) {
             MkdirP(injectLayer_ + "/vendor/lib64/hw");
@@ -2116,6 +2342,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     logdwThread_ = std::thread(&AndroidRuntime::LogdwLoop, this, sockDir + "/logdw", logDir + "/logcat.txt");
     InputBridge::Instance().Start(sockDir + "/input_touch.sock", sockDir + "/input_kbd.sock",
                                   width, height, sockDir + "/input_gamepad.sock", true);
+    for (int i = 1; i <= InputBridge::kMaxSecondaryDisplays; ++i) {
+        InputBridge::Instance().StartSecondaryTouch(i, sockDir + "/input_touch_" + std::to_string(i) + ".sock");
+    }
     AudioBridge::Instance().Start(ipcDir + "/audio.sock");
     UsbBridge::Instance().Start(sockDir + "/usb_001_002.sock", sockDir + "/ttyusb0.sock");
     if (useGfx) {
@@ -2350,22 +2579,69 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         runSvbox("zygote64", zygCmd, true, { zfd, ufd });
         SetStatus("Booting Full Android 14 (" + std::to_string(width) + "x" + std::to_string(height) +
                   "@" + std::to_string(targetHz) + "Hz · Zygote64 -> system_server -> Launcher3)...");
-        // Once Android 14 finishes boot, lock DisplayModeDirector + SurfaceFlinger to targetHz
-        // (DisplayModeDirector otherwise defaults to 60Hz regardless of HWC activeConfig).
-        if (targetHz != 60) {
-            std::thread([this, targetHz]() {
-                for (int i = 0; i < 60 && running_.load(); ++i) {
-                    if (!SleepCancelableMs(500)) return;
-                    if (i >= 18) {
-                        int32_t curHz = refreshRate_.load();
-                        if (curHz == targetHz) {
-                            SetRefreshRate(curHz);
-                        }
-                        break;
-                    }
-                }
-            }).detach();
+
+        // Stage svbox-wm-agent.jar + libsvbox_wm_jni.so under /data/local/tmp/svbox_wm
+        // (permitted by Android 14 libnativeloader clns-1 namespace) and launch once system_server is up.
+        const std::string wmJarSrc =
+            FileExists(hnpBin + "/svbox-wm-agent.jar") ? (hnpBin + "/svbox-wm-agent.jar")
+                                                       : (androidDir_ + "/wm_agent/svbox-wm-agent.jar");
+        const std::string wmJniSrc =
+            FileExists(hnpBin + "/libsvbox_wm_jni.so") ? (hnpBin + "/libsvbox_wm_jni.so")
+                                                       : (androidDir_ + "/wm_agent/libsvbox_wm_jni.so");
+        const std::string wmGuestHostDir = dataBase_ + "/data/local/tmp/svbox_wm";
+        MkdirP(wmGuestHostDir);
+        bool hasWmAgent = false;
+        if (FileExists(wmJarSrc) && FileExists(wmJniSrc)) {
+            if (CopyRegularFile(wmJarSrc, wmGuestHostDir + "/svbox-wm-agent.jar") &&
+                CopyRegularFile(wmJniSrc, wmGuestHostDir + "/libsvbox_wm_jni.so")) {
+                chmod((wmGuestHostDir + "/svbox-wm-agent.jar").c_str(), 0644);
+                chmod((wmGuestHostDir + "/libsvbox_wm_jni.so").c_str(), 0755);
+                hasWmAgent = true;
+            }
         }
+        const std::string wmSockCopy = ipcDir + "/wm_agent.sock";
+        std::thread([this, targetHz, hasWmAgent, wmSockCopy, logDir]() {
+            // Wait ~8s for system_server + PackageManager + DisplayManager to come online, then start wm_agent
+            for (int i = 0; i < 16 && running_.load(); ++i) {
+                if (!SleepCancelableMs(500)) return;
+            }
+            if (!running_.load()) return;
+
+            if (hasWmAgent) {
+                std::vector<std::string> wmArgv = BaseSvboxArgs();
+                wmArgv.push_back("-e");
+                wmArgv.push_back("CLASSPATH=/data/local/tmp/svbox_wm/svbox-wm-agent.jar");
+                wmArgv.push_back("system/bin/app_process64");
+                wmArgv.push_back("-Xusejit:false");
+                wmArgv.push_back("-Dsvbox.jni.dir=/data/local/tmp/svbox_wm");
+                wmArgv.push_back("/system/bin");
+                wmArgv.push_back("org.svbox.wm.SvboxWmAgent");
+                wmArgv.push_back("/ipc/wm_agent.sock");
+                wmArgv.push_back("/ipc/gfxstream.sock.present");
+                wmArgv.push_back("/ipc/icons");
+                Spawn(wmArgv, false, logDir + "/wm_agent.log");
+
+                for (int i = 0; i < 80 && running_.load(); ++i) {
+                    if (FileExists(wmSockCopy)) {
+                        std::string resp = WmRpc("PING", 2000);
+                        if (resp.find("\"ok\":true") != std::string::npos) {
+                            wmAgentReady_.store(true);
+                            OH_LOG_INFO(LOG_APP, "SvboxWmAgent online (%s)", wmSockCopy.c_str());
+                            wmEventThread_ = std::thread(&AndroidRuntime::WmEventLoop, this, wmSockCopy);
+                            break;
+                        }
+                    }
+                    if (!SleepCancelableMs(250)) return;
+                }
+            }
+
+            if (targetHz != 60 && running_.load()) {
+                int32_t curHz = refreshRate_.load();
+                if (curHz == targetHz) {
+                    SetRefreshRate(curHz);
+                }
+            }
+        }).detach();
     }
 
     size_t procCount = 0;
@@ -2379,6 +2655,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 std::string AndroidRuntime::Stop() {
     running_.store(false);
     paused_.store(false);
+    wmAgentReady_.store(false);
     HwcRenderer::Instance().Stop();
     InputBridge::Instance().Stop();
     AudioBridge::Instance().Stop();
@@ -2389,6 +2666,17 @@ std::string AndroidRuntime::Stop() {
     }
     if (bootThread_.joinable()) {
         bootThread_.join();
+    }
+    if (wmEventThread_.joinable()) {
+        wmEventThread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lk(slotMapMu_);
+        for (int i = 0; i <= 8; ++i) slotPkg_[i].clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(wmEventMu_);
+        wmEventQueue_.clear();
     }
     if (lmkdThread_.joinable()) {
         lmkdThread_.join();

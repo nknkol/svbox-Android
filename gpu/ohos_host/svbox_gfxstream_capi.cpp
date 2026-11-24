@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include "svbox_gfxstream_capi.h"
 
+#include "DisplaySurface.h"
 #include "FrameBuffer.h"
 #include "GfxStreamAgents.h"
+#include "NativeSubWindow.h"
 #include "gfxstream/host/Features.h"
 #include "host-common/GraphicsAgentFactory.h"
 #include "host-common/logging.h"
@@ -10,6 +12,8 @@
 #include "render-utils/RenderLib.h"
 #include "render-utils/Renderer.h"
 #include "render-utils/render_api.h"
+#include "vulkan/DisplayVk.h"
+#include "vulkan/VkCommonOperations.h"
 #include "vulkan/VulkanDispatch.h"
 
 #include <atomic>
@@ -107,6 +111,33 @@ struct ClientConn {
     bool hasCbHandle = false;
 };
 
+struct SecondaryDisplaySlot {
+    std::mutex mu;
+    OHNativeWindow* window = nullptr;
+    EGLNativeWindowType subWin = 0;
+    std::unique_ptr<gfxstream::DisplaySurface> displaySurface;
+    std::unique_ptr<gfxstream::vk::DisplayVk> displayVk;
+    int32_t surfaceW = 0;
+    int32_t surfaceH = 0;
+    int32_t bufW = 0;
+    int32_t bufH = 0;
+    int32_t fbW = 0;
+    int32_t fbH = 0;
+    uint32_t lastCb = 0;
+    std::atomic<bool> visible{true};
+    std::atomic<uint64_t> framesPosted{0};
+    std::atomic<int32_t> fps{0};
+    std::chrono::steady_clock::time_point fpsWindowStart;
+    int32_t fpsFrames = 0;
+};
+
+struct PresentPacket {
+    uint32_t displaySlot;
+    uint32_t cbHandle;
+    int32_t width;
+    int32_t height;
+};
+
 struct HostState {
     std::mutex mu;
     bool initialized = false;
@@ -131,6 +162,11 @@ struct HostState {
     int listenFd = -1;
     int wakeFd = -1;
     std::thread serverThread;
+
+    std::string presentSockPath;
+    int presentListenFd = -1;
+    std::thread presentThread;
+    SecondaryDisplaySlot secondary[SVBOX_GFX_MAX_DISPLAYS];
 
     std::atomic<uint64_t> nextPuid{1};
     std::atomic<int> activeChannels{0};
@@ -483,6 +519,142 @@ void ServerLoop() {
     close(epfd);
 }
 
+void DetachSecondarySlotLocked(SecondaryDisplaySlot& slot) {
+    if (slot.displayVk) {
+        slot.displayVk->drainQueues();
+        slot.displayVk->unbindFromSurface();
+        slot.displayVk.reset();
+    }
+    slot.displaySurface.reset();
+    if (slot.subWin) {
+        destroySubWindow(slot.subWin);
+        slot.subWin = 0;
+    }
+    slot.window = nullptr;
+    slot.bufW = 0;
+    slot.bufH = 0;
+}
+
+bool AttachSecondarySlotLocked(SecondaryDisplaySlot& slot, int32_t displaySlot,
+                               OHNativeWindow* win, int32_t surfW, int32_t surfH) {
+    if (!win) {
+        DetachSecondarySlotLocked(slot);
+        return true;
+    }
+    auto* fb = gfxstream::FrameBuffer::getFB();
+    if (!fb || !fb->hasEmulationVk()) {
+        slot.window = win;
+        slot.surfaceW = surfW;
+        slot.surfaceH = surfH;
+        return false;
+    }
+    const int32_t targetW = (slot.fbW > 0) ? slot.fbW : (surfW > 0 ? surfW : 720);
+    const int32_t targetH = (slot.fbH > 0) ? slot.fbH : (surfH > 0 ? surfH : 1280);
+
+    if (slot.window == win && slot.displayVk && slot.displaySurface && slot.subWin) {
+        slot.surfaceW = surfW;
+        slot.surfaceH = surfH;
+        if (slot.bufW != targetW || slot.bufH != targetH) {
+            moveSubWindow(nullptr, slot.subWin, 0, 0, targetW, targetH, 1.0f);
+            slot.displaySurface->updateSize(static_cast<uint32_t>(targetW),
+                                            static_cast<uint32_t>(targetH));
+            slot.bufW = targetW;
+            slot.bufH = targetH;
+        }
+        return true;
+    }
+
+    DetachSecondarySlotLocked(slot);
+    EGLNativeWindowType subWin = createSubWindow(
+        win, 0, 0, targetW, targetH, 1.0f, nullptr, nullptr, 0);
+    if (!subWin) {
+        GFX_LOGE("slot %d: createSubWindow failed", displaySlot);
+        return false;
+    }
+    auto& vkEmu = fb->getEmulationVk();
+    auto surface = vkEmu.createDisplaySurface(
+        subWin, static_cast<uint32_t>(targetW), static_cast<uint32_t>(targetH));
+    if (!surface) {
+        GFX_LOGE("slot %d: createDisplaySurface failed", displaySlot);
+        destroySubWindow(subWin);
+        return false;
+    }
+    auto dispVk = vkEmu.createSecondaryDisplay();
+    if (!dispVk) {
+        GFX_LOGE("slot %d: createSecondaryDisplay failed", displaySlot);
+        surface.reset();
+        destroySubWindow(subWin);
+        return false;
+    }
+    dispVk->bindToSurface(surface.get());
+    slot.window = win;
+    slot.subWin = subWin;
+    slot.displaySurface = std::move(surface);
+    slot.displayVk = std::move(dispVk);
+    slot.surfaceW = surfW;
+    slot.surfaceH = surfH;
+    slot.bufW = targetW;
+    slot.bufH = targetH;
+    GFX_LOGI("slot %d: attached DisplayVk window=%p buf=%dx%d surf=%dx%d",
+             displaySlot, win, targetW, targetH, surfW, surfH);
+    return true;
+}
+
+bool RecvExactFd(int fd, void* dst, size_t n) {
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
+        if (r > 0) {
+            got += static_cast<size_t>(r);
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+void HandlePresentClient(int cfd) {
+    struct timeval tv = { 5, 0 };
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    HostState& st = State();
+    while (!st.stop.load()) {
+        PresentPacket pkt = {};
+        if (!RecvExactFd(cfd, &pkt, sizeof(pkt))) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
+        int rc = svbox_gfx_present_cb(
+            static_cast<int32_t>(pkt.displaySlot), pkt.cbHandle, pkt.width, pkt.height);
+        uint8_t ack = (rc == 0) ? 1u : 0u;
+        if (send(cfd, &ack, 1, MSG_NOSIGNAL) != 1) {
+            break;
+        }
+    }
+    close(cfd);
+}
+
+void PresentServerLoop() {
+    HostState& st = State();
+    while (!st.stop.load()) {
+        struct sockaddr_un peer = {};
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(st.presentListenFd, reinterpret_cast<struct sockaddr*>(&peer), &plen);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(20000);
+                continue;
+            }
+            break;
+        }
+        int fl = fcntl(cfd, F_GETFL, 0);
+        if (fl >= 0) fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
+        std::thread(HandlePresentClient, cfd).detach();
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -642,6 +814,34 @@ int svbox_gfx_init(int32_t width, int32_t height, int mode, const char* sockPath
     st.wakeFd = efd;
     st.initialized = true;
 
+    // Secondary-display zero-copy present server on <sockPath>.present (or <sockPath>_present for abstract)
+    st.presentSockPath = isAbstract ? (std::string(sockPath) + "_present") : (std::string(sockPath) + ".present");
+    if (!isAbstract) unlink(st.presentSockPath.c_str());
+    int pfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (pfd >= 0) {
+        struct sockaddr_un psa = {};
+        psa.sun_family = AF_UNIX;
+        socklen_t psaLen = sizeof(psa);
+        if (isAbstract) {
+            size_t plen = st.presentSockPath.size() - 1;
+            if (plen > sizeof(psa.sun_path) - 2) plen = sizeof(psa.sun_path) - 2;
+            psa.sun_path[0] = '\0';
+            std::memcpy(psa.sun_path + 1, st.presentSockPath.c_str() + 1, plen);
+            psaLen = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 + plen);
+        } else {
+            std::strncpy(psa.sun_path, st.presentSockPath.c_str(), sizeof(psa.sun_path) - 1);
+        }
+        if (bind(pfd, reinterpret_cast<struct sockaddr*>(&psa), psaLen) == 0 && listen(pfd, 32) == 0) {
+            if (!isAbstract) chmod(st.presentSockPath.c_str(), 0666);
+            st.presentListenFd = pfd;
+            st.presentThread = std::thread(PresentServerLoop);
+            GFX_LOGI("Secondary display present server listening on %s", st.presentSockPath.c_str());
+        } else {
+            GFX_LOGE("bind/listen present(%s) failed: errno=%d", st.presentSockPath.c_str(), errno);
+            close(pfd);
+        }
+    }
+
     // If a window was already registered before init, attach it now.
     // Match native buffer geometry to guest fbW x fbH (1:1 pixel match, OHOS RenderService scales cleanly).
     if (st.window) {
@@ -649,6 +849,13 @@ int svbox_gfx_init(int32_t width, int32_t height, int mode, const char* sockPath
             st.window, 0, 0, st.fbW, st.fbH, st.fbW, st.fbH, 1.0f, 0.0f, false, false);
         GFX_LOGI("Attached pre-existing OHNativeWindow %p (%dx%d) -> %d",
                  st.window, st.fbW, st.fbH, st.windowAttached ? 1 : 0);
+    }
+    for (int i = 1; i < SVBOX_GFX_MAX_DISPLAYS; ++i) {
+        std::lock_guard<std::mutex> slk(st.secondary[i].mu);
+        if (st.secondary[i].window && !st.secondary[i].displayVk) {
+            AttachSecondarySlotLocked(st.secondary[i], i, st.secondary[i].window,
+                                      st.secondary[i].surfaceW, st.secondary[i].surfaceH);
+        }
     }
 
     st.serverThread = std::thread(ServerLoop);
@@ -684,6 +891,206 @@ void svbox_gfx_clear_window(void) {
     st.window = nullptr;
 }
 
+int svbox_gfx_set_display_window(int32_t displaySlot, void* ohNativeWindow,
+                                 int32_t surfaceW, int32_t surfaceH) {
+    if (displaySlot == 0) {
+        return svbox_gfx_set_window(ohNativeWindow, surfaceW, surfaceH);
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) {
+        return -1;
+    }
+    HostState& st = State();
+    auto& sec = st.secondary[displaySlot];
+    uint32_t repaintCb = 0;
+    int32_t repaintW = 0;
+    int32_t repaintH = 0;
+    {
+        std::lock_guard<std::mutex> slk(sec.mu);
+        if (!st.initialized) {
+            sec.window = static_cast<OHNativeWindow*>(ohNativeWindow);
+            sec.surfaceW = surfaceW;
+            sec.surfaceH = surfaceH;
+            return 0;
+        }
+        bool ok = AttachSecondarySlotLocked(
+            sec, displaySlot, static_cast<OHNativeWindow*>(ohNativeWindow), surfaceW, surfaceH);
+        if (!ok) return -1;
+        repaintCb = sec.lastCb;
+        repaintW = sec.fbW;
+        repaintH = sec.fbH;
+    }
+    if (repaintCb != 0) {
+        svbox_gfx_present_cb(displaySlot, repaintCb, repaintW, repaintH);
+    }
+    return 0;
+}
+
+void svbox_gfx_clear_display_window(int32_t displaySlot) {
+    if (displaySlot == 0) {
+        svbox_gfx_clear_window();
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) {
+        return;
+    }
+    HostState& st = State();
+    auto& sec = st.secondary[displaySlot];
+    std::lock_guard<std::mutex> slk(sec.mu);
+    DetachSecondarySlotLocked(sec);
+    sec.lastCb = 0;
+    sec.fbW = 0;
+    sec.fbH = 0;
+    sec.fps.store(0);
+}
+
+void svbox_gfx_set_display_visible(int32_t displaySlot, int visible) {
+    if (displaySlot == 0) {
+        svbox_gfx_set_visible(visible);
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) {
+        return;
+    }
+    HostState& st = State();
+    auto& sec = st.secondary[displaySlot];
+    sec.visible.store(visible != 0);
+    if (visible) {
+        uint32_t cb = 0;
+        int32_t w = 0, h = 0;
+        {
+            std::lock_guard<std::mutex> slk(sec.mu);
+            cb = sec.lastCb;
+            w = sec.fbW;
+            h = sec.fbH;
+        }
+        if (cb != 0) {
+            svbox_gfx_present_cb(displaySlot, cb, w, h);
+        }
+    }
+}
+
+int svbox_gfx_present_cb(int32_t displaySlot, uint32_t cbHandle, int32_t width, int32_t height) {
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS || cbHandle == 0) {
+        return -1;
+    }
+    HostState& st = State();
+    if (!st.initialized) return -2;
+    auto* fb = gfxstream::FrameBuffer::getFB();
+    if (!fb) return -3;
+
+    auto& sec = st.secondary[displaySlot];
+    std::lock_guard<std::mutex> slk(sec.mu);
+    sec.lastCb = cbHandle;
+    if (width > 0) sec.fbW = width;
+    if (height > 0) sec.fbH = height;
+
+    auto now = std::chrono::steady_clock::now();
+    if (sec.framesPosted.load() == 0) {
+        sec.fpsWindowStart = now;
+    }
+    uint64_t total = sec.framesPosted.fetch_add(1) + 1;
+    sec.fpsFrames++;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - sec.fpsWindowStart).count();
+    if (ms >= 1000) {
+        sec.fps.store(static_cast<int32_t>((sec.fpsFrames * 1000LL) / ms));
+        sec.fpsFrames = 0;
+        sec.fpsWindowStart = now;
+    }
+
+    if (!sec.visible.load() || !sec.displayVk || !sec.displaySurface) {
+        return 0;
+    }
+
+    if (sec.fbW > 0 && sec.fbH > 0 && (sec.bufW != sec.fbW || sec.bufH != sec.fbH) && sec.subWin) {
+        moveSubWindow(nullptr, sec.subWin, 0, 0, sec.fbW, sec.fbH, 1.0f);
+        sec.displaySurface->updateSize(static_cast<uint32_t>(sec.fbW),
+                                       static_cast<uint32_t>(sec.fbH));
+        sec.bufW = sec.fbW;
+        sec.bufH = sec.fbH;
+    }
+
+    for (int retry = 0; retry < 2; ++retry) {
+        auto imageInfo = fb->borrowColorBufferForDisplay(cbHandle);
+        if (!imageInfo) {
+            if (total <= 5) {
+                GFX_LOGE("slot %d: borrowColorBufferForDisplay(0x%x) returned null", displaySlot, cbHandle);
+            }
+            return -4;
+        }
+        auto result = sec.displayVk->post(imageInfo.get());
+        if (result.success) {
+            if (result.postCompletedWaitable.valid()) {
+                result.postCompletedWaitable.wait();
+            }
+            if (total == 1 || total == 10 || (total % 300 == 0)) {
+                GFX_LOGI("slot %d: presented frame #%llu (cb=0x%x, %dx%d)",
+                         displaySlot, static_cast<unsigned long long>(total), cbHandle, sec.fbW, sec.fbH);
+            }
+            return 0;
+        }
+    }
+    return -5;
+}
+
+void svbox_gfx_get_display_stats(int32_t displaySlot, SvboxGfxDisplayStats* outStats) {
+    if (!outStats) return;
+    std::memset(outStats, 0, sizeof(*outStats));
+    outStats->displaySlot = displaySlot;
+    HostState& st = State();
+    if (displaySlot == 0) {
+        std::lock_guard<std::mutex> lk(st.mu);
+        outStats->attached = st.windowAttached ? 1 : 0;
+        outStats->visible = st.visible.load() ? 1 : 0;
+        outStats->width = st.fbW;
+        outStats->height = st.fbH;
+        outStats->framesPosted = st.framesPosted.load();
+        outStats->fps = st.fps.load();
+        return;
+    }
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
+    auto& sec = st.secondary[displaySlot];
+    std::lock_guard<std::mutex> slk(sec.mu);
+    outStats->attached = (sec.displayVk != nullptr) ? 1 : 0;
+    outStats->visible = sec.visible.load() ? 1 : 0;
+    outStats->width = sec.fbW;
+    outStats->height = sec.fbH;
+    outStats->lastCb = sec.lastCb;
+    outStats->framesPosted = sec.framesPosted.load();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - sec.fpsWindowStart)
+                  .count();
+    if (ms > 1500 && sec.fpsFrames == 0) {
+        sec.fps.store(0);
+    }
+    outStats->fps = sec.fps.load();
+}
+
+int svbox_gfx_read_display_rgba(int32_t displaySlot, void* outRgba, uint32_t bufBytes,
+                                int32_t* outW, int32_t* outH) {
+    if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS || !outRgba) return -1;
+    HostState& st = State();
+    auto* fb = gfxstream::FrameBuffer::getFB();
+    if (!st.initialized || !fb) return -2;
+
+    uint32_t cb = 0;
+    int32_t w = 0, h = 0;
+    {
+        auto& sec = st.secondary[displaySlot];
+        std::lock_guard<std::mutex> slk(sec.mu);
+        cb = sec.lastCb;
+        w = sec.fbW;
+        h = sec.fbH;
+    }
+    if (cb == 0 || w <= 0 || h <= 0) return -3;
+    const uint64_t need = static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 4u;
+    if (bufBytes < need) return -4;
+    // GL_RGBA = 0x1908, GL_UNSIGNED_BYTE = 0x1401
+    fb->readColorBuffer(cb, 0, 0, w, h, 0x1908, 0x1401, outRgba, bufBytes);
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+    return 0;
+}
+
 void svbox_gfx_repaint(void) {
     HostState& st = State();
     std::lock_guard<std::mutex> lk(st.mu);
@@ -716,10 +1123,33 @@ void svbox_gfx_stop(void) {
     HostState& st = State();
     st.stop.store(true);
     WakeEpoll(st);
+    if (st.presentListenFd >= 0) {
+        shutdown(st.presentListenFd, SHUT_RDWR);
+    }
     if (st.serverThread.joinable()) {
         st.serverThread.join();
     }
+    if (st.presentThread.joinable()) {
+        st.presentThread.join();
+    }
+    for (int i = 1; i < SVBOX_GFX_MAX_DISPLAYS; ++i) {
+        std::lock_guard<std::mutex> slk(st.secondary[i].mu);
+        DetachSecondarySlotLocked(st.secondary[i]);
+        st.secondary[i].lastCb = 0;
+        st.secondary[i].fbW = 0;
+        st.secondary[i].fbH = 0;
+        st.secondary[i].framesPosted.store(0);
+        st.secondary[i].fps.store(0);
+    }
     std::lock_guard<std::mutex> lk(st.mu);
+    if (st.presentListenFd >= 0) {
+        close(st.presentListenFd);
+        st.presentListenFd = -1;
+    }
+    if (!st.presentSockPath.empty()) {
+        if (st.presentSockPath[0] != '@') unlink(st.presentSockPath.c_str());
+        st.presentSockPath.clear();
+    }
     if (st.listenFd >= 0) {
         close(st.listenFd);
         st.listenFd = -1;

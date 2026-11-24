@@ -2,6 +2,7 @@
   "module": {
     "name": "entry",
     "type": "entry",
+    "srcEntry": "./ets/abilitystage/MyAbilityStage.ets",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
     "deviceTypes": [
@@ -56,6 +57,17 @@
             "actions": ["ohos.want.action.home"]
           }
         ]
+      },
+      {
+        "name": "AppWindowAbility",
+        "srcEntry": "./ets/entryability/AppWindowAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:EntryAbility_label",
+        "launchType": "specified",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true
       }
     ]
   }

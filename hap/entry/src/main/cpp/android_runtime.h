@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #pragma once
 
+#include "ohos_bridge/gpu_bridge.h"
 #include "ohos_bridge/sched_qos.h"
 
 #include <atomic>
@@ -38,10 +39,23 @@ public:
     int32_t DisplayHeight() const { return displayH_.load(); }
     void OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h);
     void OnSurfaceDestroyed(OHNativeWindow* window = nullptr);
+    void OnDisplaySurfaceChanged(int32_t displaySlot, OHNativeWindow* window, int32_t w, int32_t h);
+    void OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWindow* window = nullptr);
+    void SetDisplayVisible(int32_t displaySlot, bool visible);
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
     bool RunGuestCmd(const std::string& shCmd, const std::string& outPath);
     bool DumpProcs(const std::string& outPath);
+
+    // Multi-window / WM Agent RPC & slot management
+    bool IsWmAgentReady() const { return wmAgentReady_.load(); }
+    std::string IconsHostDir() const;
+    std::string WmRpc(const std::string& cmd, int timeoutMs = 15000);
+    int32_t AllocDisplaySlotForPkg(const std::string& pkg);
+    int32_t FindDisplaySlotForPkg(const std::string& pkg) const;
+    void ReleaseDisplaySlot(int32_t slot);
+    std::string PollWmEventsJson();
+    SvboxGfxDisplayStats GetDisplayStats(int32_t displaySlot) const;
 
     bool IsRunning() const { return running_.load(); }
     bool IsPaused() const { return paused_.load(); }
@@ -57,6 +71,7 @@ private:
     void LmkdLoop(std::string sockPath);
     void LogdwLoop(std::string sockPath, std::string outPath);
     void DnsProxyLoop(int listenFd);
+    void WmEventLoop(std::string sockPath);
     bool SleepCancelableMs(int totalMs) const;
     bool WaitForConditionMs(int maxMs, const std::function<bool()>& pred) const;
     void SetStatus(const std::string& s);
@@ -110,4 +125,13 @@ private:
     std::string gpuGuestDir_;
     std::string androidDir_;
     std::string rootfs_;
+
+    std::atomic<bool> wmAgentReady_{false};
+    std::string wmSockPath_;
+    std::string iconsHostDir_;
+    std::thread wmEventThread_;
+    std::mutex wmEventMu_;
+    std::vector<std::string> wmEventQueue_;
+    mutable std::mutex slotMapMu_;
+    std::string slotPkg_[9];
 };

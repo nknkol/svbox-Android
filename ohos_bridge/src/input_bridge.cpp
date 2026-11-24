@@ -367,23 +367,49 @@ void InputBridge::Start(const std::string& touchSockPath,
     running_.store(true);
     if (!touchSockPath.empty()) {
         touchSrv_.kind = DevKind::Touch;
+        touchSrv_.displaySlot = 0;
         touchSrv_.sockPath = touchSockPath;
         touchSrv_.listenFd = -1;
         touchSrv_.thread = std::thread(&InputBridge::RunServer, this, &touchSrv_);
     }
     if (!kbdSockPath.empty()) {
         kbdSrv_.kind = DevKind::Keyboard;
+        kbdSrv_.displaySlot = 0;
         kbdSrv_.sockPath = kbdSockPath;
         kbdSrv_.listenFd = -1;
         kbdSrv_.thread = std::thread(&InputBridge::RunServer, this, &kbdSrv_);
     }
     if (!gamepadSockPath.empty()) {
         gamepadSrv_.kind = DevKind::Gamepad;
+        gamepadSrv_.displaySlot = 0;
         gamepadSrv_.sockPath = gamepadSockPath;
         gamepadSrv_.listenFd = -1;
         gamepadSrv_.thread = std::thread(&InputBridge::RunServer, this, &gamepadSrv_);
         TryAttachGameControllerKit();
     }
+}
+
+void InputBridge::StartSecondaryTouch(int displaySlot, const std::string& sockPath) {
+    if (displaySlot < 1 || displaySlot > kMaxSecondaryDisplays || sockPath.empty()) return;
+    if (!running_.load()) return;
+    int idx = displaySlot - 1;
+    auto& st = secondaryTouchState_[idx];
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.mouseLeftDown = false;
+        st.nextTrackingId = 1;
+        for (int i = 0; i < 10; ++i) {
+            st.slotFinger[i] = -1;
+            st.slotTrack[i] = -1;
+        }
+    }
+    auto& srv = secondaryTouchSrvs_[idx];
+    if (srv.thread.joinable()) return;
+    srv.kind = DevKind::Touch;
+    srv.displaySlot = displaySlot;
+    srv.sockPath = sockPath;
+    srv.listenFd = -1;
+    srv.thread = std::thread(&InputBridge::RunServer, this, &srv);
 }
 
 void InputBridge::Stop() {
@@ -411,15 +437,26 @@ void InputBridge::Stop() {
     stopSrv(touchSrv_);
     stopSrv(kbdSrv_);
     stopSrv(gamepadSrv_);
+    for (int i = 0; i < kMaxSecondaryDisplays; ++i) {
+        stopSrv(secondaryTouchSrvs_[i]);
+    }
     touchClients_.store(0);
     kbdClients_.store(0);
     gamepadClients_.store(0);
 }
 
 void InputBridge::SetSurfaceSize(int32_t surfaceW, int32_t surfaceH) {
-    if (surfaceW > 0 && surfaceH > 0) {
+    SetDisplaySurfaceSize(0, surfaceW, surfaceH);
+}
+
+void InputBridge::SetDisplaySurfaceSize(int displaySlot, int32_t surfaceW, int32_t surfaceH) {
+    if (surfaceW <= 0 || surfaceH <= 0) return;
+    if (displaySlot == 0) {
         surfaceW_.store(surfaceW);
         surfaceH_.store(surfaceH);
+    } else if (displaySlot >= 1 && displaySlot <= kMaxSecondaryDisplays) {
+        secondaryTouchState_[displaySlot - 1].surfaceW.store(surfaceW);
+        secondaryTouchState_[displaySlot - 1].surfaceH.store(surfaceH);
     }
 }
 
@@ -465,9 +502,9 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
     }
 
     auto updateClientCount = [this, srv](int32_t cnt) {
-        if (srv->kind == DevKind::Touch) touchClients_.store(cnt);
+        if (srv->kind == DevKind::Touch && srv->displaySlot == 0) touchClients_.store(cnt);
         else if (srv->kind == DevKind::Keyboard) kbdClients_.store(cnt);
-        else gamepadClients_.store(cnt);
+        else if (srv->kind == DevKind::Gamepad) gamepadClients_.store(cnt);
     };
 
     if (hdr.op == kVdevOpOpen) {
@@ -483,16 +520,25 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
         VdevOpenRep rep = {};
         rep.proc_id = req.pid ? req.pid : 1u;
         rep.major = 13u;
-        rep.minor = (srv->kind == DevKind::Touch) ? 64u :
-                    (srv->kind == DevKind::Keyboard ? 65u : 66u);
+        if (srv->kind == DevKind::Touch && srv->displaySlot > 0) {
+            rep.minor = static_cast<uint32_t>(73 + srv->displaySlot); // event10..event17
+        } else {
+            rep.minor = (srv->kind == DevKind::Touch) ? 64u :
+                        (srv->kind == DevKind::Keyboard ? 65u : 66u);
+        }
         rep.memfd_size = 0;
         if (!SendVdevReply(fd, kVdevOpOpen, rep.proc_id, 0, &rep, sizeof(rep))) {
             close(fd);
             return;
         }
-        const char* tag = srv->kind == DevKind::Touch ? "event0(touch)" :
-                          (srv->kind == DevKind::Keyboard ? "event1(kbd)" : "event2(gamepad)");
-        OB_LOG_INFO("SvboxInput", "evdev %s opened by pid=%u", tag, req.pid);
+        if (srv->kind == DevKind::Touch && srv->displaySlot > 0) {
+            OB_LOG_INFO("SvboxInput", "evdev secondary touch slot=%d opened by pid=%u",
+                        srv->displaySlot, req.pid);
+        } else {
+            const char* tag = srv->kind == DevKind::Touch ? "event0(touch)" :
+                              (srv->kind == DevKind::Keyboard ? "event1(kbd)" : "event2(gamepad)");
+            OB_LOG_INFO("SvboxInput", "evdev %s opened by pid=%u", tag, req.pid);
+        }
         {
             std::lock_guard<std::mutex> lk(srv->clientsMu);
             srv->streamFds.push_back(fd);
@@ -573,8 +619,15 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
                 }
                 if (out.size() >= sizeof(id)) std::memcpy(out.data(), &id, sizeof(id));
             } else if (nr == 0x06) { // EVIOCGNAME
-                const char* s = srv->kind == DevKind::Touch ? "svbox-touchscreen" :
-                                (srv->kind == DevKind::Keyboard ? "svbox-keyboard" : "svbox-gamepad");
+                char buf[64];
+                const char* s = nullptr;
+                if (srv->kind == DevKind::Touch && srv->displaySlot > 0) {
+                    snprintf(buf, sizeof(buf), "svbox-touchscreen-%d", srv->displaySlot);
+                    s = buf;
+                } else {
+                    s = srv->kind == DevKind::Touch ? "svbox-touchscreen" :
+                        (srv->kind == DevKind::Keyboard ? "svbox-keyboard" : "svbox-gamepad");
+                }
                 size_t n = std::min(out.size(), std::strlen(s) + 1);
                 if (n > 0) {
                     std::memcpy(out.data(), s, n);
@@ -583,8 +636,15 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
                 out.resize(n);
                 rc = static_cast<int32_t>(n);
             } else if (nr == 0x07) { // EVIOCGPHYS
-                const char* s = srv->kind == DevKind::Touch ? "svbox/input0" :
-                                (srv->kind == DevKind::Keyboard ? "svbox/input1" : "svbox/input2");
+                char buf[64];
+                const char* s = nullptr;
+                if (srv->kind == DevKind::Touch && srv->displaySlot > 0) {
+                    snprintf(buf, sizeof(buf), "svbox-disp-%d", srv->displaySlot);
+                    s = buf;
+                } else {
+                    s = srv->kind == DevKind::Touch ? "svbox/input0" :
+                        (srv->kind == DevKind::Keyboard ? "svbox/input1" : "svbox/input2");
+                }
                 size_t n = std::min(out.size(), std::strlen(s) + 1);
                 if (n > 0) {
                     std::memcpy(out.data(), s, n);
@@ -593,8 +653,15 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
                 out.resize(n);
                 rc = static_cast<int32_t>(n);
             } else if (nr == 0x08) { // EVIOCGUNIQ
-                const char* s = srv->kind == DevKind::Touch ? "svbox-touch-0" :
-                                (srv->kind == DevKind::Keyboard ? "svbox-kbd-1" : "svbox-gamepad-2");
+                char buf[64];
+                const char* s = nullptr;
+                if (srv->kind == DevKind::Touch && srv->displaySlot > 0) {
+                    snprintf(buf, sizeof(buf), "svbox-touch-%d", srv->displaySlot);
+                    s = buf;
+                } else {
+                    s = srv->kind == DevKind::Touch ? "svbox-touch-0" :
+                        (srv->kind == DevKind::Keyboard ? "svbox-kbd-1" : "svbox-gamepad-2");
+                }
                 size_t n = std::min(out.size(), std::strlen(s) + 1);
                 if (n > 0) {
                     std::memcpy(out.data(), s, n);
@@ -676,12 +743,14 @@ void InputBridge::HandleVdevConn(EvdevServer* srv, int fd) {
                         ai.value = gamepadAbs_[absCode];
                     }
                 } else {
+                    const int32_t maxX = (srv->displaySlot > 0) ? 32767 : (displayW_.load() - 1);
+                    const int32_t maxY = (srv->displaySlot > 0) ? 32767 : (displayH_.load() - 1);
                     if (absCode == ABS_MT_POSITION_X || absCode == ABS_X) {
                         ai.minimum = 0;
-                        ai.maximum = displayW_.load() - 1;
+                        ai.maximum = maxX;
                     } else if (absCode == ABS_MT_POSITION_Y || absCode == ABS_Y) {
                         ai.minimum = 0;
-                        ai.maximum = displayH_.load() - 1;
+                        ai.maximum = maxY;
                     } else if (absCode == ABS_MT_SLOT) {
                         ai.minimum = 0;
                         ai.maximum = 9;
@@ -731,9 +800,9 @@ void InputBridge::BroadcastEvents(EvdevServer* srv, const void* data, size_t byt
         }
     }
     int32_t sz = static_cast<int32_t>(srv->streamFds.size());
-    if (srv->kind == DevKind::Touch) touchClients_.store(sz);
+    if (srv->kind == DevKind::Touch && srv->displaySlot == 0) touchClients_.store(sz);
     else if (srv->kind == DevKind::Keyboard) kbdClients_.store(sz);
-    else gamepadClients_.store(sz);
+    else if (srv->kind == DevKind::Gamepad) gamepadClients_.store(sz);
     eventsSent_.fetch_add(bytes / sizeof(struct input_event));
 }
 
@@ -753,33 +822,66 @@ int InputBridge::MapCoordY(float y) const {
     return std::clamp(v, 0, dh - 1);
 }
 
+int InputBridge::MapSecondaryCoord(float coord, int32_t surfaceSpan) const {
+    if (surfaceSpan <= 0) surfaceSpan = 1000;
+    int v = static_cast<int>(std::lround(static_cast<double>(coord) * 32767.0 / surfaceSpan));
+    return std::clamp(v, 0, 32767);
+}
+
 void InputBridge::InjectTouch(int32_t fingerId, int action, float x, float y) {
+    InjectTouchForDisplay(0, fingerId, action, x, y);
+}
+
+void InputBridge::InjectTouchForDisplay(int displaySlot, int32_t fingerId, int action, float x, float y) {
     if (!running_.load()) return;
-    int ax = MapCoordX(x);
-    int ay = MapCoordY(y);
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
+
+    EvdevServer* targetSrv = &touchSrv_;
+    std::mutex* stateMu = &touchStateMu_;
+    int32_t* slotFinger = slotFinger_;
+    int32_t* slotTrack = slotTrack_;
+    int32_t* nextTid = &nextTrackingId_;
+    int ax = 0;
+    int ay = 0;
+
+    if (displaySlot == 0) {
+        ax = MapCoordX(x);
+        ay = MapCoordY(y);
+    } else {
+        int idx = displaySlot - 1;
+        targetSrv = &secondaryTouchSrvs_[idx];
+        auto& st = secondaryTouchState_[idx];
+        stateMu = &st.mu;
+        slotFinger = st.slotFinger;
+        slotTrack = st.slotTrack;
+        nextTid = &st.nextTrackingId;
+        ax = MapSecondaryCoord(x, st.surfaceW.load());
+        ay = MapSecondaryCoord(y, st.surfaceH.load());
+    }
+
     struct timeval tv = NowMonotonicTv();
     std::vector<struct input_event> evs;
     evs.reserve(10);
 
-    std::lock_guard<std::mutex> lk(touchStateMu_);
+    std::lock_guard<std::mutex> lk(*stateMu);
     int slot = -1;
     int activeBefore = 0;
     for (int i = 0; i < 10; ++i) {
-        if (slotFinger_[i] >= 0) activeBefore++;
-        if (slotFinger_[i] == fingerId) slot = i;
+        if (slotFinger[i] >= 0) activeBefore++;
+        if (slotFinger[i] == fingerId) slot = i;
     }
 
     if (action == 0) {
         if (slot < 0) {
             for (int i = 0; i < 10; ++i) {
-                if (slotFinger_[i] < 0) { slot = i; break; }
+                if (slotFinger[i] < 0) { slot = i; break; }
             }
         }
         if (slot < 0) return;
-        int32_t tid = nextTrackingId_++;
-        if (nextTrackingId_ > 65000) nextTrackingId_ = 1;
-        slotFinger_[slot] = fingerId;
-        slotTrack_[slot] = tid;
+        int32_t tid = (*nextTid)++;
+        if (*nextTid > 65000) *nextTid = 1;
+        slotFinger[slot] = fingerId;
+        slotTrack[slot] = tid;
         PushEv(evs, tv, EV_ABS, ABS_MT_SLOT, slot);
         PushEv(evs, tv, EV_ABS, ABS_MT_TRACKING_ID, tid);
         PushEv(evs, tv, EV_ABS, ABS_MT_POSITION_X, ax);
@@ -796,11 +898,11 @@ void InputBridge::InjectTouch(int32_t fingerId, int action, float x, float y) {
         PushEv(evs, tv, EV_SYN, SYN_REPORT, 0);
     } else {
         if (slot < 0) return;
-        slotFinger_[slot] = -1;
-        slotTrack_[slot] = -1;
+        slotFinger[slot] = -1;
+        slotTrack[slot] = -1;
         int activeAfter = 0;
         for (int i = 0; i < 10; ++i) {
-            if (slotFinger_[i] >= 0) activeAfter++;
+            if (slotFinger[i] >= 0) activeAfter++;
         }
         PushEv(evs, tv, EV_ABS, ABS_MT_SLOT, slot);
         PushEv(evs, tv, EV_ABS, ABS_MT_TRACKING_ID, -1);
@@ -809,12 +911,17 @@ void InputBridge::InjectTouch(int32_t fingerId, int action, float x, float y) {
     }
 
     if (!evs.empty()) {
-        BroadcastEvents(&touchSrv_, evs.data(), evs.size() * sizeof(struct input_event));
+        BroadcastEvents(targetSrv, evs.data(), evs.size() * sizeof(struct input_event));
     }
 }
 
 void InputBridge::InjectMouse(int action, int button, float x, float y) {
+    InjectMouseForDisplay(0, action, button, x, y);
+}
+
+void InputBridge::InjectMouseForDisplay(int displaySlot, int action, int button, float x, float y) {
     if (!running_.load()) return;
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
     constexpr int32_t kMouseFingerId = 9000;
     if (button == 2) {
         if (action == 1) TapLinuxKey(KEY_BACK);
@@ -824,39 +931,47 @@ void InputBridge::InjectMouse(int action, int button, float x, float y) {
         if (action == 1) TapLinuxKey(KEY_HOMEPAGE);
         return;
     }
+    std::mutex* stateMu = (displaySlot == 0) ? &touchStateMu_ : &secondaryTouchState_[displaySlot - 1].mu;
+    bool* leftDown = (displaySlot == 0) ? &mouseLeftDown_ : &secondaryTouchState_[displaySlot - 1].mouseLeftDown;
+
     if (action == 1 && button == 1) {
         {
-            std::lock_guard<std::mutex> lk(touchStateMu_);
-            mouseLeftDown_ = true;
+            std::lock_guard<std::mutex> lk(*stateMu);
+            *leftDown = true;
         }
-        InjectTouch(kMouseFingerId, 0, x, y);
+        InjectTouchForDisplay(displaySlot, kMouseFingerId, 0, x, y);
     } else if (action == 3) {
         bool down = false;
         {
-            std::lock_guard<std::mutex> lk(touchStateMu_);
-            down = mouseLeftDown_;
+            std::lock_guard<std::mutex> lk(*stateMu);
+            down = *leftDown;
         }
-        if (down) InjectTouch(kMouseFingerId, 1, x, y);
+        if (down) InjectTouchForDisplay(displaySlot, kMouseFingerId, 1, x, y);
     } else if (action == 2 || action == 4) {
         bool down = false;
         {
-            std::lock_guard<std::mutex> lk(touchStateMu_);
-            down = mouseLeftDown_;
-            mouseLeftDown_ = false;
+            std::lock_guard<std::mutex> lk(*stateMu);
+            down = *leftDown;
+            *leftDown = false;
         }
-        if (down) InjectTouch(kMouseFingerId, 2, x, y);
+        if (down) InjectTouchForDisplay(displaySlot, kMouseFingerId, 2, x, y);
     }
 }
 
 void InputBridge::InjectScroll(float x, float y, float deltaY) {
+    InjectScrollForDisplay(0, x, y, deltaY);
+}
+
+void InputBridge::InjectScrollForDisplay(int displaySlot, float x, float y, float deltaY) {
     if (!running_.load() || std::fabs(deltaY) < 0.01f) return;
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
     constexpr int32_t kScrollFinger = 9001;
     float step = std::clamp(deltaY * 18.0f, -180.0f, 180.0f);
-    InjectTouch(kScrollFinger, 0, x, y);
+    InjectTouchForDisplay(displaySlot, kScrollFinger, 0, x, y);
     for (int i = 1; i <= 4; ++i) {
-        InjectTouch(kScrollFinger, 1, x, y - step * (static_cast<float>(i) / 4.0f));
+        InjectTouchForDisplay(displaySlot, kScrollFinger, 1, x, y - step * (static_cast<float>(i) / 4.0f));
     }
-    InjectTouch(kScrollFinger, 2, x, y - step);
+    InjectTouchForDisplay(displaySlot, kScrollFinger, 2, x, y - step);
 }
 
 void InputBridge::InjectLinuxKey(uint16_t linuxKey, bool down) {

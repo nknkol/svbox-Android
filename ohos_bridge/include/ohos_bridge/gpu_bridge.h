@@ -29,6 +29,14 @@ public:
     void SetVisible(bool visible);
     void SetRefreshRate(int32_t hz);
 
+    // Multi-display zero-copy presentation (displaySlot 0 = primary, 1..8 = secondary)
+    void SetDisplayWindow(int32_t displaySlot, OHNativeWindow* window, int32_t surfaceW, int32_t surfaceH);
+    void ClearDisplayWindow(int32_t displaySlot);
+    void SetDisplayVisible(int32_t displaySlot, bool visible);
+    SvboxGfxDisplayStats GetDisplayStats(int32_t displaySlot) const;
+    bool ReadDisplayRgba(int32_t displaySlot, void* outRgba, uint32_t bufBytes,
+                         int32_t* outW, int32_t* outH) const;
+
     bool IsActive() const { return active_.load(); }
     bool IsConnected() const;
     uint64_t FrameCount() const;
@@ -52,6 +60,11 @@ private:
     void (*fnSetVsyncHz_)(int32_t) = nullptr;
     void (*fnStop_)(void) = nullptr;
     void (*fnGetStats_)(SvboxGfxStats*) = nullptr;
+    int (*fnSetDisplayWindow_)(int32_t, void*, int32_t, int32_t) = nullptr;
+    void (*fnClearDisplayWindow_)(int32_t) = nullptr;
+    void (*fnSetDisplayVisible_)(int32_t, int) = nullptr;
+    void (*fnGetDisplayStats_)(int32_t, SvboxGfxDisplayStats*) = nullptr;
+    int (*fnReadDisplayRgba_)(int32_t, void*, uint32_t, int32_t*, int32_t*) = nullptr;
 
     std::atomic<bool> active_{false};
     OHNativeWindow* pendingWindow_ = nullptr;

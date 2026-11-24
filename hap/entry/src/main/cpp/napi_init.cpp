@@ -9,6 +9,8 @@
 
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <hilog/log.h>
 #include <mutex>
 #include <napi/native_api.h>
@@ -64,7 +66,24 @@ bool GetBoolArg(napi_env env, napi_value val, bool fallback) {
 }
 
 std::mutex g_xcMu;
-OH_NativeXComponent* g_activeXC = nullptr;
+OH_NativeXComponent* g_xcBySlot[SVBOX_GFX_MAX_DISPLAYS] = {};
+int32_t g_slotHz[SVBOX_GFX_MAX_DISPLAYS] = { 60, 60, 60, 60, 60, 60, 60, 60, 60 };
+
+int32_t DisplaySlotFromXC(OH_NativeXComponent* component) {
+    if (!component) return 0;
+    char idBuf[OH_XCOMPONENT_ID_LEN_MAX + 1] = {};
+    uint64_t idSize = OH_XCOMPONENT_ID_LEN_MAX + 1;
+    if (OH_NativeXComponent_GetXComponentId(component, idBuf, &idSize) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+        return 0;
+    }
+    const char* prefix = "svbox_display_";
+    const size_t plen = std::strlen(prefix);
+    if (std::strncmp(idBuf, prefix, plen) == 0) {
+        int32_t slot = std::atoi(idBuf + plen);
+        if (slot >= 0 && slot < SVBOX_GFX_MAX_DISPLAYS) return slot;
+    }
+    return 0;
+}
 
 void ApplyExpectedFrameRateLocked(OH_NativeXComponent* component, int32_t hz) {
     if (!component) return;
@@ -76,41 +95,48 @@ void ApplyExpectedFrameRateLocked(OH_NativeXComponent* component, int32_t hz) {
 }
 
 void OnSurfaceCreatedCB(OH_NativeXComponent* component, void* window) {
+    int32_t slot = DisplaySlotFromXC(component);
     {
         std::lock_guard<std::mutex> lk(g_xcMu);
-        g_activeXC = component;
-        ApplyExpectedFrameRateLocked(component, AndroidRuntime::Instance().RefreshRate());
+        g_xcBySlot[slot] = component;
+        int32_t hz = (slot == 0) ? AndroidRuntime::Instance().RefreshRate() : g_slotHz[slot];
+        ApplyExpectedFrameRateLocked(component, hz);
     }
     uint64_t w = 0, h = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &w, &h);
-    InputBridge::Instance().SetSurfaceSize(static_cast<int32_t>(w), static_cast<int32_t>(h));
-    AndroidRuntime::Instance().OnSurfaceChanged(
+    InputBridge::Instance().SetDisplaySurfaceSize(slot, static_cast<int32_t>(w), static_cast<int32_t>(h));
+    AndroidRuntime::Instance().OnDisplaySurfaceChanged(
+        slot,
         static_cast<OHNativeWindow*>(window),
         static_cast<int32_t>(w),
         static_cast<int32_t>(h));
 }
 
 void OnSurfaceChangedCB(OH_NativeXComponent* component, void* window) {
+    int32_t slot = DisplaySlotFromXC(component);
     uint64_t w = 0, h = 0;
     OH_NativeXComponent_GetXComponentSize(component, window, &w, &h);
-    InputBridge::Instance().SetSurfaceSize(static_cast<int32_t>(w), static_cast<int32_t>(h));
-    AndroidRuntime::Instance().OnSurfaceChanged(
+    InputBridge::Instance().SetDisplaySurfaceSize(slot, static_cast<int32_t>(w), static_cast<int32_t>(h));
+    AndroidRuntime::Instance().OnDisplaySurfaceChanged(
+        slot,
         static_cast<OHNativeWindow*>(window),
         static_cast<int32_t>(w),
         static_cast<int32_t>(h));
 }
 
 void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
+    int32_t slot = DisplaySlotFromXC(component);
     {
         std::lock_guard<std::mutex> lk(g_xcMu);
-        if (g_activeXC == component) {
-            g_activeXC = nullptr;
+        if (g_xcBySlot[slot] == component) {
+            g_xcBySlot[slot] = nullptr;
         }
     }
-    AndroidRuntime::Instance().OnSurfaceDestroyed(static_cast<OHNativeWindow*>(window));
+    AndroidRuntime::Instance().OnDisplaySurfaceDestroyed(slot, static_cast<OHNativeWindow*>(window));
 }
 
 void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
+    int32_t slot = DisplaySlotFromXC(component);
     OH_NativeXComponent_TouchEvent ev = {};
     if (OH_NativeXComponent_GetTouchEvent(component, window, &ev) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
         return;
@@ -123,15 +149,17 @@ void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
         case OH_NATIVEXCOMPONENT_CANCEL: action = 3; break;
         default: return;
     }
-    InputBridge::Instance().InjectTouch(ev.id, action, ev.x, ev.y);
+    InputBridge::Instance().InjectTouchForDisplay(slot, ev.id, action, ev.x, ev.y);
 }
 
 void DispatchMouseEventCB(OH_NativeXComponent* component, void* window) {
+    int32_t slot = DisplaySlotFromXC(component);
     OH_NativeXComponent_MouseEvent ev = {};
     if (OH_NativeXComponent_GetMouseEvent(component, window, &ev) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
         return;
     }
-    InputBridge::Instance().InjectMouse(
+    InputBridge::Instance().InjectMouseForDisplay(
+        slot,
         static_cast<int>(ev.action),
         static_cast<int>(ev.button),
         ev.x,
@@ -274,11 +302,196 @@ napi_value SetRefreshRateNapi(napi_env env, napi_callback_info info) {
     AndroidRuntime::Instance().SetRefreshRate(hz);
     {
         std::lock_guard<std::mutex> lk(g_xcMu);
-        ApplyExpectedFrameRateLocked(g_activeXC, hz);
+        g_slotHz[0] = hz;
+        ApplyExpectedFrameRateLocked(g_xcBySlot[0], hz);
     }
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
+}
+
+napi_value SetDisplayRefreshRateNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    int32_t hz = argc > 1 ? GetInt32Arg(env, args[1], 60) : 60;
+    if (hz != 60 && hz != 90 && hz != 120) hz = 60;
+    if (slot == 0) {
+        AndroidRuntime::Instance().SetRefreshRate(hz);
+    }
+    if (slot >= 0 && slot < SVBOX_GFX_MAX_DISPLAYS) {
+        int32_t maxHz = hz;
+        {
+            std::lock_guard<std::mutex> lk(g_xcMu);
+            g_slotHz[slot] = hz;
+            ApplyExpectedFrameRateLocked(g_xcBySlot[slot], hz);
+            for (int i = 0; i < SVBOX_GFX_MAX_DISPLAYS; ++i) {
+                if (g_xcBySlot[i] && g_slotHz[i] > maxHz) maxHz = g_slotHz[i];
+            }
+        }
+        // Keep host gfxstream VSync at least as high as the fastest active window
+        if (maxHz > AndroidRuntime::Instance().RefreshRate()) {
+            AndroidRuntime::Instance().SetRefreshRate(maxHz);
+        }
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value SetDisplayVisibleNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    bool visible = argc > 1 ? GetBoolArg(env, args[1], true) : true;
+    AndroidRuntime::Instance().SetDisplayVisible(slot, visible);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value SendDisplayScrollNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    float x = argc > 1 ? static_cast<float>(GetDoubleArg(env, args[1], 360.0)) : 360.0f;
+    float y = argc > 2 ? static_cast<float>(GetDoubleArg(env, args[2], 640.0)) : 640.0f;
+    float dy = argc > 3 ? static_cast<float>(GetDoubleArg(env, args[3], 0.0)) : 0.0f;
+    InputBridge::Instance().InjectScrollForDisplay(slot, x, y, dy);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value IsWmAgentReadyNapi(napi_env env, napi_callback_info) {
+    napi_value out = nullptr;
+    napi_get_boolean(env, AndroidRuntime::Instance().IsWmAgentReady(), &out);
+    return out;
+}
+
+napi_value GetIconsDirNapi(napi_env env, napi_callback_info) {
+    std::string dir = AndroidRuntime::Instance().IconsHostDir();
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, dir.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
+napi_value WmRpcNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string cmd = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string res = AndroidRuntime::Instance().WmRpc(cmd, 15000);
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, res.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
+struct WmRpcAsyncCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string cmd;
+    std::string result;
+};
+
+void WmRpcAsyncExecute(napi_env, void* data) {
+    auto* ctx = static_cast<WmRpcAsyncCtx*>(data);
+    ctx->result = AndroidRuntime::Instance().WmRpc(ctx->cmd, 25000);
+}
+
+void WmRpcAsyncComplete(napi_env env, napi_status, void* data) {
+    auto* ctx = static_cast<WmRpcAsyncCtx*>(data);
+    napi_value val = nullptr;
+    napi_create_string_utf8(env, ctx->result.c_str(), NAPI_AUTO_LENGTH, &val);
+    napi_resolve_deferred(env, ctx->deferred, val);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+napi_value WmRpcAsyncNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    auto* ctx = new WmRpcAsyncCtx();
+    ctx->cmd = argc > 0 ? GetStringArg(env, args[0]) : "";
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resName = nullptr;
+    napi_create_string_utf8(env, "svbox_wm_rpc", NAPI_AUTO_LENGTH, &resName);
+    napi_create_async_work(env, nullptr, resName, WmRpcAsyncExecute, WmRpcAsyncComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value AllocDisplaySlotNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string pkg = argc > 0 ? GetStringArg(env, args[0]) : "";
+    int32_t slot = AndroidRuntime::Instance().AllocDisplaySlotForPkg(pkg);
+    napi_value out = nullptr;
+    napi_create_int32(env, slot, &out);
+    return out;
+}
+
+napi_value FindDisplaySlotNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string pkg = argc > 0 ? GetStringArg(env, args[0]) : "";
+    int32_t slot = AndroidRuntime::Instance().FindDisplaySlotForPkg(pkg);
+    napi_value out = nullptr;
+    napi_create_int32(env, slot, &out);
+    return out;
+}
+
+napi_value ReleaseDisplaySlotNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], -1) : -1;
+    AndroidRuntime::Instance().ReleaseDisplaySlot(slot);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value PollWmEventsNapi(napi_env env, napi_callback_info) {
+    std::string json = AndroidRuntime::Instance().PollWmEventsJson();
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, json.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
+napi_value GetDisplayStatsNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    auto ds = AndroidRuntime::Instance().GetDisplayStats(slot);
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    auto setI32 = [&](const char* k, int32_t v) {
+        napi_value nv = nullptr;
+        napi_create_int32(env, v, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    auto setI64 = [&](const char* k, int64_t v) {
+        napi_value nv = nullptr;
+        napi_create_int64(env, v, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    setI32("displaySlot", ds.displaySlot);
+    setI32("attached", ds.attached);
+    setI32("visible", ds.visible);
+    setI32("width", ds.width);
+    setI32("height", ds.height);
+    setI64("framesPosted", static_cast<int64_t>(ds.framesPosted));
+    setI32("fps", ds.fps);
+    return obj;
 }
 
 napi_value SetPausedNapi(napi_env env, napi_callback_info info) {
@@ -441,6 +654,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setBool("running", rt.IsRunning());
     setBool("paused", rt.IsPaused());
     setBool("connected", useGfx ? gfx.IsConnected() : hwc.IsConnected());
+    setBool("wmAgentReady", rt.IsWmAgentReady());
     setBool("vsyncActive", useGfx ? gfx.IsActive() : hwc.UsingNativeVsync());
     setBool("inputReady", inp.HasTouchClient() || inp.HasKbdClient());
     setBool("gamepadReady", inp.HasGamepadClient());
@@ -477,6 +691,18 @@ napi_value Init(napi_env env, napi_value exports) {
         { "setResourceConfig", nullptr, SetResourceConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setGpuMode", nullptr, SetGpuModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRefreshRate", nullptr, SetRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setDisplayRefreshRate", nullptr, SetDisplayRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setDisplayVisible", nullptr, SetDisplayVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "sendDisplayScroll", nullptr, SendDisplayScrollNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "isWmAgentReady", nullptr, IsWmAgentReadyNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getIconsDir", nullptr, GetIconsDirNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "wmRpc", nullptr, WmRpcNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "wmRpcAsync", nullptr, WmRpcAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "allocDisplaySlot", nullptr, AllocDisplaySlotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "findDisplaySlot", nullptr, FindDisplaySlotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "releaseDisplaySlot", nullptr, ReleaseDisplaySlotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "pollWmEvents", nullptr, PollWmEventsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getDisplayStats", nullptr, GetDisplayStatsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setPaused", nullptr, SetPausedNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

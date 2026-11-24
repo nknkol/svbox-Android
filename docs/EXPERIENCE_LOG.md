@@ -663,6 +663,49 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **网络 / 音频 / APK 安装** | `Active default network: 100`（`Ethernet CONNECTED`, `eth0 10.0.2.15/24`, `DNS 223.5.5.5, 8.8.8.8`），`ping -c 1 223.5.5.5` `0% packet loss`；`media.audio_flinger` 在线；`pm install` / `am start` / `pm uninstall` 全通 |
 | **Layer 1 回归 & HAP 打包安装** | `svbox` 全量回归 **26/26 PASS**，Layer 1 零 Android/OHOS 词条纯净度通过；`hvigorw assembleHap` + `pack_hnp.py` + `hda install` 全部成功安装至 `HAD-W32`（`org.svbox.android`）；`rootfs/` 与 `rootfs14/` 均 0 字节改动 |
 
+---
+
+### 15. 双模式（默认自由多窗 + 传统模拟器）与鸿蒙 PC 桌面快捷方式（2026-11-24）
+
+在单一共享 Android 14 容器实例上，零修改 `rootfs14/` 实现 **默认自由多窗模式（单应用独立鸿蒙 PC 窗口）+ 一键无重启切换传统模拟器模式**，以及基于 `@kit.AppGalleryKit` `productViewManager` 的 **「发送到桌面」快捷方式**。
+
+#### A. 严格三层架构实现总览
+
+1. **Layer 1 (`svbox` `feat/vdev-binder`)**：
+   * `src/payload/include/config.h`：仅将通用常量 `CONFIG_MAX_VDEVS` 从 `16` 提升至 `32`（容纳 8 路次级虚拟触控设备 `/dev/input/event10..17`），零 Android/OHOS 词条，**26/26 回归全过**。
+2. **Layer 2 (`ohos_bridge/` + `gpu/ohos_host/`)**：
+   * **多屏零拷贝 Vulkan 呈现**：`VkEmulation::createSecondaryDisplay()` 共享宿主机 `VkDevice`/`VkQueue` 创建多路独立 `DisplayVk` + `DisplaySurface`（`SVBOX_GFX_MAX_DISPLAYS = 9`，slot 0 为主模拟器屏，slot 1..8 为独立应用窗口）；新增 `<gfx.sock>.present` AF_UNIX 零拷贝呈帧通道，直接凭 guest `ColorBuffer` `hostHandle` 调用 `FrameBuffer::borrowColorBufferForDisplay(cbHandle)` 上屏，**全程零 CPU readback**。
+   * **多屏独立触控路由**：`InputBridge` 新增 `StartSecondaryTouch(1..8)`（`/dev/input/event10..17`，`EVIOCGPHYS = "svbox-disp-<slot>"`，归一化 `0..32767` ABS_MT 坐标）及 `InjectTouchForDisplay` / `InjectMouseForDisplay` / `InjectScrollForDisplay`。
+3. **Layer 3 (`wm_agent/` + `hap/entry/`)**：
+   * **Android 14 常驻多屏窗口代理 `wm_agent/`**（不改 `rootfs14/`）：
+     * `libsvbox_wm_jni.cpp`（345 KB stripped）：封装 `AImageReader`（`GPU_SAMPLED_IMAGE | GPU_COLOR_OUTPUT`）并直接从 `AHardwareBuffer_getNativeHandle()` 提取 `gralloc.ranchu.so` `cb_handle_t::hostHandle` 投递至 `<gfx.sock>.present`。
+     * `SvboxWmAgent.java`（17.3 KB DEX，经 `app_process64 -Xusejit:false` 运行，镜像放 `/data/local/tmp/svbox_wm/` 以满足 Android 14 `clns-1` 命名空间约束）：支持 `LIST_APPS`（提取 `<= 100 KB` PNG 图标 + 自动探测 `resizeable`/`isGame`/锁定方向给出默认窗口策略）、`CREATE_DISPLAY`（原生 `60/90/120Hz` `VirtualDisplay` + `addUniqueIdAssociation("svbox-disp-N", uniqueId)` + 隐藏系统导航栏）、`RESIZE_DISPLAY`（原地 `resizeVirtualDisplay` + `setVirtualDisplaySurface` 不杀 Activity 实时重排）、`LAUNCH_APP`、`MOVE_TASK`、`POP_OUT_EMULATOR`、`PULL_BACK_TO_EMULATOR`、`SEND_KEY`、`CLOSE_APP`、`DESTROY_DISPLAY`，并通过 `ITaskStackListener` 推送异步 `CROSS_APP_LAUNCH`（自动豁免 `PermissionController`/`IntentResolver`/`SystemUI` 系统弹窗）与 `DISPLAY_EMPTY` 事件。
+   * **HarmonyOS PC 双模式 UI & 桌面快捷方式（`hap/entry/`）**：
+     * `MyAbilityStage.ets` + `AppWindowAbility.ets`（`launchType: "specified"`）+ `AppWindowPage.ets`：每个 Android 应用映射到独立鸿蒙窗口 `svbox_app_<pkg>`；支持拖拽期 GPU 平滑缩放 + 250ms 防抖实排 `RESIZE_DISPLAY`、手动切换 `自适应 / 固定竖 / 固定横`、5 档预设、独立 `60/90/120Hz`、「加桌」与「收回模拟器」，并支持从桌面快捷方式冷启动直接拉起 Android 14 并进入目标应用。
+     * `EntryAbility.ets` + `Index.ets`：默认进入 **自由多窗 App Launcher**（搜索、应用过滤、`桌面图标 N/10`、真实图标网格、模式切换与加桌/删桌、跨应用自动弹窗），一键无重启切换至 **传统模拟器模式**（`Display 0` + 5 档预设 + 60/90/120Hz + **「拆出应用」`POP_OUT_EMULATOR`**）。
+     * `AppWindowPrefs.ets` + `DesktopShortcut.ets`：按包名持久化窗口偏好（`app_window_prefs.json`），封装 `@kit.AppGalleryKit` `productViewManager`（`checkPinShortcutPermitted` / `requestNewPinShortcut` / `getPinShortcutInfos` / `removePinShortcut`，`shortcutId <= 63B`、全 string `want.parameters`、`<= 100 KB` PNG 图标，PC 上限 10 个）。
+
+#### B. 关键排障根因速记
+
+| 现象 | 根因 | 修复 |
+| :--- | :--- | :--- |
+| `app_process64` 启动 `SvboxWmAgent` `SIGSEGV (0x278)` 或拒启 | 混入 `SF_LD_PATH` 破坏 Android 14 `linkerconfig` 命名空间；`-Xint` 与 `dalvik.vm.usejit=true` 冲突 | 去掉 `SF_LD_PATH` 并使用 `-Xusejit:false` |
+| `System.load("/ipc/libsvbox_wm_jni.so")` 报 `clns-1` `UnsatisfiedLinkError` | Android 14 `libnativeloader` `clns-1` 仅允许 `/data:/mnt/expand:/system/lib64` | 宿主机将 `svbox-wm-agent.jar` 与 `libsvbox_wm_jni.so` 释放到 `/data/local/tmp/svbox_wm/` |
+| `IVirtualDisplayCallback` 回调 `AbstractMethodError` | Android 14 `VirtualDisplayAdapter` 新增 `onPaused()`/`onResumed()`/`onStopped()` | 在 `SvboxWmAgent` 的 `IVirtualDisplayCallback.Stub` 子类补全全部回调 |
+| 次级虚拟触控设备落回 Display 0 | 缺少对应 `svbox-touchscreen-<slot>.idc`（`device.internal = 0`） | 在 `inject_layer/system/usr/idc/` 生成 `svbox-touchscreen-1..8.idc` |
+
+#### C. `HAD-W32` 真机端到端验收结果（`M1_M3_DUALMODE_E2E_ALL_PASSED`）
+
+| 验收项 | 真机实测结果 |
+| :--- | :--- |
+| **Android 14 冷启动 + `SvboxWmAgent`** | Android 14 **17.4s** 启动完成，`SvboxWmAgent` 就绪，`ITaskStackListener` 注册成功 |
+| **应用列表与图标提取 (`LIST_APPS`)** | 扫描 10 个应用，全部 PNG 图标 **14.8 KB – 44.9 KB**（均 `<= 100 KB`）；自动识别 `Camera -> fixed_portrait (resize=False)`、`Settings/Calendar/Contacts/Clock/WebView -> adaptive (resize=True)` |
+| **三屏并行零拷贝渲染 + 实时重排** | 同时运行 `Display 0` (`720×1280 60/90/120Hz`) + `Display 2` (`Settings 600×900@280dpi 120Hz`, 39 帧) + `Display 3` (`Calendar 960×600@240dpi 90Hz`, 17 帧)；执行 `RESIZE_DISPLAY 1 900 600 280` 零杀进程实时横屏重排（57 帧），抓图目视清晰无花屏 |
+| **多屏独立触控路由 (`dumpsys input`)** | `svbox-touchscreen-1` (`svbox-disp-1`, `svbox-touchscreen-1.idc`) 绑定 `virtual:android:svbox-vdisp-1` (`displayId=2`, `logicalFrame=[0, 0, 900, 600]`, `isActive=[1]`)；`svbox-touchscreen-2` (`svbox-disp-2`) 绑定 `virtual:android:svbox-vdisp-2` (`displayId=3`, `logicalFrame=[0, 0, 960, 600]`) |
+| **跨应用弹窗 & 双模式实时互转** | `CROSS_APP_LAUNCH` 精准捕获 Settings 内拉起 Contacts (`taskId=10`)，且豁免 `PermissionController` 权限弹窗；`MOVE_TASK`、`SEND_KEY`、`PULL_BACK_TO_EMULATOR`（`moved=2`）、`POP_OUT_EMULATOR`（`Calendar -> displayId=3`）、`CLOSE_APP`、`DESTROY_DISPLAY` 全通；`system_server Fatal signals = 0` |
+| **构建打包与 Layer 1 回归** | `svbox` 回归 **26/26 PASS**、Layer 1 纯净度通过；`hvigorw assembleHap` 0 错误 + `pack_hnp.py` 注入 `svbox.hnp`（5.96 MB，含 `svbox`、`libsvbox_wm_jni.so`、`svbox-wm-agent.jar`），`module.json` 含 `AppWindowAbility (specified)` 与 `MyAbilityStage`；`rootfs/` 与 `rootfs14/` 0 字节改动 |
+
+
 
 
 

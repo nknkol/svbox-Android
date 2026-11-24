@@ -1320,6 +1320,31 @@ def main() -> None:
         "VkEmulatedPhysicalDeviceMemory OHOS preserve HOST_COHERENT end",
     )
 
+    # Secondary DisplayVk factory for multi-window zero-copy Vulkan presentation.
+    vkops_h = os.path.join(gfx, "host/vulkan/VkCommonOperations.h")
+    patch_file(
+        vkops_h,
+        "    DisplayVk* getDisplay();\n",
+        "    DisplayVk* getDisplay();\n"
+        "    std::unique_ptr<DisplayVk> createSecondaryDisplay();\n",
+        "VkEmulation::createSecondaryDisplay header",
+    )
+    vkops_cpp = os.path.join(gfx, "host/vulkan/VkCommonOperations.cpp")
+    patch_file(
+        vkops_cpp,
+        "DisplayVk* VkEmulation::getDisplay() { return mDisplayVk.get(); }\n",
+        "DisplayVk* VkEmulation::getDisplay() { return mDisplayVk.get(); }\n\n"
+        "std::unique_ptr<DisplayVk> VkEmulation::createSecondaryDisplay() {\n"
+        "    if (!mIvk || !mPhysicalDevice || !mDevice || !mQueue || !mQueueLock) {\n"
+        "        return nullptr;\n"
+        "    }\n"
+        "    return std::make_unique<DisplayVk>(*mIvk, mPhysicalDevice, mQueueFamilyIndex,\n"
+        "                                       mQueueFamilyIndex, mDevice, mQueue, mQueueLock,\n"
+        "                                       mQueue, mQueueLock);\n"
+        "}\n",
+        "VkEmulation::createSecondaryDisplay impl",
+    )
+
 
 if __name__ == "__main__":
     main()

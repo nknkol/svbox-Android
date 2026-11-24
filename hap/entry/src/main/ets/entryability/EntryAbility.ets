@@ -12,6 +12,7 @@ export default class EntryAbility extends UIAbility {
 
   private applyWant(want: Want, isNewWant: boolean): void {
     const rawAuto: Object | undefined = want.parameters ? want.parameters['autoStart'] : undefined;
+    const rawUiMode: Object | undefined = want.parameters ? want.parameters['uiMode'] : undefined;
     const rawGpu: Object | undefined = want.parameters ? want.parameters['gpuMode'] : undefined;
     const rawRes: Object | undefined = want.parameters ? want.parameters['resolution'] : undefined;
     const rawHz: Object | undefined = want.parameters ? want.parameters['refreshRate'] : undefined;
@@ -22,6 +23,7 @@ export default class EntryAbility extends UIAbility {
     const rawDump: Object | undefined = want.parameters ? want.parameters['dumpProcs'] : undefined;
     const rawTap: Object | undefined = want.parameters ? want.parameters['injectTap'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
+    const uiModeStr: string = typeof rawUiMode === 'string' ? rawUiMode : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
     const resStr: string = typeof rawRes === 'string' ? rawRes : '';
     const hzStr: string = typeof rawHz === 'string' ? rawHz : (typeof rawHz === 'number' ? String(rawHz) : '');
@@ -66,6 +68,11 @@ export default class EntryAbility extends UIAbility {
       return;
     }
 
+    if (uiModeStr === 'multiwindow' || uiModeStr === 'emulator') {
+      AppStorage.setOrCreate<string>('requestedUiMode', uiModeStr);
+    } else if (autoStr === 'bootanim' || autoStr === 'full') {
+      AppStorage.setOrCreate<string>('requestedUiMode', 'emulator');
+    }
     if (gpuStr.length > 0) {
       AppStorage.setOrCreate<string>('gpuMode', gpuStr);
     }
@@ -126,14 +133,15 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     try {
-      native.setVisible(true);
+      const curMode: string = AppStorage.get<string>('activeUiMode') ?? 'multiwindow';
+      native.setDisplayVisible(0, curMode === 'emulator');
     } catch (_e) {
     }
   }
 
   onBackground(): void {
     try {
-      native.setVisible(false);
+      native.setDisplayVisible(0, false);
     } catch (_e) {
     }
   }
