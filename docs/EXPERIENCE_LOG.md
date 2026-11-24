@@ -837,6 +837,29 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   3. **Layer 3 (`android_runtime.cpp`)**：`AndroidRuntime::Stop()` 改为**优先向全部容器进程组发送 `SIGCONT -> SIGTERM -> 60ms -> SIGKILL`** 让全部宿主机桥接 Socket 瞬间收到 EOF 退出，随后再 join 线程并关闭 `GfxstreamBridge`（并在 `bootThread_.join()` 后再补收一次竞态残留 PID）。
 * **真机实测验证**：执行 `autoStart restart`（完整 `Stop -> Start` 闭环），`hilog` 在 `< 1s` 内干净输出 `SvboxGfxBridge: gfxstream stopped`，全流程 **0 次 `THREAD_BLOCK` / `AppFreeze`**，且 `8s` 即完成二次重启进入 `sys.boot_completed=1`。
 
+---
+
+### 21. 酷安延迟 9–12s 闪退根因（字节 Metasec `.text` 哈希自检）→ Step 2 零字节改写 + Vulkan 流畅度深度优化
+
+#### A. 延迟闪退根因定位（`libPglbizssdk_ml.so` 精确到单条指令）
+* **现象**：酷安通过 Step 1 正常进入首页后，约 `9–12s` 在穿山甲线程 `csj_io` / `csj_b_6` 触发 `SIGSEGV (fault addr 0x4000)`，寄存器呈现典型反篡改自毁特征：`sp = x29 = 0x7b`、`lr = 0`、`pc = 0x4000`、`x8 = 0x77df8b85`（期望哈希）、`x9` 每次启动随 ASLR 变化。
+* **反汇编铁证**：`ucrash` 日志与 `linker64` 寄存器定位到 `com.volcengine.mobsecBiz.metasec.ml.PglMSManagerUtils.init` 加载的 **`libPglbizssdk_ml.so`**（含 **197 处内联 `svc #0`**）。其 `DT_INIT_ARRAY` 构造函数 `0xa7a70` 在魔数标记 `0xff77f6f1` (`0xa7b90`) 与 `0xf077f6f1` (`0xa7c9c`) 之间放置了不可达的诱饵 `svc #0`（`0xa7bec`、`0xa7c50`），随后对区间内所有 32 位指令做滚动异或/移位哈希并与 `0x77df8b85` 比对；`svbox` 原先将其内联改写为 `b <stub_island>` 导致哈希失配，直接调用 `0xa47f0` 自毁。
+* **Step 2 通用解法（Layer 1 `svbox` `feat/vdev-binder`）**：
+  * 实测验证鸿蒙 HAP 沙箱内允许 `PR_SET_NO_NEW_PRIVS` + `seccomp(SECCOMP_SET_MODE_FILTER)`（`rc=0`）。
+  * 打通 `--seccomp-backstop` 与 `--trap-sigsys` 组合（[backstop.c](file:///storage/Users/currentUser/Workspace/svbox/src/loader/backstop.c)、[signals.c](file:///storage/Users/currentUser/Workspace/svbox/src/loader/signals.c)、[main.c](file:///storage/Users/currentUser/Workspace/svbox/src/loader/main.c)）：`SIGSYS` 处理器携带 `SA_RESTORER` (`svbox_sigsys_restorer`)，捕获 `si_errno == BACKSTOP_TRAP_DATA` 的未改写 `svc #0` 转发 `dispatch_syscall()`，宿主机沙箱触发的其他 `SYS_SECCOMP` 则按 `--trap-sigsys` 转 `-ENOSYS`。
+  * 新增通用选项 `--no-inline-patch` 与 `--no-inline-patch-prefix DIR`（[options.c](file:///storage/Users/currentUser/Workspace/svbox/src/loader/options.c)、[dispatch.c](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c)）：Layer 3（[android_runtime.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)）传入 `--seccomp-backstop --trap-sigsys --no-inline-patch-prefix /data --no-inline-patch-prefix /data_mirror`。系统库（`/system`、`/apex`、`/vendor`）继续走全速内联补丁（9s 进桌面），而所有用户应用 `.so` 及运行期 `mprotect(PROT_EXEC)` 解壳代码 **0 字节改写 `.text`**，同时全部直接 `svc #0` 经 `seccomp-backstop` 透明拦截。
+  * **真机验证**：酷安连续滑动 25s+（含打开 `WebViewActivity`）**同 PID 零崩溃**，彻底通过 Metasec 完整性校验。
+
+#### B. 酷安流畅度瓶颈定位与 Vulkan 4 KiB 脏页 Diff 优化
+* **`dumpsys gfxinfo framestats` 根因**：UI 线程仅 `2–5 ms`、Maleoon 916 GPU 仅 `1 ms`，但 Vulkan 模式 `RenderThread` (`IssueDrawCommandsStart -> SwapBuffers`) 高达 **`35–95 ms`**（P50 `97 ms` ≈ 10 fps）。根因在于此前 Guest 侧 `HOST_COHERENT` 模拟（[apply_guest_patches.py](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/apply_guest_patches.py)）在每次 `on_vkQueueSubmit()` 中对所有常驻映射的 `VkDeviceMemory` 全量刷写 `VK_WHOLE_SIZE`（每帧经 `/ipc/gfxstream.sock` 拷贝数十 MB）。
+* **优化落地**：在 `ResourceTracker.cpp` 引入 4 KiB 粒度脏页对比与连续合并（`flushShadowPtr` + `flushPageSynced` 位图），仅通过 socket 刷写实际改动的脏页。
+* **真机同口径滑动实测对比（`720×1280 @ 120Hz`）**：
+  * **Vulkan 优化前**：`232 帧` · Janky `93.97%` · P50 **`97 ms`** · P90 `250 ms` · P99 `700 ms` · `IssueDraw->Swap` `35–95 ms`
+  * **Vulkan 4 KiB 脏页优化后**：`248 帧` · Janky `66.53%` · P50 **`36 ms`（快 2.7×）** · P90 `69 ms`（快 3.6×） · P99 `150 ms`（快 4.7×） · `IssueDraw->Swap` **`13–19 ms`**
+  * **GLES（`skiagl`）同场景对比**：**`704 帧`**（~70–100+ fps）· Janky **`13.78%`** · P50 **`14 ms`**（大量帧 `6–11 ms`）· P90 `27 ms` · `IssueDraw->Swap` **`5.4–7.5 ms`**
+  * 剩余差距原因：Vulkan 模式当前无 `GlDirectMem`（跨进程 `memfd`/`ashmem` 零拷贝）且 `vkFlushMappedMemoryRanges` 每次需同步等回复，外加无 `/dev/goldfish_sync` 时 `qsriFence`/`vkDeviceWaitIdle` 串行等待；后续通过 `SCM_RIGHTS` 共享 `memfd` 开启 `GlDirectMem` + 异步虚拟 sync FD 可将 Vulkan 也推至 90–120 fps。
+
+
 
 
 

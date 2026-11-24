@@ -72,7 +72,10 @@ def main() -> None:
         bool directMapped = false;
         bool isMapped = false;
         VkDeviceSize mapOffset = 0;
-        VkDeviceSize mapSize = 0;""",
+        VkDeviceSize mapSize = 0;
+        uint8_t* flushShadowPtr = nullptr;
+        VkDeviceSize flushShadowSize = 0;
+        std::vector<uint8_t> flushPageSynced;""",
     )
 
     patch_file(
@@ -163,6 +166,12 @@ def main() -> None:
         if (it == info_VkDeviceMemory.end()) return;
         auto& info = it->second;
         info.isMapped = false;
+        if (info.flushShadowPtr && info.flushShadowSize > 0) {
+            munmap(info.flushShadowPtr, info.flushShadowSize);
+            info.flushShadowPtr = nullptr;
+            info.flushShadowSize = 0;
+            info.flushPageSynced.clear();
+        }
         uint64_t memoryObjectId = (uint64_t)(void*)memory;""",
     )
 
@@ -190,12 +199,86 @@ def main() -> None:
         return host_result;
     }
 
+    void collectCoherentDirtyRangesLocked(
+        VkDeviceMemory memory,
+        VkDeviceMemory_Info& info,
+        VkDeviceSize reqOffset,
+        VkDeviceSize reqSize,
+        std::vector<VkMappedMemoryRange>& out) {
+        if (!info.mappedPtr || info.mappedSize == 0) return;
+        VkDeviceSize startOff = reqOffset < info.mappedSize ? reqOffset : info.mappedSize;
+        VkDeviceSize endOff = (reqSize == VK_WHOLE_SIZE || reqSize > info.mappedSize - startOff)
+                                  ? info.mappedSize
+                                  : (startOff + reqSize);
+        if (endOff <= startOff) return;
+
+        constexpr VkDeviceSize kPage = 4096;
+        VkDeviceSize scanStart = startOff & ~(kPage - 1);
+        VkDeviceSize scanEnd = (endOff + kPage - 1) & ~(kPage - 1);
+        if (scanEnd > info.mappedSize) scanEnd = info.mappedSize;
+
+        if (!info.flushShadowPtr) {
+            void* shadow = mmap(nullptr, info.mappedSize, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (shadow == MAP_FAILED || !shadow) {
+                VkMappedMemoryRange r{};
+                r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                r.memory = memory;
+                r.offset = scanStart;
+                r.size = scanEnd - scanStart;
+                out.push_back(r);
+                return;
+            }
+            info.flushShadowPtr = static_cast<uint8_t*>(shadow);
+            info.flushShadowSize = info.mappedSize;
+            size_t numPages = static_cast<size_t>((info.mappedSize + kPage - 1) / kPage);
+            info.flushPageSynced.assign((numPages + 7) / 8, 0);
+        }
+
+        bool inDirty = false;
+        VkDeviceSize dirtyStart = 0;
+        VkDeviceSize dirtyEnd = 0;
+        for (VkDeviceSize off = scanStart; off < scanEnd; off += kPage) {
+            VkDeviceSize chunk = (scanEnd - off < kPage) ? (scanEnd - off) : kPage;
+            size_t pageIdx = static_cast<size_t>(off / kPage);
+            uint8_t& byteRef = info.flushPageSynced[pageIdx >> 3];
+            uint8_t bitMask = static_cast<uint8_t>(1u << (pageIdx & 7));
+            bool synced = (byteRef & bitMask) != 0;
+            bool dirty = !synced ||
+                         (memcmp(info.mappedPtr + off, info.flushShadowPtr + off, chunk) != 0);
+            if (dirty) {
+                memcpy(info.flushShadowPtr + off, info.mappedPtr + off, chunk);
+                byteRef |= bitMask;
+                if (!inDirty) {
+                    inDirty = true;
+                    dirtyStart = off;
+                }
+                dirtyEnd = off + chunk;
+            } else if (inDirty) {
+                VkMappedMemoryRange r{};
+                r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                r.memory = memory;
+                r.offset = dirtyStart;
+                r.size = dirtyEnd - dirtyStart;
+                out.push_back(r);
+                inDirty = false;
+            }
+        }
+        if (inDirty) {
+            VkMappedMemoryRange r{};
+            r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            r.memory = memory;
+            r.offset = dirtyStart;
+            r.size = dirtyEnd - dirtyStart;
+            out.push_back(r);
+        }
+    }
+
     void on_vkUnmapMemory(
         void* context,
         VkDevice device,
         VkDeviceMemory memory) {
-        VkMappedMemoryRange range{};
-        bool shouldFlush = false;
+        std::vector<VkMappedMemoryRange> unmapRanges;
         {
             AutoLock<RecursiveLock> lock(mLock);
             auto it = info_VkDeviceMemory.find(memory);
@@ -207,19 +290,18 @@ def main() -> None:
                     if (info.memoryTypeIndex < props.memoryTypeCount &&
                         (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                        range.memory = memory;
-                        range.offset = 0;
-                        range.size = VK_WHOLE_SIZE;
-                        shouldFlush = true;
+                        collectCoherentDirtyRangesLocked(
+                            memory, info, info.mapOffset, info.mapSize, unmapRanges);
                     }
                 }
                 info.isMapped = false;
             }
         }
-        if (shouldFlush && context) {
+        if (!unmapRanges.empty() && context) {
             VkEncoder* enc = (VkEncoder*)context;
-            enc->vkFlushMappedMemoryRanges(device, 1, &range, true /* do lock */);
+            enc->vkFlushMappedMemoryRanges(
+                device, static_cast<uint32_t>(unmapRanges.size()),
+                unmapRanges.data(), true /* do lock */);
         }
     }""",
     )
@@ -246,19 +328,15 @@ def main() -> None:
                 if (qIt != info_VkQueue.end()) {
                     qDev = qIt->second.device;
                     const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
-                    for (const auto& kv : info_VkDeviceMemory) {
-                        const auto& info = kv.second;
+                    for (auto& kv : info_VkDeviceMemory) {
+                        auto& info = kv.second;
                         if (info.ownerDevice == qDev && info.isMapped && info.directMapped &&
                             info.mappedPtr && info.mappedSize > 0 &&
                             info.memoryTypeIndex < props.memoryTypeCount &&
                             (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                            VkMappedMemoryRange r{};
-                            r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                            r.memory = kv.first;
-                            r.offset = 0;
-                            r.size = VK_WHOLE_SIZE;
-                            coherentRanges.push_back(r);
+                            collectCoherentDirtyRangesLocked(
+                                kv.first, info, info.mapOffset, info.mapSize, coherentRanges);
                         }
                     }
                 }
