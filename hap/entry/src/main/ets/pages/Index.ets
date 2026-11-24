@@ -206,6 +206,12 @@ struct Index {
         const mode: string | undefined = AppStorage.get<string>('autoStart');
         if (mode === 'bootanim' || mode === 'full') {
           this.startInstance(mode);
+        } else if (mode === 'restart') {
+          native.stopContainer();
+          this.running = false;
+          setTimeout((): void => {
+            this.startInstance('full');
+          }, 300);
         }
       }
 

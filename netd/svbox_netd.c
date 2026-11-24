@@ -44,6 +44,7 @@
 #define NODE_SUSPEND_CTRL       0x1009ull
 #define NODE_SUSPEND_CTRL_INT   0x100aull
 #define NODE_VOLD               0x100bull
+#define NODE_STATSD             0x100cull
 
 /* Android 14 IVold transaction codes (verified from framework.jar classes3.dex) */
 #define VOLD_TX_SET_LISTENER               1u
@@ -1073,12 +1074,14 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         else if (node == NODE_SUSPEND_CTRL) p_str16(&reply, "android.system.suspend.ISuspendControlService");
         else if (node == NODE_SUSPEND_CTRL_INT) p_str16(&reply, "android.system.suspend.internal.ISuspendControlServiceInternal");
         else if (node == NODE_VOLD) p_str16(&reply, "android.os.IVold");
+        else if (node == NODE_STATSD) p_str16(&reply, "android.os.IStatsd");
         else p_str16(&reply, "android.net.INetd");
     } else if (code == GET_INTERFACE_VERSION) {
         p_i32(&reply, 0);
         p_i32(&reply, node == NODE_DNSRESOLVER ? 9 :
                       ((node == NODE_OEMNETD || node == NODE_SYSTEM_SUSPEND || node == NODE_WAKELOCK ||
-                        node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT || node == NODE_VOLD) ? 1 : 12));
+                        node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT || node == NODE_VOLD ||
+                        node == NODE_STATSD) ? 1 : 12));
     } else if (code == GET_INTERFACE_HASH) {
         p_i32(&reply, 0);
         if (node == NODE_DNSRESOLVER)
@@ -1094,7 +1097,7 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         if (code == 1u) { /* acquireWakeLock */
             p_binder_stab(&reply, NODE_WAKELOCK, NODE_WAKELOCK, 0x3f);
         }
-    } else if (node == NODE_WAKELOCK || node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT) {
+    } else if (node == NODE_WAKELOCK || node == NODE_SUSPEND_CTRL || node == NODE_SUSPEND_CTRL_INT || node == NODE_STATSD) {
         p_i32(&reply, 0);
         p_i32(&reply, 0);
     } else if (node == NODE_AUDIO_POLICY || node == NODE_AUDIO_FLINGER || node == NODE_MEDIA_METRICS) {
@@ -1539,12 +1542,10 @@ static void handle_transaction(const struct sv_binder_transaction_data *tr)
         } else if (code == VOLD_TX_ON_USER_ADDED) {
             int32_t uid = 0;
             if (pr.buf && pr_skip_iface_token(&pr) == 0 && pr_i32(&pr, &uid) == 0) {
+                /* Match stock AOSP VolumeManager: onUserAdded only registers user metadata;
+                 * EmulatedVolume creation happens in onUserStarted once mStartedUsers has uid. */
                 fprintf(stderr, "[svbox-netd] vold: onUserAdded(userId=%d)\n", uid);
                 fflush(stderr);
-                if (uid >= 0 && uid < 32 && !(g_vold_created_users_mask & (1u << uid))) {
-                    g_vold_created_users_mask |= (1u << uid);
-                    post_vold_create_uid = uid;
-                }
             }
             p_i32(&reply, 0);
         } else if (code == VOLD_TX_ON_USER_STARTED) {
@@ -1781,6 +1782,8 @@ int main(int argc, char **argv)
     if (register_vold && add_service("vold", NODE_VOLD) == 0)
         fprintf(stderr, "[svbox-netd] registered 'vold' (FUSE-less, data_dir=%s)\n",
                 g_data_dir[0] ? g_data_dir : "<none>");
+    if (add_service("stats", NODE_STATSD) == 0)
+        fprintf(stderr, "[svbox-netd] registered 'stats' (stub)\n");
     if (register_audio_stubs) {
         add_service("media.audio_policy", NODE_AUDIO_POLICY);
         add_service("media.audio_flinger", NODE_AUDIO_FLINGER);

@@ -103,6 +103,7 @@ struct bproc {
     int              handles_cap;
     struct bmsg     *inbox_head;
     struct bmsg     *inbox_tail;
+    uint32_t         async_node_count;
 };
 
 struct bnode {
@@ -117,6 +118,8 @@ struct bnode {
     bool     pending_weak_ref;
     bool     pending_strong_ref;
     bool     has_async_txn;
+    int32_t  handle_count;
+    int32_t  strong_ref_total;
     uint64_t async_buf_ptr;
     struct bmsg *async_head;
     struct bmsg *async_tail;
@@ -461,6 +464,8 @@ static struct bhandle *get_or_create_handle_entry(struct bproc *proc, uint32_t n
             proc->handles[i].handle = proc->next_handle++;
             if (proc->next_handle == 0) proc->next_handle = 1;
             proc->handles[i].node_id = node_id;
+            struct bnode *nd = find_node(node_id);
+            if (nd) nd->handle_count++;
             return &proc->handles[i];
         }
     }
@@ -476,6 +481,8 @@ static struct bhandle *get_or_create_handle_entry(struct bproc *proc, uint32_t n
     proc->handles[idx].handle = proc->next_handle++;
     if (proc->next_handle == 0) proc->next_handle = 1;
     proc->handles[idx].node_id = node_id;
+    struct bnode *nd = find_node(node_id);
+    if (nd) nd->handle_count++;
     return &proc->handles[idx];
 }
 
@@ -490,8 +497,13 @@ static void maybe_reclaim_handle(struct bproc *proc, struct bhandle *he)
     uint32_t nid = he->node_id;
     he->used = false;
     he->node_id = 0;
-    if (nid != 0)
-        node_check_release(find_node(nid));
+    if (nid != 0) {
+        struct bnode *nd = find_node(nid);
+        if (nd) {
+            if (nd->handle_count > 0) nd->handle_count--;
+            node_check_release(nd);
+        }
+    }
 }
 
 static void mem_block_add_handle(struct mem_block *blk, uint32_t handle)
@@ -523,8 +535,16 @@ static void mem_block_release_handles(struct bproc *proc, struct mem_block *blk)
         uint32_t h = (i < INLINE_BLK_HANDLES) ? blk->handles[i] : blk->extra_handles[i - INLINE_BLK_HANDLES];
         struct bhandle *he = find_handle_entry(proc, h);
         if (he) {
-            if (he->in_flight > 0)
+            uint32_t nid = he->node_id;
+            if (he->in_flight > 0) {
                 he->in_flight--;
+                struct bnode *nd = nid ? find_node(nid) : NULL;
+                if (nd && nd->strong_ref_total > 0) {
+                    nd->strong_ref_total--;
+                    if (nd->strong_ref_total == 0)
+                        node_check_release(nd);
+                }
+            }
             maybe_reclaim_handle(proc, he);
         }
     }
@@ -805,25 +825,9 @@ static void node_check_release(struct bnode *node)
     struct bproc *owner = find_proc(node->owner_proc_id);
     if (!owner)
         return;
-    bool any_strong = false;
-    bool any_weak = false;
-    uint32_t nid = node->node_id;
-    for (int pi = 0; pi < MAX_PROCS; pi++) {
-        if (!g_procs[pi].used || !g_procs[pi].handles)
-            continue;
-        for (int hi = 0; hi < g_procs[pi].handles_cap; hi++) {
-            struct bhandle *he = &g_procs[pi].handles[hi];
-            if (he->used && he->node_id == nid) {
-                any_weak = true;
-                if (he->strong_refs > 0 || he->in_flight > 0) {
-                    any_strong = true;
-                    break;
-                }
-            }
-        }
-        if (any_strong)
-            break;
-    }
+    /* O(1) strong/weak reference check maintained across all handle operations. */
+    bool any_strong = (node->strong_ref_total > 0);
+    bool any_weak   = (node->handle_count > 0);
     uint64_t pc[2] = { node->ptr, node->cookie };
     if (!any_strong && node->has_strong_ref && !node->pending_strong_ref) {
         node->has_strong_ref = false;
@@ -1059,6 +1063,8 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
                     if (he) {
                         h = he->handle;
                         he->in_flight++;
+                        struct bnode *nd = find_node(nid);
+                        if (nd) nd->strong_ref_total++;
                         if (alloc_idx >= 0)
                             mem_block_add_handle(&target_p->allocs[alloc_idx], h);
                     } else {
@@ -1090,6 +1096,8 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
                         if (he) {
                             h = he->handle;
                             he->in_flight++;
+                            struct bnode *nd = find_node(nid);
+                            if (nd) nd->strong_ref_total++;
                             if (alloc_idx >= 0)
                                 mem_block_add_handle(&target_p->allocs[alloc_idx], h);
                         } else {
@@ -1166,6 +1174,7 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
         } else {
             target_node->has_async_txn = true;
             target_node->async_buf_ptr = msg->data_guest_ptr;
+            target_p->async_node_count++;
             push_inbox(target_p, msg);
             wake_proc_waiters(target_p);
         }
@@ -1261,24 +1270,27 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             memcpy(&ptr, arg, 8);
             proc_mem_free(proc, ptr);
             /* Advance serialized TF_ONE_WAY queue on any node whose active async buffer was freed. */
-            for (int ni = 0; ni < g_nodes_cap; ni++) {
-                struct bnode *nd = &g_nodes[ni];
-                if (nd->used && nd->owner_proc_id == proc->proc_id &&
-                    nd->has_async_txn && nd->async_buf_ptr == ptr) {
-                    if (nd->async_head) {
-                        struct bmsg *nxt = nd->async_head;
-                        nd->async_head = nxt->next;
-                        if (!nd->async_head) nd->async_tail = NULL;
-                        nxt->next = NULL;
-                        nd->async_buf_ptr = nxt->data_guest_ptr;
-                        push_inbox(proc, nxt);
-                        wake_proc_waiters(proc);
-                    } else {
-                        nd->has_async_txn = false;
-                        nd->async_buf_ptr = 0;
-                        node_check_release(nd);
+            if (proc->async_node_count > 0) {
+                for (int ni = 0; ni < g_nodes_cap; ni++) {
+                    struct bnode *nd = &g_nodes[ni];
+                    if (nd->used && nd->owner_proc_id == proc->proc_id &&
+                        nd->has_async_txn && nd->async_buf_ptr == ptr) {
+                        if (nd->async_head) {
+                            struct bmsg *nxt = nd->async_head;
+                            nd->async_head = nxt->next;
+                            if (!nd->async_head) nd->async_tail = NULL;
+                            nxt->next = NULL;
+                            nd->async_buf_ptr = nxt->data_guest_ptr;
+                            push_inbox(proc, nxt);
+                            wake_proc_waiters(proc);
+                        } else {
+                            nd->has_async_txn = false;
+                            nd->async_buf_ptr = 0;
+                            if (proc->async_node_count > 0) proc->async_node_count--;
+                            node_check_release(nd);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
             break;
@@ -1303,15 +1315,16 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             uint32_t h = 0;
             memcpy(&h, arg, 4);
             struct bhandle *he = find_handle_entry(proc, h);
+            struct bnode *n = lookup_handle_node(proc, h);
             if (he) {
                 if (cmd == SV_BC_ACQUIRE) {
                     he->strong_refs++;
                     he->released_strong = false;
+                    if (n) n->strong_ref_total++;
                 } else {
                     he->weak_refs++;
                 }
             }
-            struct bnode *n = lookup_handle_node(proc, h);
             if (n)
                 node_inc_refs(n, cmd == SV_BC_ACQUIRE, NULL);
             break;
@@ -1324,7 +1337,12 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             if (he) {
                 uint32_t nid = he->node_id;
                 if (cmd == SV_BC_RELEASE) {
-                    if (he->strong_refs > 0) he->strong_refs--;
+                    if (he->strong_refs > 0) {
+                        he->strong_refs--;
+                        struct bnode *nd = nid ? find_node(nid) : NULL;
+                        if (nd && nd->strong_ref_total > 0)
+                            nd->strong_ref_total--;
+                    }
                     if (he->strong_refs == 0) {
                         he->released_strong = true;
                         if (nid != 0)
@@ -1499,8 +1517,17 @@ static void drop_conn(struct conn_entry *ce)
                 rel_nodes = (uint32_t *)malloc((size_t)p->handles_cap * sizeof(uint32_t));
                 for (int hi = 0; hi < p->handles_cap; hi++) {
                     if (p->handles[hi].used) {
-                        if (rel_nodes && p->handles[hi].node_id != 0)
-                            rel_nodes[rel_count++] = p->handles[hi].node_id;
+                        uint32_t nid = p->handles[hi].node_id;
+                        if (nid != 0) {
+                            struct bnode *nd = find_node(nid);
+                            if (nd) {
+                                int32_t sr = p->handles[hi].strong_refs + p->handles[hi].in_flight;
+                                nd->strong_ref_total = (nd->strong_ref_total > sr) ? (nd->strong_ref_total - sr) : 0;
+                                if (nd->handle_count > 0) nd->handle_count--;
+                            }
+                            if (rel_nodes)
+                                rel_nodes[rel_count++] = nid;
+                        }
                         p->handles[hi].used = false;
                         p->handles[hi].node_id = 0;
                         p->handles[hi].strong_refs = 0;

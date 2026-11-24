@@ -976,6 +976,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-u", "0:0",
         "--cap-add", "ALL",
         "--trap-sigsys",
+        "--deny-memfd-prefix", "jit-",
         "--kernel-sysname", "Linux",
         "--kernel-release", "5.15.0-android14",
         "--hostname", "localhost",
@@ -1015,7 +1016,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", rootfs_ + "/system/apex:/apex",
         "-v", rootfs_ + "/system/apex/com.android.vndk.current:/apex/com.android.vndk.v34",
         "-v", runBase_ + "/apex-info-list.xml:/apex/apex-info-list.xml",
-        "-v", runBase_ + "/linkerconfig:/linkerconfig",
+        "-v", dataBase_ + "/cache/linkerconfig_a14:/linkerconfig",
         "-v", rootfs_ + "/system/etc:/etc",
         "-v", runBase_ + "/resolv.conf:/etc/resolv.conf",
         "-v", rootfs_ + "/system/product:/product",
@@ -1975,6 +1976,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/data/misc/keystore",
         "/data/misc/gatekeeper", "/data/misc/installd", "/data/misc/user/0",
         "/data/misc/media", "/data/misc/credstore", "/data/misc/ethernet",
+        "/data/misc/bluetooth", "/data/misc/bluetooth/logs", "/data/misc/bluedroid",
         "/data/misc_ce/0", "/data/misc_de/0", "/data/vendor_ce/0", "/data/vendor_de/0",
         "/data/media/0", "/data/media/0/Download", "/data/media/0/Download/HarmonyShare",
         "/data/media/0/Pictures", "/data/media/0/DCIM", "/data/media/0/DCIM/Camera",
@@ -2394,30 +2396,69 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         return Spawn(args, nullStdio, nullStdio ? "" : (logDir + "/" + tag + ".log"), keepFds);
     };
 
-    // 2.5 Generate Android 14 /linkerconfig/ld.config.txt into ephemeral runBase_/linkerconfig
+    // Persistent cross-boot SVC-site scan cache symlinked into mount_scratch
     {
-        SetStatus("Generating Android 14 linkerconfig...");
-        pid_t lcPid = runSvbox("linkerconfig",
-                               { "apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig" });
-        if (lcPid > 0) {
-            int st = 0;
-            waitpid(lcPid, &st, 0);
+        const std::string persistCacheDir = dataBase_ + "/cache";
+        MkdirP(persistCacheDir);
+        const std::string persistSvcCache = persistCacheDir + "/svbox_svc_cache";
+        const std::string scratchSvcCache = runBase_ + "/tmpfs/.svbox_svc_cache";
+        struct stat st = {};
+        if (lstat(scratchSvcCache.c_str(), &st) != 0) {
+            (void)symlink(persistSvcCache.c_str(), scratchSvcCache.c_str());
         }
-        const std::string lcDir = runBase_ + "/linkerconfig";
+    }
+
+    // 2.5 Generate Android 14 /linkerconfig/* directly into persistent cache dir (all files + apex.libraries.config.txt)
+    {
+        const std::string lcDir = dataBase_ + "/cache/linkerconfig_a14";
         const std::string lcFile = lcDir + "/ld.config.txt";
+        const std::string lcApex = lcDir + "/apex.libraries.config.txt";
+        const std::string lcSig = lcDir + "/.sig";
+        MkdirP(lcDir);
+        struct stat bpSt = {}, apSt = {};
+        stat((rootfs_ + "/system/build.prop").c_str(), &bpSt);
+        stat((runBase_ + "/apex-info-list.xml").c_str(), &apSt);
+        const std::string curSig = std::to_string(bpSt.st_size) + ":" +
+                                   std::to_string(bpSt.st_mtime) + ":" +
+                                   std::to_string(apSt.st_size) + "\n";
+        std::string savedSig;
+        {
+            int sfd = open(lcSig.c_str(), O_RDONLY);
+            if (sfd >= 0) {
+                char buf[128] = {};
+                ssize_t n = read(sfd, buf, sizeof(buf) - 1);
+                if (n > 0) savedSig.assign(buf, static_cast<size_t>(n));
+                close(sfd);
+            }
+        }
+        bool cacheHit = (savedSig == curSig && FileExists(lcFile) && FileExists(lcApex));
+        if (!cacheHit) {
+            SetStatus("Generating Android 14 linkerconfig...");
+            pid_t lcPid = runSvbox("linkerconfig",
+                                   { "apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig" });
+            if (lcPid > 0) {
+                int st = 0;
+                waitpid(lcPid, &st, 0);
+            }
+            if (FileExists(lcFile) && FileExists(lcApex)) {
+                WriteFile(lcSig, curSig);
+            }
+        }
         chmod(lcDir.c_str(), 0755);
         chmod(lcFile.c_str(), 0644);
+        chmod(lcApex.c_str(), 0644);
         struct stat lcSt = {};
         int r = stat(lcFile.c_str(), &lcSt);
-        logLine("Android 14 linkerconfig generated: stat=" + std::to_string(r) +
+        logLine("Android 14 linkerconfig " + std::string(cacheHit ? "cached" : "generated") +
+                ": stat=" + std::to_string(r) +
                 " size=" + std::to_string(lcSt.st_size) + " mode=" + std::to_string(lcSt.st_mode));
     }
 
     SetStatus("Starting servicemanager & graphics HALs...");
     runSvbox("servicemanager", { "system/bin/servicemanager" });
-    if (!SleepCancelableMs(80)) return;
+    if (!SleepCancelableMs(40)) return;
     runSvbox("hwservicemanager", { "system/bin/hwservicemanager" });
-    if (!SleepCancelableMs(150)) return;
+    if (!SleepCancelableMs(80)) return;
 
     const std::string sfLdPath =
         "LD_LIBRARY_PATH=/system/lib64:/system_ext/lib64:/product/lib64:"
@@ -2432,12 +2473,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     // 4. Graphics HALs
     runSvbox("hidl_alloc", { "-e", sfLdPath, "system/bin/hw/android.hidl.allocator@1.0-service" });
-    if (!SleepCancelableMs(40)) return;
+    if (!SleepCancelableMs(20)) return;
     runSvbox("gralloc", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.allocator@2.0-service" });
-    if (!SleepCancelableMs(60)) return;
+    if (!SleepCancelableMs(30)) return;
     runSvbox("hwcomposer", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.graphics.composer@2.1-service" });
     if (useGfx) {
-        if (!SleepCancelableMs(180)) return;
+        if (!SleepCancelableMs(100)) return;
     } else {
         WaitForFile(ipcDir + "/hwcomposer.sock", 1500);
     }
@@ -2492,15 +2533,21 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         auto launchPaced = [&](const std::string& tag, const std::vector<std::string>& cmd) {
             runSvbox(tag, cmd);
-            SleepCancelableMs(25);
+            SleepCancelableMs(8);
         };
         if (useRealAudio) {
             launchPaced("audio_hal", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.audio.service" });
-            SleepCancelableMs(150);
+            SleepCancelableMs(80);
             launchPaced("audioserver", { "-e", sfLdPath, "system/bin/audioserver" });
         }
         if (FileExists(rootfs_ + "/system/bin/cameraserver")) {
             launchPaced("cameraserver", { "-e", sfLdPath, "system/bin/cameraserver" });
+        }
+        if (FileExists(rootfs_ + "/system/bin/mediaextractor")) {
+            launchPaced("mediaextractor", { "system/bin/mediaextractor" });
+        }
+        if (FileExists(rootfs_ + "/system/bin/mediaserver")) {
+            launchPaced("mediaserver", { "system/bin/mediaserver" });
         }
         {
             const std::string wvFlags = dataBase_ + "/data/local/tmp/webview-command-line";
@@ -2525,7 +2572,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             adbdCmd.push_back("exec /apex/com.android.adbd/bin/adbd --root_seclabel=u:r:su:s0");
             runSvbox("adbd", adbdCmd, false,
                      adbdFd >= 0 ? std::vector<int>{ adbdFd } : std::vector<int>{});
-            SleepCancelableMs(80);
+            SleepCancelableMs(30);
         }
         // Android 14 ART Service daemon (artd) for PackageManager / dexopt / pm install
         if (FileExists(rootfs_ + "/system/apex/com.android.art/bin/artd")) {
@@ -2561,7 +2608,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         launchPaced("bt", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim" });
         launchPaced("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
-        if (!SleepCancelableMs(100)) return;
+        if (!SleepCancelableMs(40)) return;
 
         int zfd = MakeListenUnix(sockDir + "/zygote");
         int ufd = MakeListenUnix(sockDir + "/usap_pool_primary");

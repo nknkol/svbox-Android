@@ -734,6 +734,64 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **`MediaProvider`** | `content://media/external/images/media` 毫秒级返回零报错；`content://media/external/file` 索引 `volume_name=external_primary` 下 14 个标准目录（`Music/Movies/Download/DCIM/Documents/...`） |
 | **`Files` & `Gallery` 独立窗口** | `Files` (`com.android.documentsui`) 加载全部 7 个根目录（最近/primary/下载/图片/视频/音频/文档），`immersive topBar=#FFFFFF`；`Gallery` (`com.android.gallery3d`) `+358ms` 完成首帧显示，`immersive topBar=#080808 dark=1`；双窗口零白屏、零崩溃、零 ANR |
 
+---
+
+### 17. 全栈启动与运行期深度性能优化（2026-11-24）
+
+围绕 Layer 1 `svbox` 的 `svc #0` 扫描/加载路径、跨进程共享缓存、ART 单映射 JIT 支持，以及 Layer 3 `svbox-binderd` / `svbox-netd` / `android_runtime.cpp` 编排层完成全套优化，并在 `HAD-W32` 上保留同口径 **BEFORE vs AFTER** 量化对比（原始 JSON 留档于 scratch 目录 `before_opt_v2_*.json` / `after_opt_v2_*.json`）。
+
+#### A. 分层改动清单
+
+1. **Layer 1 `svbox`（`feat/vdev-binder`，通用 Linux 能力，27/27 回归全过，零 Android 专用代码）**：
+   * **ARM64 NEON 4 路单趟扫描 + 批量 ELF 节表读取 + 非代码段预检（`src/payload/include/stub_island.h`）**：
+     * `island_code_ranges()` 改为每批 `64` 项（4 KiB）一次 `pread64`（将每库 ~35 次系统调用压缩为 1 次），并识别有效 ELF 中零 `SHF_EXECINSTR` 重叠段返回 `-1` 直接跳过扫描。
+     * `island_scan_word_range()` 使用 4×128-bit 向量（每次 64B = 16 条指令）单趟直扫 `SHF_EXECINSTR` 区间，彻底取消第二趟扫描与逐字区间判定；对调用方已持纯 `RW` 映射的场景（`map_exec_copy`）省略两次冗余 `mprotect`。
+   * **跨进程无锁共享 `SVC-Site Cache`（新增 `src/payload/include/svc_cache.h`，接入 `loader/hook.c` 与 `payload/logic/hook_runtime.c`）**：
+     * 位于 `<mount_scratch>/.svbox_svc_cache`（1 MiB `MAP_SHARED`，2048 槽 4 路探测 + 229K 位点池，per-slot seqlock 无锁并发），以 `(dev, ino, file_size, mtime_sec, mtime_nsec, file_off, map_len)` 精确校验；文件变更自动失效。零 `svc` 库 O(1) 跳过扫描，含 `svc` 库直接按缓存偏移数组打补丁。
+   * **大块加载与匿名可执行页优化（`src/payload/logic/dispatch.c`）**：
+     * `read_region()` 由 `4 KiB` 提升至 `1 MiB` 分块，并在 EOF 立即退出（利用新匿名页零页特性）。
+     * `map_exec()` 对匿名 `MAP_FIXED|PROT_EXEC`（如 ART 32 MiB JIT 代码缓存）先 `RW` 映射再 `platform_mprotect_exec()`，且跳过全零匿名页扫描避免提前缺页占用物理内存。
+   * **通用容器策略补齐（`config.h` / `options.c` / `slow_syscalls.inc` / `dispatch.c`）**：
+     * 虚拟 `CAP_SYS_NICE` 兼容：`sched_setscheduler` / `sched_setparam` / `sched_setattr` 在宿主机返回 `-EPERM` 且容器持有虚拟 `CAP_SYS_NICE` 时返回 `0`。
+     * 新增通用 `--deny-memfd-prefix PREFIX`，按前缀对 `memfd_create` 返回 `-ENOSYS`（供宿主不支持 `MAP_SHARED|PROT_EXEC` 的运行时优雅回退单映射匿名 JIT）。
+     * 新增回归测试 `test/vfs/test_svc_cache_and_sched.py`（冷/热缓存命中、文件覆盖自动失效、`CAP_SYS_NICE`、`--deny-memfd-prefix` 全覆盖）。
+
+2. **Layer 3 `svbox-Android`（`main`）**：
+   * **`binderd/svbox_binderd.c`**：在 `struct bnode` 上维护 `handle_count` 与 `strong_ref_total`，将 `node_check_release()` 由 `O(MAX_PROCS × handles_cap)` 全表双层扫描降为 **O(1)**；在 `struct bproc` 上维护 `async_node_count`，同步 `BC_FREE_BUFFER` O(1) 跳过异步节点遍历。
+   * **`netd/svbox_netd.c`**：新增轻量 `"stats"`（`NODE_STATSD`）桩消除 `Service stats didn't start` 5 秒超时；将 `IVold` 的 `onVolumeCreated` 严格对齐至 `onUserStarted`（消除超快冷启动下 `onUserAdded` 抢跑竞态）。
+   * **`hap/entry/src/main/cpp/android_runtime.cpp` + `Index.ets`**：
+     * 传入 `--deny-memfd-prefix jit-`，恢复 Android 14 `system_server` 及全部子应用真 AArch64 ART JIT。
+     * 持久化跨重启 `svbox_svc_cache`（软链至 `userdata14/cache/svbox_svc_cache`）与整目录 `/linkerconfig` 缓存（`userdata14/cache/linkerconfig_a14/`，含 `ld.config.txt` 与 `apex.libraries.config.txt`）。
+     * 拉起原版 `mediaextractor` 与 `mediaserver`（消除 7×5s `waitForService` 超时）；预建 `/data/misc/bluetooth/logs` 与 `/data/misc/bluedroid`；精简串行 `SleepCancelableMs` 空等；新增 `--ps autoStart restart` 便于自动化基准复测。
+
+#### B. `HAD-W32` 真机 BEFORE vs AFTER 量化性能对比
+
+##### 1. Layer 1 `svbox` 实测对比（5 轮中位数，大核 `12-19`）
+
+| 指标 | 优化前 (BEFORE) | 优化后 (AFTER) | 变化 / 提速 |
+| :--- | :---: | :---: | :---: |
+| **8 MiB `.so` `dlopen`（冷扫 → 跨进程缓存命中）** | `47.27 ms`（冷） | **`8.08 ms`**（热命中） | **5.85× 提速** |
+| **Alpine Overlay `fork+exec /bin/true`** | `8.64 ms` | **`7.97 ms`** | **-7.8%** |
+| **Alpine Overlay `jit`（RW→RX 桩岛周期）** | `33.80 µs` | **`29.40 µs`** | **-13.0%** |
+| **Alpine Overlay `small300`** | `56.05 ms` | **`54.79 ms`** | **-2.2%** |
+| **Bare `stat_rw` / `stat_ro`** | `3.713 / 3.653 µs` | `3.737 / 3.694 µs` | 持平（零回退） |
+| **Alpine Overlay `stat_rw` / `stat_ro`** | `11.605 / 21.852 µs` | `12.026 / 22.015 µs` | 持平（零回退） |
+
+##### 2. Layer 3 Android 14 真机实测对比（`HAD-W32`）
+
+| 指标 | 优化前 (BEFORE) | 优化后 (AFTER) | 变化 / 提速 |
+| :--- | :---: | :---: | :---: |
+| **冷启动至 `sys.boot_completed=1`** | `10,260 ms` | **`7,064 ms`**（3 轮：`7270 / 7004 / 7064 ms`，首启 `adbd 1256 ms`） | **-3.20 s（-31.2% / 1.45×）** |
+| **`Settings` 冷启动 (`am start -W TotalTime`)** | `779 ms` | **`451 ms`** | **-42.1%（1.73×）** |
+| **`Files` 冷启动 (`TotalTime`)** | `523 ms` | **`437 ms`** | **-16.4%（1.20×）** |
+| **`Clock` 冷启动 (`TotalTime`)** | `483 ms` | **`445 ms`** | **-7.9%** |
+| **`Gallery` 冷启动 (`TotalTime`)** | `435 ms` | **`421 ms`** | **-3.2%** |
+| **`service check activity` × 50** | `1,808 ms` | **`1,737 ms`** | **-3.9%** |
+| **5 秒 `Service .* didn't start` 超时数** | `11` 次 | **`0` 次** | **-100% 清零** |
+| **子进程 ART JIT 创建失败（`system_server` + Apps）** | `3` 处（全量回退解释器） | **`0` 处（仅 `zygote64` 1 条无害告警，全部 App 启用真 JIT）** | **真 JIT 恢复生效** |
+| **`bt_stack_manage` `SIGABRT` 次数** | `5` 次（含 `real time scheduling` 崩溃循环） | `2` 次（`real time scheduling` 与 `snoop_logger` 目录报错均清零） | **-60%** |
+| **存储与多窗验收** | `emulated;0` `MOUNTED` | `emulated;0` 3 轮快速冷启均 `MOUNTED`、`System unlocked [0]`、`MediaProvider` 14 目录、`Files` + `Gallery` + `Clock` 三屏并行零崩溃 | **全部 PASS** |
+
 
 
 
