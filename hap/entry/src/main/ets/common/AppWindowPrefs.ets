@@ -190,3 +190,96 @@ class AppWindowPrefsStore {
 }
 
 export const appWindowPrefs: AppWindowPrefsStore = new AppWindowPrefsStore();
+
+export interface InstanceConfig {
+  runMode: string;        // 'multiwindow' | 'emulator'
+  resolutionKey: string;  // e.g. '720x1280'
+  refreshRate: number;    // 60 | 90 | 120
+  gpuMode: string;        // 'vulkan' | 'gles' | 'swiftshader'
+  profile: string;        // 'Balanced' | 'Performance' | 'Eco'
+}
+
+export function defaultInstanceConfig(): InstanceConfig {
+  return {
+    runMode: 'multiwindow',
+    resolutionKey: '720x1280',
+    refreshRate: 60,
+    gpuMode: 'vulkan',
+    profile: 'Balanced',
+  };
+}
+
+class InstanceConfigStore {
+  private loaded: boolean = false;
+  private filePath: string = '';
+  private cfg: InstanceConfig = defaultInstanceConfig();
+
+  private ensureLoaded(filesDir: string): void {
+    if (this.loaded && this.filePath.length > 0) return;
+    if (filesDir.length === 0) return;
+    this.filePath = `${filesDir}/instance_config.json`;
+    this.loaded = true;
+    try {
+      if (!fileIo.accessSync(this.filePath)) return;
+      const stat: fileIo.Stat = fileIo.statSync(this.filePath);
+      if (stat.size <= 0 || stat.size > 65536) return;
+      const f: fileIo.File = fileIo.openSync(this.filePath, fileIo.OpenMode.READ_ONLY);
+      const ab: ArrayBuffer = new ArrayBuffer(stat.size);
+      fileIo.readSync(f.fd, ab);
+      fileIo.closeSync(f);
+      const parsed: InstanceConfig = JSON.parse(buffer.from(ab).toString('utf-8')) as InstanceConfig;
+      if (parsed) {
+        if (parsed.runMode === 'multiwindow' || parsed.runMode === 'emulator') {
+          this.cfg.runMode = parsed.runMode;
+        }
+        if (parsed.resolutionKey && parsed.resolutionKey.length > 0) {
+          this.cfg.resolutionKey = parsed.resolutionKey;
+        }
+        if (parsed.refreshRate === 60 || parsed.refreshRate === 90 || parsed.refreshRate === 120) {
+          this.cfg.refreshRate = parsed.refreshRate;
+        }
+        if (parsed.gpuMode === 'vulkan' || parsed.gpuMode === 'gles' || parsed.gpuMode === 'swiftshader') {
+          this.cfg.gpuMode = parsed.gpuMode;
+        }
+        if (parsed.profile === 'Balanced' || parsed.profile === 'Performance' || parsed.profile === 'Eco') {
+          this.cfg.profile = parsed.profile;
+        }
+      }
+    } catch (_e) {
+    }
+  }
+
+  public get(filesDir: string): InstanceConfig {
+    this.ensureLoaded(filesDir);
+    return {
+      runMode: this.cfg.runMode,
+      resolutionKey: this.cfg.resolutionKey,
+      refreshRate: this.cfg.refreshRate,
+      gpuMode: this.cfg.gpuMode,
+      profile: this.cfg.profile,
+    };
+  }
+
+  public save(filesDir: string, next: InstanceConfig): void {
+    this.ensureLoaded(filesDir);
+    this.cfg = {
+      runMode: next.runMode,
+      resolutionKey: next.resolutionKey,
+      refreshRate: next.refreshRate,
+      gpuMode: next.gpuMode,
+      profile: next.profile,
+    };
+    if (this.filePath.length === 0) return;
+    try {
+      const f: fileIo.File = fileIo.openSync(
+        this.filePath,
+        fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY
+      );
+      fileIo.writeSync(f.fd, JSON.stringify(this.cfg));
+      fileIo.closeSync(f);
+    } catch (_e) {
+    }
+  }
+}
+
+export const instanceConfigStore: InstanceConfigStore = new InstanceConfigStore();

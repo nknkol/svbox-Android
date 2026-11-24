@@ -133,18 +133,9 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
-    try {
-      const curMode: string = AppStorage.get<string>('activeUiMode') ?? 'multiwindow';
-      native.setDisplayVisible(0, curMode === 'emulator');
-    } catch (_e) {
-    }
   }
 
   onBackground(): void {
-    try {
-      native.setDisplayVisible(0, false);
-    } catch (_e) {
-    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
