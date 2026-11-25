@@ -930,6 +930,17 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   2. [`hap/entry/src/main/cpp/android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp#L270-L410)：每次启动按实际 `--cpuset` 核数动态生成完整 `/sys/devices/system/cpu` 目录树（`possible/present/online/kernel_max`、`cpu0..N-1/{online,topology/*,cpufreq/*,cache/index0..3/*}`）并挂载进容器，同步从宿主 `/proc/cpuinfo` 读取 `Hardware` 写入 `ro.soc.{manufacturer,model}`、`ro.hardware.chipname`、`ro.board.platform`。
   3. **真机实测（`HAD-W32`）**：`CPU Info` 实时界面恢复显示 **`Cores: 8`**、**`ARM Neon: Yes`**、8 核 L1d/L1i Cache 及 **`Core 0–7: 2.32 GHz`**，`ro.soc.model=KirinX90`，`logcat` 零 `getMinMaxFreq` 报错。
 
+### 11.6 修复安装应用卡死（`PackageInstallerActivity` Binder `NO_MEMORY` / `OutOfMemoryError` / ANR）
+- **现象**：在 Android 14 内从酷安点击安装带高分辨率图标的 APK 时，系统安装器界面卡死 5 秒后触发 ANR 崩溃退出。
+- **真实根因（`hap_logs/logcat.txt` 实证）**：
+  1. `IPCThreadState` 连续打印 `Driver returned error (NO_MEMORY)`，随后 `PackageInstallerActivity.startInstall()` 调用 `IActivityTaskManager.startActivity()` 抛出 `java.lang.OutOfMemoryError`，且未清空的 `mOut` 导致后续所有主线程 Binder 事务（包括崩溃上报）持续返回 `NO_MEMORY` 直至 5s 输入超时 ANR。
+  2. 定位到 [`svbox/src/payload/logic/vdev.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vdev.c#L74) 的 `VDEV_BWR_SCRATCH_CAP` 仅有 **256 KiB**（且 `vdev_proto.h` `VDEV_MAX_PAYLOAD` 为 512 KiB），低于 Android 内核 Binder 的 1 MiB 单事务上限；当系统安装器把大尺寸应用图标 `Bitmap` 随 `Intent` 一起打包跨进程传递时超过 256 KiB，触发 `vdev.c` 直接返回 `-ENOMEM`。
+- **修复与真机验证**：
+  1. **[`svbox/src/payload/include/vdev_proto.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/vdev_proto.h#L14) & [`svbox/src/payload/logic/vdev.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vdev.c#L730-L810)**：将通用 `VDEV_MAX_PAYLOAD` 提升至 **2 MiB**；`binder_write_read()` 改为三档缓冲策略（`<= 8 KiB` 栈零拷贝 → `<= 256 KiB` 线程缓存 → `256 KiB ~ 2 MiB` 一次性按需 `mmap` 用完即 `munmap`，零常驻内存开销）。
+  2. **[`svbox-Android/binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L41)**：将每进程按需分页的 `PROC_MEM_SIZE` 从 2 MiB 扩至 **4 MiB**，避免并发大事务碎片化。
+  3. **真机实测（`HAD-W32`）**：已重编 `svbox`、`svbox-binderd` 并重新打入 `svbox.hnp` 安装验证；对 114 MB 酷安 APK 走系统 `PackageInstallerActivity` 点击安装/更新及 `pm install -r` 均无卡顿、`NO_MEMORY / OutOfMemoryError / ANR` 计数为 **0**。
+
+
 
 
 

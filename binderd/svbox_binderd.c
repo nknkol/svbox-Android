@@ -38,7 +38,7 @@
 #define MAX_THREADS        4096
 #define MAX_CONNS          4096
 #define HASH_BUCKETS       8192
-#define PROC_MEM_SIZE      (2u * 1024u * 1024u) /* 2 MiB per process */
+#define PROC_MEM_SIZE      (4u * 1024u * 1024u) /* 4 MiB per process (demand-paged memfd) */
 #define MAX_ALLOCS         1024
 #define INLINE_BLK_HANDLES 16
 
