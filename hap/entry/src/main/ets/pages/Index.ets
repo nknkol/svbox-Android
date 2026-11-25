@@ -1,5 +1,6 @@
 import { common, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { LengthUnit } from '@kit.ArkUI';
 import native, { RuntimeStatus } from 'libentry.so';
 import {
   AndroidAppItem,
@@ -59,6 +60,10 @@ struct Index {
   @State private globalSettings: GlobalSettings = defaultGlobalSettings();
   @State private sortBy: string = 'index';      // 'index' | 'time' | 'name'
   @State private viewMode: string = 'card';     // 'card' | 'compact'
+
+  // Responsive Breakpoint ('sm' < 600vp Phone, 'md' 600..839vp Foldable/Tablet, 'lg' >= 840vp PC)
+  @State private winWidthVp: number = 1040;
+  @State private bp: string = 'lg';
 
   // Hover & Batch State
   @State private hoveredInstId: string = '';
@@ -782,10 +787,38 @@ struct Index {
     this.refreshPinnedShortcuts();
   }
 
+  private getAppsColumnsTemplate(): string {
+    if (this.bp === 'sm') return '1fr 1fr';
+    if (this.bp === 'md') return '1fr 1fr 1fr 1fr';
+    if (this.winWidthVp >= 1220) return '1fr 1fr 1fr 1fr 1fr 1fr';
+    return '1fr 1fr 1fr 1fr 1fr';
+  }
+
+  private computeSheetWidth(preferred: number): Dimension {
+    if (this.bp === 'sm') return '100%';
+    return Math.max(360, Math.min(preferred, Math.floor(this.winWidthVp - 40)));
+  }
+
+  private computeSheetType(): SheetType {
+    return this.bp === 'sm' ? SheetType.BOTTOM : SheetType.CENTER;
+  }
+
+  private updateBreakpoint(wVp: number): void {
+    if (wVp <= 0) return;
+    this.winWidthVp = wVp;
+    const nextBp: string = wVp < 600 ? 'sm' : (wVp < 840 ? 'md' : 'lg');
+    if (nextBp !== this.bp) {
+      this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_SHORT, () => {
+        this.bp = nextBp;
+      });
+    }
+  }
+
   // --- Half-Modal Sheet Builders ---
   @Builder
   private createSheetBuilder() {
     CreateInstanceSheet({
+      compactLayout: this.bp === 'sm',
       onConfirm: (opts: CreateInstanceOptions) => {
         this.showCreateSheet = false;
         const created: DeviceInstance[] = instanceManager.createInstances(this.getSandboxFilesDir(), opts);
@@ -804,6 +837,7 @@ struct Index {
       instance: this.editingInstance,
       filesDir: this.getSandboxFilesDir(),
       isInstanceRunning: this.editingInstance ? this.isInstanceRunning(this.editingInstance) : false,
+      compactLayout: this.winWidthVp < 680,
       onSave: (updated: DeviceInstance) => {
         this.showDeviceSettingsSheet = false;
         instanceManager.updateInstance(this.getSandboxFilesDir(), updated);
@@ -845,6 +879,7 @@ struct Index {
   private globalSettingsSheetBuilder() {
     GlobalSettingsSheet({
       initialSettings: this.globalSettings,
+      compactLayout: this.bp === 'sm',
       onSave: (next: GlobalSettings) => {
         this.showGlobalSettingsSheet = false;
         this.globalSettings = next;
@@ -972,6 +1007,187 @@ struct Index {
   }
 
   @Builder
+  private deviceMobileCard(inst: DeviceInstance) {
+    Column({ space: Spacing.MD }) {
+      Row({ space: Spacing.MD }) {
+        if (this.batchMode) {
+          Checkbox()
+            .select(this.isSelected(inst.id))
+            .selectedColor($r('sys.color.brand'))
+            .width(20)
+            .height(20)
+            .transition(Motion.checkboxSlideTransition())
+            .onChange(() => {
+              this.toggleSelection(inst.id);
+            })
+        }
+
+        // Compact Mobile Thumbnail (52 x 52 vp)
+        Stack({ alignContent: Alignment.Center }) {
+          Column()
+            .width(52)
+            .height(52)
+            .borderRadius(Radius.MD)
+            .linearGradient({
+              angle: 135,
+              colors: this.isInstanceRunning(inst)
+                ? [['#0A59F7', 0.0], ['#38BDF8', 1.0]]
+                : [['#2B3242', 0.0], ['#1B202C', 1.0]]
+            })
+          SymbolGlyph(inst.deviceType === 'tablet' ? $r('sys.symbol.pad_fill') : $r('sys.symbol.phone_1'))
+            .fontSize(IconSize.MD)
+            .fontColor([this.isInstanceRunning(inst) ? '#FFFFFF' : '#CBD5E1'])
+        }
+        .flexShrink(0)
+        .onClick(() => {
+          if (this.isInstanceRunning(inst)) {
+            this.openEmulatorWindow(inst);
+          }
+        })
+
+        Column({ space: Spacing.XS }) {
+          Row({ space: Spacing.SM }) {
+            Text(`#${inst.index}`)
+              .fontSize(FontSize.MICRO)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_secondary'))
+            Text(inst.name)
+              .fontSize(FontSize.BODY_LG)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('sys.color.font_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width('100%')
+
+          Row({ space: Spacing.SM }) {
+            Row({ space: Spacing.XS }) {
+              Circle({ width: 6, height: 6 })
+                .fill(
+                  this.isInstanceRunning(inst)
+                    ? (this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
+                    : $r('sys.color.font_fourth')
+                )
+              Text(
+                this.isInstanceRunning(inst)
+                  ? (this.paused ? '已暂停' : (this.wmAgentReady ? '运行中' : '启动中'))
+                  : '未开机'
+              )
+                .fontSize(FontSize.MICRO)
+                .fontColor(
+                  this.isInstanceRunning(inst)
+                    ? (this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
+                    : $r('sys.color.font_tertiary')
+                )
+            }
+
+            Text(inst.runMode === 'emulator' ? '传统模拟器' : '自由多窗')
+              .fontSize(FontSize.BADGE)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_emphasize'))
+              .padding({ left: Spacing.SM - 2, right: Spacing.SM - 2, top: 2, bottom: 2 })
+              .borderRadius(Radius.BADGE)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+          }
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Row({ space: Spacing.SM }) {
+          if (this.isInstanceRunning(inst)) {
+            Button({ type: ButtonType.Circle }) {
+              SymbolGlyph(inst.runMode === 'emulator' ? $r('sys.symbol.display') : $r('sys.symbol.square_grid_2x2'))
+                .fontSize(IconSize.SM)
+                .fontColor([$r('sys.color.icon_on_primary')])
+            }
+            .width(ControlSize.BTN_MD)
+            .height(ControlSize.BTN_MD)
+            .backgroundColor($r('sys.color.brand'))
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              if (inst.runMode === 'emulator') {
+                this.openEmulatorWindow(inst);
+              } else {
+                this.switchNavAnimated('apps');
+              }
+            })
+
+            Button({ type: ButtonType.Circle }) {
+              SymbolGlyph($r('sys.symbol.power'))
+                .fontSize(IconSize.SM)
+                .fontColor([$r('sys.color.warning')])
+            }
+            .width(ControlSize.BTN_MD)
+            .height(ControlSize.BTN_MD)
+            .backgroundColor('#1AE84026')
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              this.stopActiveInstance();
+            })
+          } else {
+            Button({ type: ButtonType.Circle }) {
+              SymbolGlyph($r('sys.symbol.play_fill'))
+                .fontSize(IconSize.SM)
+                .fontColor([$r('sys.color.icon_on_primary')])
+            }
+            .width(ControlSize.BTN_MD)
+            .height(ControlSize.BTN_MD)
+            .backgroundColor($r('sys.color.brand'))
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              this.startDeviceInstance(inst, 'full');
+            })
+          }
+
+          Button({ type: ButtonType.Circle }) {
+            SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
+              .fontSize(IconSize.SM)
+              .fontColor([$r('sys.color.icon_secondary')])
+          }
+          .width(ControlSize.BTN_MD)
+          .height(ControlSize.BTN_MD)
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .bindMenu(this.deviceMoreMenuBuilder(inst))
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      if (this.viewMode === 'card') {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.XS + 2, unit: LengthUnit.VP } }
+        }) {
+          this.specChip(inst.androidVersion)
+          this.specChip(`${inst.cpuCores} 核`)
+          this.specChip(`${Math.round(inst.memLimitMb / 1024)} GB`)
+          this.specChip(formatGpuModeLabel(inst.gpuMode))
+          this.specChip(`${inst.refreshRate}Hz`)
+          this.specChip(`${inst.width}×${inst.height}`)
+        }
+        .width('100%')
+      }
+    }
+    .width('100%')
+    .padding(Spacing.MD)
+    .borderRadius(Radius.CARD)
+    .backgroundColor($r('sys.color.comp_background_primary'))
+    .border({
+      width: this.isInstanceRunning(inst) ? 1.2 : (this.hoveredInstId === inst.id ? 1.0 : 0.6),
+      color: this.isInstanceRunning(inst) || this.hoveredInstId === inst.id
+        ? $r('sys.color.brand')
+        : $r('sys.color.comp_divider')
+    })
+    .shadow(this.hoveredInstId === inst.id ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .onHover((isHover: boolean) => {
+      this.hoveredInstId = isHover ? inst.id : (this.hoveredInstId === inst.id ? '' : this.hoveredInstId);
+    })
+  }
+
+  @Builder
   private deviceCardRow(inst: DeviceInstance) {
     Row({ space: Spacing.LG }) {
       if (this.batchMode) {
@@ -986,7 +1202,7 @@ struct Index {
           })
       }
 
-      // Preview Thumbnail (128 x 76 vp)
+      // Preview Thumbnail (adapts slightly between md Tablet and lg PC)
       Stack({ alignContent: Alignment.TopStart }) {
         Column() {
           SymbolGlyph(inst.deviceType === 'tablet' ? $r('sys.symbol.pad_fill') : $r('sys.symbol.phone_1'))
@@ -1034,10 +1250,10 @@ struct Index {
         .padding({ left: Spacing.SM - 2, right: Spacing.SM, top: 2, bottom: 2 })
         .borderRadius(Radius.BADGE)
         .backgroundColor('#7A000000')
-        .position({ x: 6, y: 52 })
+        .position({ x: 6, y: this.bp === 'md' ? 44 : 52 })
       }
-      .width(128)
-      .height(76)
+      .width(this.bp === 'md' ? 104 : 128)
+      .height(this.bp === 'md' ? 68 : 76)
       .flexShrink(0)
       .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
       .onClick(() => {
@@ -1046,7 +1262,7 @@ struct Index {
         }
       })
 
-      // Middle: Title + Spec Chips + Telemetry
+      // Middle: Title + Wrapping Spec Chips + Telemetry
       Column({ space: Spacing.SM }) {
         Row({ space: Spacing.SM }) {
           Text(inst.name)
@@ -1055,7 +1271,7 @@ struct Index {
             .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({ maxWidth: 260 })
+            .constraintSize({ maxWidth: this.bp === 'md' ? 180 : 280 })
 
           if (this.isInstanceRunning(inst)) {
             Row({ space: Spacing.XS }) {
@@ -1082,13 +1298,17 @@ struct Index {
         }
         .alignItems(VerticalAlign.Center)
 
-        Row({ space: Spacing.SM }) {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.XS, unit: LengthUnit.VP } }
+        }) {
           this.specChip(inst.androidVersion)
           this.specChip(`${inst.cpuCores} 核`)
           this.specChip(`${Math.round(inst.memLimitMb / 1024)} GB`)
           this.specChip(formatGpuModeLabel(inst.gpuMode))
           this.specChip(`${inst.refreshRate}Hz`)
         }
+        .width('100%')
 
         Text(
           `${inst.width}×${inst.height} · ${inst.dpi} DPI` +
@@ -1104,32 +1324,52 @@ struct Index {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      // Right: Unified Circular Actions (ControlSize.BTN_MD = 36 / BTN_LG = 40, IconSize.SM = 16 / MD = 20)
+      // Right: Unified Circular Actions
       Row({ space: Spacing.SM }) {
         if (this.isInstanceRunning(inst)) {
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.XS + 2 }) {
+          if (this.bp === 'lg') {
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS + 2 }) {
+                SymbolGlyph(inst.runMode === 'emulator' ? $r('sys.symbol.display') : $r('sys.symbol.square_grid_2x2'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([$r('sys.color.icon_on_primary')])
+                Text(inst.runMode === 'emulator' ? '打开窗口' : '应用中心')
+                  .fontSize(FontSize.CAPTION)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_on_primary'))
+              }
+            }
+            .height(ControlSize.BTN_MD)
+            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .backgroundColor($r('sys.color.brand'))
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+            .onClick(() => {
+              if (inst.runMode === 'emulator') {
+                this.openEmulatorWindow(inst);
+              } else {
+                this.switchNavAnimated('apps');
+              }
+            })
+          } else {
+            Button({ type: ButtonType.Circle }) {
               SymbolGlyph(inst.runMode === 'emulator' ? $r('sys.symbol.display') : $r('sys.symbol.square_grid_2x2'))
                 .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_on_primary')])
-              Text(inst.runMode === 'emulator' ? '打开窗口' : '应用中心')
-                .fontSize(FontSize.CAPTION)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_on_primary'))
             }
+            .width(ControlSize.BTN_MD)
+            .height(ControlSize.BTN_MD)
+            .backgroundColor($r('sys.color.brand'))
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+            .onClick(() => {
+              if (inst.runMode === 'emulator') {
+                this.openEmulatorWindow(inst);
+              } else {
+                this.switchNavAnimated('apps');
+              }
+            })
           }
-          .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.LG, right: Spacing.LG })
-          .backgroundColor($r('sys.color.brand'))
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-          .onClick(() => {
-            if (inst.runMode === 'emulator') {
-              this.openEmulatorWindow(inst);
-            } else {
-              this.switchNavAnimated('apps');
-            }
-          })
 
           Button({ type: ButtonType.Circle }) {
             SymbolGlyph(this.paused ? $r('sys.symbol.play_fill') : $r('sys.symbol.pause_fill'))
@@ -1199,7 +1439,6 @@ struct Index {
         : $r('sys.color.comp_divider')
     })
     .shadow(this.hoveredInstId === inst.id ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
-    .translate({ y: this.hoveredInstId === inst.id ? -1.5 : 0 })
     .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
     .onHover((isHover: boolean) => {
       this.hoveredInstId = isHover ? inst.id : (this.hoveredInstId === inst.id ? '' : this.hoveredInstId);
@@ -1309,210 +1548,223 @@ struct Index {
 
   @Builder
   private devicesWorkspace() {
-    Column({ space: Spacing.LG }) {
-      // Animated Action Toolbar (Normal Mode <-> Batch Mode)
+    Column({ space: this.bp === 'sm' ? Spacing.MD : Spacing.LG }) {
+      // Responsive Action Toolbar (Normal Mode <-> Batch Mode)
       if (!this.batchMode) {
-        Row({ space: Spacing.MD }) {
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.SM }) {
-              SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(IconSize.SM)
-                .fontColor([$r('sys.color.icon_on_primary')])
-              Text('新建设备')
-                .fontSize(FontSize.BODY_MD)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_on_primary'))
-            }
-          }
-          .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.LG, right: Spacing.XL })
-          .backgroundColor($r('sys.color.brand'))
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-          .onClick(() => {
-            this.openCreateSheet();
-          })
-
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.SM }) {
-              SymbolGlyph($r('sys.symbol.checkmark_square'))
-                .fontSize(IconSize.SM)
-                .fontColor([$r('sys.color.icon_primary')])
-              Text('批量操作')
-                .fontSize(FontSize.BODY_MD)
-                .fontColor($r('sys.color.font_primary'))
-            }
-          }
-          .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.LG, right: Spacing.LG })
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-          .onClick(() => {
-            this.setBatchModeAnimated(true);
-          })
-
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.SM }) {
-              SymbolGlyph($r('sys.symbol.rectangle_split_2x1'))
-                .fontSize(IconSize.SM)
-                .fontColor([$r('sys.color.icon_primary')])
-              Text('排列窗口')
-                .fontSize(FontSize.BODY_MD)
-                .fontColor($r('sys.color.font_primary'))
-            }
-          }
-          .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.LG, right: Spacing.LG })
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-          .onClick(() => {
-            this.handleArrangeWindows();
-          })
-
-          Blank()
-
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.XS + 2 }) {
-              SymbolGlyph($r('sys.symbol.sort'))
-                .fontSize(IconSize.SM)
-                .fontColor([$r('sys.color.icon_secondary')])
-              Text(this.sortBy === 'time' ? '按时间' : (this.sortBy === 'name' ? '按名称' : '按编号'))
-                .fontSize(FontSize.CAPTION)
-                .fontColor($r('sys.color.font_secondary'))
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(IconSize.XS)
-                .fontColor([$r('sys.color.icon_tertiary')])
-            }
-          }
-          .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.MD, right: Spacing.MD })
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
-          .bindMenu(this.sortMenuBuilder())
-
-          // Segmented Card / Compact Toggle with Sliding Indicator
-          Stack({ alignContent: Alignment.Start }) {
-            Column()
-              .width(34)
-              .height(28)
-              .borderRadius(14)
-              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
-              .translate({ x: this.viewMode === 'card' ? 0 : 36 })
-              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
-
-            Row({ space: 2 }) {
-              Button({ type: ButtonType.Normal }) {
-                SymbolGlyph($r('sys.symbol.rectangle_grid_1x2'))
-                  .fontSize(IconSize.SM)
-                  .fontColor([
-                    this.viewMode === 'card'
-                      ? $r('sys.color.icon_emphasize')
-                      : $r('sys.color.icon_secondary')
-                  ])
-              }
-              .width(34)
-              .height(28)
-              .borderRadius(14)
-              .backgroundColor(Color.Transparent)
-              .onClick(() => { this.updateViewMode('card'); })
-
-              Button({ type: ButtonType.Normal }) {
-                SymbolGlyph($r('sys.symbol.list_bullet'))
-                  .fontSize(IconSize.SM)
-                  .fontColor([
-                    this.viewMode === 'compact'
-                      ? $r('sys.color.icon_emphasize')
-                      : $r('sys.color.icon_secondary')
-                  ])
-              }
-              .width(34)
-              .height(28)
-              .borderRadius(14)
-              .backgroundColor(Color.Transparent)
-              .onClick(() => { this.updateViewMode('compact'); })
-            }
-          }
-          .padding(3)
-          .borderRadius(Radius.CAPSULE)
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-        .transition(Motion.toolbarSwapTransition())
-      } else {
-        Row({ space: Spacing.MD }) {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          justifyContent: FlexAlign.SpaceBetween,
+          alignItems: ItemAlign.Center,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
           Row({ space: Spacing.SM }) {
-            Checkbox()
-              .select(this.selectedIds.length > 0 && this.selectedIds.length === this.instances.length)
-              .selectedColor($r('sys.color.brand'))
-              .width(18)
-              .height(18)
-              .onChange(() => {
-                this.toggleSelectAll();
-              })
-            Text(`全选 (${this.selectedIds.length}/${this.instances.length})`)
-              .fontSize(FontSize.BODY_MD)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.font_primary'))
-          }
-          .padding({ left: Spacing.SM, right: Spacing.SM })
-          .onClick(() => { this.toggleSelectAll(); })
-
-          Button('启动首台所选', { type: ButtonType.Capsule })
-            .height(ControlSize.BTN_SM)
-            .padding({ left: Spacing.LG, right: Spacing.LG })
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_on_primary'))
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS + 2 }) {
+                SymbolGlyph($r('sys.symbol.plus'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([$r('sys.color.icon_on_primary')])
+                Text(this.bp === 'sm' ? '新建' : '新建设备')
+                  .fontSize(FontSize.BODY_MD)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_on_primary'))
+              }
+            }
+            .height(ControlSize.BTN_MD)
+            .padding({ left: Spacing.MD, right: Spacing.LG })
             .backgroundColor($r('sys.color.brand'))
-            .enabled(this.selectedIds.length > 0)
             .hoverEffect(HoverEffect.Highlight)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
-              const first: DeviceInstance | undefined = this.getInstanceById(this.selectedIds[0]);
-              if (first) this.startDeviceInstance(first, 'full');
+              this.openCreateSheet();
             })
 
-          Button('关闭运行设备', { type: ButtonType.Capsule })
-            .height(ControlSize.BTN_SM)
-            .padding({ left: Spacing.LG, right: Spacing.LG })
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_primary'))
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS + 2 }) {
+                SymbolGlyph($r('sys.symbol.checkmark_square'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([$r('sys.color.icon_primary')])
+                Text(this.bp === 'sm' ? '批量' : '批量操作')
+                  .fontSize(FontSize.BODY_MD)
+                  .fontColor($r('sys.color.font_primary'))
+              }
+            }
+            .height(ControlSize.BTN_MD)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
             .backgroundColor($r('sys.color.comp_background_primary'))
             .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-            .enabled(this.running)
             .hoverEffect(HoverEffect.Highlight)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-            .onClick(() => { this.stopActiveInstance(); })
+            .onClick(() => {
+              this.setBatchModeAnimated(true);
+            })
 
-          Button({ type: ButtonType.Capsule }) {
-            Row({ space: Spacing.XS }) {
-              Text('更多')
-                .fontSize(FontSize.CAPTION)
-                .fontColor($r('sys.color.font_primary'))
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(IconSize.XS)
-                .fontColor([$r('sys.color.icon_secondary')])
+            if (this.bp !== 'sm') {
+              Button({ type: ButtonType.Capsule }) {
+                Row({ space: Spacing.XS + 2 }) {
+                  SymbolGlyph($r('sys.symbol.rectangle_split_2x1'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([$r('sys.color.icon_primary')])
+                  Text('排列窗口')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontColor($r('sys.color.font_primary'))
+                }
+              }
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .backgroundColor($r('sys.color.comp_background_primary'))
+              .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                this.handleArrangeWindows();
+              })
             }
           }
-          .height(ControlSize.BTN_SM)
-          .padding({ left: Spacing.LG, right: Spacing.MD })
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-          .hoverEffect(HoverEffect.Highlight)
-          .bindMenu(this.batchMoreMenuBuilder())
 
-          Blank()
+          Row({ space: Spacing.SM }) {
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS + 2 }) {
+                SymbolGlyph($r('sys.symbol.sort'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([$r('sys.color.icon_secondary')])
+                Text(this.sortBy === 'time' ? '按时间' : (this.sortBy === 'name' ? '按名称' : '按编号'))
+                  .fontSize(FontSize.CAPTION)
+                  .fontColor($r('sys.color.font_secondary'))
+                SymbolGlyph($r('sys.symbol.chevron_down'))
+                  .fontSize(IconSize.XS)
+                  .fontColor([$r('sys.color.icon_tertiary')])
+              }
+            }
+            .height(ControlSize.BTN_MD)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .backgroundColor($r('sys.color.comp_background_primary'))
+            .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+            .bindMenu(this.sortMenuBuilder())
 
-          Button('取消批量操作', { type: ButtonType.Capsule })
+            Stack({ alignContent: Alignment.Start }) {
+              Column()
+                .width(34)
+                .height(28)
+                .borderRadius(14)
+                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                .translate({ x: this.viewMode === 'card' ? 0 : 36 })
+                .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+
+              Row({ space: 2 }) {
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph($r('sys.symbol.rectangle_grid_1x2'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([
+                      this.viewMode === 'card'
+                        ? $r('sys.color.icon_emphasize')
+                        : $r('sys.color.icon_secondary')
+                    ])
+                }
+                .width(34)
+                .height(28)
+                .padding(0)
+                .borderRadius(14)
+                .backgroundColor(Color.Transparent)
+                .onClick(() => { this.updateViewMode('card'); })
+
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph($r('sys.symbol.list_bullet'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([
+                      this.viewMode === 'compact'
+                        ? $r('sys.color.icon_emphasize')
+                        : $r('sys.color.icon_secondary')
+                    ])
+                }
+                .width(34)
+                .height(28)
+                .padding(0)
+                .borderRadius(14)
+                .backgroundColor(Color.Transparent)
+                .onClick(() => { this.updateViewMode('compact'); })
+              }
+            }
+            .padding(3)
+            .borderRadius(Radius.CAPSULE)
+            .backgroundColor($r('sys.color.comp_background_primary'))
+            .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          }
+        }
+        .width('100%')
+        .transition(Motion.toolbarSwapTransition())
+      } else {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          justifyContent: FlexAlign.SpaceBetween,
+          alignItems: ItemAlign.Center,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
+          Row({ space: Spacing.SM }) {
+            Row({ space: Spacing.XS + 2 }) {
+              Checkbox()
+                .select(this.selectedIds.length > 0 && this.selectedIds.length === this.instances.length)
+                .selectedColor($r('sys.color.brand'))
+                .width(18)
+                .height(18)
+                .onChange(() => {
+                  this.toggleSelectAll();
+                })
+              Text(`全选 (${this.selectedIds.length}/${this.instances.length})`)
+                .fontSize(FontSize.BODY_MD)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('sys.color.font_primary'))
+            }
+            .onClick(() => { this.toggleSelectAll(); })
+
+            Button('启动', { type: ButtonType.Capsule })
+              .height(ControlSize.BTN_SM)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_on_primary'))
+              .backgroundColor($r('sys.color.brand'))
+              .enabled(this.selectedIds.length > 0)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                const first: DeviceInstance | undefined = this.getInstanceById(this.selectedIds[0]);
+                if (first) this.startDeviceInstance(first, 'full');
+              })
+
+            Button('关闭', { type: ButtonType.Capsule })
+              .height(ControlSize.BTN_SM)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_primary'))
+              .backgroundColor($r('sys.color.comp_background_primary'))
+              .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+              .enabled(this.running)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => { this.stopActiveInstance(); })
+
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS }) {
+                Text('更多')
+                  .fontSize(FontSize.CAPTION)
+                  .fontColor($r('sys.color.font_primary'))
+                SymbolGlyph($r('sys.symbol.chevron_down'))
+                  .fontSize(IconSize.XS)
+                  .fontColor([$r('sys.color.icon_secondary')])
+              }
+            }
             .height(ControlSize.BTN_SM)
-            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .padding({ left: Spacing.MD, right: Spacing.SM + 2 })
+            .backgroundColor($r('sys.color.comp_background_primary'))
+            .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+            .hoverEffect(HoverEffect.Highlight)
+            .bindMenu(this.batchMoreMenuBuilder())
+          }
+
+          Button('取消批量', { type: ButtonType.Capsule })
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
             .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_emphasize'))
             .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
@@ -1530,13 +1782,15 @@ struct Index {
         .transition(Motion.toolbarSwapTransition())
       }
 
-      // Instance List with Card Transitions
+      // Instance List with safe top/bottom shadow breathing room & subtle 3vp scrollbar
       List({ space: this.viewMode === 'card' ? Spacing.MD : Spacing.SM }) {
         ForEach(
           this.instances,
           (inst: DeviceInstance) => {
             ListItem() {
-              if (this.viewMode === 'card') {
+              if (this.bp === 'sm') {
+                this.deviceMobileCard(inst)
+              } else if (this.viewMode === 'card') {
                 this.deviceCardRow(inst)
               } else {
                 this.deviceCompactRow(inst)
@@ -1545,27 +1799,39 @@ struct Index {
             .transition(Motion.cardTransition())
           },
           (inst: DeviceInstance): string =>
-            `${inst.id}_${inst.name}_${inst.gpuMode}_${inst.refreshRate}_${inst.cpuCores}_${inst.memLimitMb}_${this.running ? this.activeInstanceId : 'idle'}_${this.paused ? 1 : 0}_${this.batchMode ? 1 : 0}_${this.selectedIds.length}_${this.viewMode}`
+            `${inst.id}_${inst.name}_${inst.gpuMode}_${inst.refreshRate}_${inst.cpuCores}_${inst.memLimitMb}_${this.running ? this.activeInstanceId : 'idle'}_${this.paused ? 1 : 0}_${this.batchMode ? 1 : 0}_${this.selectedIds.length}_${this.viewMode}_${this.bp}`
         )
       }
       .width('100%')
       .layoutWeight(1)
+      .padding({ top: Spacing.XS, bottom: Spacing.MD })
       .scrollBar(BarState.Auto)
+      .scrollBarWidth(3)
+      .scrollBarColor($r('sys.color.comp_divider'))
     }
     .width('100%')
     .height('100%')
-    .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.MD })
+    .padding({
+      left: this.bp === 'sm' ? Spacing.LG : Spacing.XL,
+      right: this.bp === 'sm' ? Spacing.LG : Spacing.XL,
+      top: Spacing.LG,
+      bottom: Spacing.SM
+    })
   }
 
   @Builder
   private appsWorkspace() {
-    Column({ space: Spacing.LG }) {
-      Row({ space: Spacing.MD }) {
+    Column({ space: this.bp === 'sm' ? Spacing.MD : Spacing.LG }) {
+      Flex({
+        wrap: FlexWrap.Wrap,
+        alignItems: ItemAlign.Center,
+        space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+      }) {
         Row({ space: Spacing.SM }) {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
             .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_tertiary')])
-          TextInput({ placeholder: '搜索已安装的 Android 应用名称或包名...', text: this.searchQuery })
+          TextInput({ placeholder: this.bp === 'sm' ? '搜索应用...' : '搜索已安装的 Android 应用名称或包名...', text: this.searchQuery })
             .layoutWeight(1)
             .height(ControlSize.INPUT_H)
             .fontSize(FontSize.BODY_MD)
@@ -1577,7 +1843,9 @@ struct Index {
               this.searchQuery = val;
             })
         }
-        .layoutWeight(1)
+        .width(this.bp === 'sm' ? '100%' : undefined)
+        .flexGrow(this.bp === 'sm' ? 0 : 1)
+        .constraintSize({ minWidth: 200 })
         .height(ControlSize.BTN_MD)
         .padding({ left: Spacing.LG, right: Spacing.MD })
         .borderRadius(Radius.CAPSULE)
@@ -1585,67 +1853,70 @@ struct Index {
         .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         .alignItems(VerticalAlign.Center)
 
-        // Segmented Filter with animated color transition
-        Row({ space: Spacing.XS }) {
-          Button('全部', { type: ButtonType.Normal })
-            .height(28)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .borderRadius(14)
-            .fontSize(FontSize.CAPTION)
-            .fontColor(this.appFilter === 'all' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
-            .backgroundColor(this.appFilter === 'all' ? $r('sys.color.brand') : Color.Transparent)
-            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-            .onClick(() => {
-              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'all'; });
-            })
-          Button('第三方', { type: ButtonType.Normal })
-            .height(28)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .borderRadius(14)
-            .fontSize(FontSize.CAPTION)
-            .fontColor(this.appFilter === 'user' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
-            .backgroundColor(this.appFilter === 'user' ? $r('sys.color.brand') : Color.Transparent)
-            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-            .onClick(() => {
-              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'user'; });
-            })
-          Button('系统', { type: ButtonType.Normal })
-            .height(28)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .borderRadius(14)
-            .fontSize(FontSize.CAPTION)
-            .fontColor(this.appFilter === 'system' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
-            .backgroundColor(this.appFilter === 'system' ? $r('sys.color.brand') : Color.Transparent)
-            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-            .onClick(() => {
-              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'system'; });
-            })
-        }
-        .padding(3)
-        .borderRadius(Radius.CAPSULE)
-        .backgroundColor($r('sys.color.comp_background_primary'))
-        .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-
-        Button({ type: ButtonType.Capsule }) {
-          Row({ space: Spacing.XS + 2 }) {
-            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(IconSize.SM)
-              .fontColor([$r('sys.color.icon_primary')])
-            Text('刷新')
+        Row({ space: Spacing.SM }) {
+          Row({ space: Spacing.XS }) {
+            Button('全部', { type: ButtonType.Normal })
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
               .fontSize(FontSize.CAPTION)
-              .fontColor($r('sys.color.font_primary'))
+              .fontColor(this.appFilter === 'all' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'all' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+              .onClick(() => {
+                this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'all'; });
+              })
+            Button('第三方', { type: ButtonType.Normal })
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
+              .fontSize(FontSize.CAPTION)
+              .fontColor(this.appFilter === 'user' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'user' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+              .onClick(() => {
+                this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'user'; });
+              })
+            Button('系统', { type: ButtonType.Normal })
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
+              .fontSize(FontSize.CAPTION)
+              .fontColor(this.appFilter === 'system' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'system' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+              .onClick(() => {
+                this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'system'; });
+              })
           }
+          .padding(3)
+          .borderRadius(Radius.CAPSULE)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+
+          Button({ type: ButtonType.Capsule }) {
+            Row({ space: Spacing.XS + 2 }) {
+              SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+                .fontSize(IconSize.SM)
+                .fontColor([$r('sys.color.icon_primary')])
+              if (this.bp !== 'sm') {
+                Text('刷新')
+                  .fontSize(FontSize.CAPTION)
+                  .fontColor($r('sys.color.font_primary'))
+              }
+            }
+          }
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .enabled(this.wmAgentReady && !this.loadingApps)
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+          .onClick(() => {
+            this.refreshApps(true);
+          })
         }
-        .height(ControlSize.BTN_MD)
-        .padding({ left: Spacing.LG, right: Spacing.LG })
-        .backgroundColor($r('sys.color.comp_background_primary'))
-        .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-        .enabled(this.wmAgentReady && !this.loadingApps)
-        .hoverEffect(HoverEffect.Highlight)
-        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-        .onClick(() => {
-          this.refreshApps(true);
-        })
       }
       .width('100%')
 
@@ -1797,7 +2068,6 @@ struct Index {
                     : $r('sys.color.comp_divider')
                 })
                 .shadow(this.hoveredAppPkg === app.packageName ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
-                .translate({ y: this.hoveredAppPkg === app.packageName ? -2 : 0 })
                 .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
                 .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
                 .onHover((isHover: boolean) => {
@@ -1809,24 +2079,71 @@ struct Index {
             (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
           )
         }
-        .columnsTemplate('1fr 1fr 1fr 1fr 1fr')
+        .columnsTemplate(this.getAppsColumnsTemplate())
         .columnsGap(Spacing.MD)
         .rowsGap(Spacing.MD)
+        .padding({ top: Spacing.XS, bottom: Spacing.MD })
+        .scrollBar(BarState.Auto)
+        .scrollBarWidth(3)
+        .scrollBarColor($r('sys.color.comp_divider'))
         .width('100%')
         .layoutWeight(1)
       }
     }
     .width('100%')
     .height('100%')
-    .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.MD })
+    .padding({
+      left: this.bp === 'sm' ? Spacing.LG : Spacing.XL,
+      right: this.bp === 'sm' ? Spacing.LG : Spacing.XL,
+      top: Spacing.LG,
+      bottom: Spacing.SM
+    })
+  }
+
+  @Builder
+  private mobileBottomTabItem(key: string, label: string, iconRes: Resource, badgeCount: number, onTap: () => void) {
+    Column({ space: 2 }) {
+      Stack({ alignContent: Alignment.TopEnd }) {
+        SymbolGlyph(iconRes)
+          .fontSize(IconSize.MD)
+          .fontColor([
+            this.activeNav === key
+              ? $r('sys.color.icon_emphasize')
+              : $r('sys.color.icon_secondary')
+          ])
+        if (badgeCount > 0) {
+          Text(`${badgeCount}`)
+            .fontSize(9)
+            .fontColor($r('sys.color.font_on_primary'))
+            .padding({ left: 4, right: 4, top: 1, bottom: 1 })
+            .borderRadius(7)
+            .backgroundColor($r('sys.color.brand'))
+            .offset({ x: 8, y: -4 })
+        }
+      }
+      Text(label)
+        .fontSize(FontSize.BADGE)
+        .fontWeight(this.activeNav === key ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(
+          this.activeNav === key
+            ? $r('sys.color.font_emphasize')
+            : $r('sys.color.font_secondary')
+        )
+    }
+    .layoutWeight(1)
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+    .onClick(onTap)
   }
 
   build() {
     Column({ space: 0 }) {
-      // 1. Integrated HarmonyOS PC Title Bar (48vp, native 3-button avoidance)
+      // 1. Integrated HarmonyOS Title Bar (adapts cleanly across Phone / Tablet / PC)
       // Anchor for Global Settings Half-Modal Sheet
-      Row({ space: Spacing.MD }) {
-        Row({ space: Spacing.MD }) {
+      Row({ space: Spacing.SM }) {
+        Row({ space: Spacing.SM }) {
           Stack({ alignContent: Alignment.Center }) {
             Column()
               .width(28)
@@ -1841,20 +2158,23 @@ struct Index {
             .fontSize(FontSize.TITLE_SM)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
 
-          Text('HarmonyOS PC')
-            .fontSize(FontSize.BADGE)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.font_emphasize'))
-            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
-            .borderRadius(Radius.BADGE)
-            .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+          if (this.bp !== 'sm') {
+            Text('HarmonyOS PC')
+              .fontSize(FontSize.BADGE)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_emphasize'))
+              .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+              .borderRadius(Radius.BADGE)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+          }
         }
         .alignItems(VerticalAlign.Center)
+        .layoutWeight(1)
 
-        Blank()
-
-        if (this.running) {
+        if (this.running && this.bp === 'lg') {
           Row({ space: Spacing.SM }) {
             Circle({ width: 7, height: 7 })
               .fill(this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
@@ -1875,77 +2195,68 @@ struct Index {
       .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
       .bindSheet($$this.showGlobalSettingsSheet, this.globalSettingsSheetBuilder(), {
-        preferType: SheetType.CENTER,
-        width: 580,
-        height: 520,
+        preferType: this.computeSheetType(),
+        width: this.computeSheetWidth(580),
+        height: this.bp === 'sm' ? SheetSize.LARGE : 520,
         blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
-        dragBar: false,
+        dragBar: this.bp === 'sm',
         showClose: true,
-        title: { title: '设置中心', subtitle: 'svbox Android · HarmonyOS PC' },
+        title: { title: '设置中心', subtitle: 'svbox Android · HarmonyOS' },
         shadow: ShadowStyle.OUTER_DEFAULT_LG
       })
 
-      // 2. Main Two-Column HarmonyOS PC + MuMu Layout
+      // 2. Main Responsive Workspace (Left Rail on md/lg, Full Width on sm)
+      // Anchor for Create Instance Half-Modal Sheet (permanent across all breakpoints)
       Row({ space: 0 }) {
-        // Slim Left Navigation Rail (76vp) with Spring-Sliding Active Highlight
-        // Anchor for Create Instance Half-Modal Sheet
-        Column({ space: 0 }) {
-          Stack({ alignContent: Alignment.TopStart }) {
-            Column()
-              .width('100%')
-              .height(NAV_RAIL_ITEM_H)
-              .borderRadius(Radius.MD)
-              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
-              .translate({ y: this.activeNav === 'devices' ? 0 : (NAV_RAIL_ITEM_H + NAV_RAIL_ITEM_GAP) })
-              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+        if (this.bp !== 'sm') {
+          Column({ space: 0 }) {
+            Stack({ alignContent: Alignment.TopStart }) {
+              Column()
+                .width('100%')
+                .height(NAV_RAIL_ITEM_H)
+                .borderRadius(Radius.MD)
+                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                .translate({ y: this.activeNav === 'devices' ? 0 : (NAV_RAIL_ITEM_H + NAV_RAIL_ITEM_GAP) })
+                .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
 
-            Column({ space: NAV_RAIL_ITEM_GAP }) {
-              this.navRailItem('devices', '设备', $r('sys.symbol.display'), 0)
-              this.navRailItem('apps', '应用', $r('sys.symbol.square_grid_2x2'), this.appList.length)
+              Column({ space: NAV_RAIL_ITEM_GAP }) {
+                this.navRailItem('devices', '设备', $r('sys.symbol.display'), 0)
+                this.navRailItem('apps', '应用', $r('sys.symbol.square_grid_2x2'), this.appList.length)
+              }
+              .width('100%')
             }
             .width('100%')
-          }
-          .width('100%')
 
-          Blank()
+            Blank()
 
-          Column({ space: Spacing.XS }) {
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph($r('sys.symbol.gearshape'))
-                .fontSize(IconSize.MD)
-                .fontColor([$r('sys.color.icon_secondary')])
+            Column({ space: Spacing.XS }) {
+              Button({ type: ButtonType.Circle }) {
+                SymbolGlyph($r('sys.symbol.gearshape'))
+                  .fontSize(IconSize.MD)
+                  .fontColor([$r('sys.color.icon_secondary')])
+              }
+              .width(ControlSize.BTN_LG)
+              .height(ControlSize.BTN_LG)
+              .backgroundColor(Color.Transparent)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+              .onClick(() => {
+                this.openGlobalSettingsSheet();
+              })
+
+              Text('设置')
+                .fontSize(FontSize.MICRO)
+                .fontColor($r('sys.color.font_tertiary'))
             }
-            .width(ControlSize.BTN_LG)
-            .height(ControlSize.BTN_LG)
-            .backgroundColor(Color.Transparent)
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-            .onClick(() => {
-              this.openGlobalSettingsSheet();
-            })
-
-            Text('设置')
-              .fontSize(FontSize.MICRO)
-              .fontColor($r('sys.color.font_tertiary'))
+            .alignItems(HorizontalAlign.Center)
+            .padding({ bottom: Spacing.XS })
           }
-          .alignItems(HorizontalAlign.Center)
-          .padding({ bottom: Spacing.XS })
+          .width(this.bp === 'md' ? 72 : ControlSize.NAV_RAIL_W)
+          .height('100%')
+          .padding({ left: Spacing.SM, right: Spacing.SM, top: Spacing.LG, bottom: Spacing.MD })
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
         }
-        .width(ControlSize.NAV_RAIL_W)
-        .height('100%')
-        .padding({ left: Spacing.SM, right: Spacing.SM, top: Spacing.LG, bottom: Spacing.MD })
-        .backgroundColor($r('sys.color.comp_background_primary'))
-        .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
-        .bindSheet($$this.showCreateSheet, this.createSheetBuilder(), {
-          preferType: SheetType.CENTER,
-          width: 620,
-          height: 590,
-          blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
-          dragBar: false,
-          showClose: true,
-          title: { title: '新建 Android 设备', subtitle: '支持批量创建，每台设备拥有独立隔离数据分区' },
-          shadow: ShadowStyle.OUTER_DEFAULT_LG
-        })
 
         // Right Workspace Canvas with Page Switch Motion
         // Anchor for Device Settings Half-Modal Sheet
@@ -1970,11 +2281,11 @@ struct Index {
         .height('100%')
         .backgroundColor($r('sys.color.background_secondary'))
         .bindSheet($$this.showDeviceSettingsSheet, this.deviceSettingsSheetBuilder(), {
-          preferType: SheetType.CENTER,
-          width: 760,
-          height: 580,
+          preferType: this.computeSheetType(),
+          width: this.computeSheetWidth(760),
+          height: this.bp === 'sm' ? SheetSize.LARGE : 580,
           blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
-          dragBar: false,
+          dragBar: this.bp === 'sm',
           showClose: true,
           title: {
             title: '设备设置',
@@ -1985,60 +2296,106 @@ struct Index {
       }
       .width('100%')
       .layoutWeight(1)
-
-      // 3. Clean HarmonyOS Bottom Status Bar (32vp)
-      // Anchor for Backup & Restore Half-Modal Sheet
-      Row({ space: Spacing.MD }) {
-        Text(`共 ${this.instances.length} 台设备 · ${this.running ? '1 台运行中' : '全部已停止'}`)
-          .fontSize(FontSize.MICRO)
-          .fontColor($r('sys.color.font_secondary'))
-
-        if (this.cloningBusy) {
-          Row({ space: Spacing.XS + 2 }) {
-            LoadingProgress().width(14).height(14).color($r('sys.color.brand'))
-            Text('正在复制设备数据...')
-              .fontSize(FontSize.MICRO)
-              .fontColor($r('sys.color.font_emphasize'))
-          }
-          .transition(Motion.pillPopTransition())
-        } else if (this.statusText.length > 0) {
-          Text(`· ${this.statusText === 'Idle' ? '就绪' : this.statusText}`)
-            .fontSize(FontSize.MICRO)
-            .fontColor($r('sys.color.font_tertiary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-        } else {
-          Blank()
-        }
-
-        Text(this.gpuRenderer.length > 0 ? this.gpuRenderer : 'Maleoon Vulkan · svbox Runtime')
-          .fontSize(FontSize.MICRO)
-          .fontColor($r('sys.color.font_tertiary'))
-          .maxLines(1)
-      }
-      .width('100%')
-      .height(ControlSize.FOOTER_BAR_H)
-      .padding({ left: Spacing.LG, right: Spacing.LG })
-      .backgroundColor($r('sys.color.comp_background_primary'))
-      .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
-      .alignItems(VerticalAlign.Center)
-      .bindSheet($$this.showBackupSheet, this.backupSheetBuilder(), {
-        preferType: SheetType.CENTER,
-        width: 540,
-        height: 520,
+      .bindSheet($$this.showCreateSheet, this.createSheetBuilder(), {
+        preferType: this.computeSheetType(),
+        width: this.computeSheetWidth(620),
+        height: this.bp === 'sm' ? SheetSize.LARGE : 590,
         blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
-        dragBar: false,
+        dragBar: this.bp === 'sm',
         showClose: true,
-        title: {
-          title: '备份与还原',
-          subtitle: this.editingInstance ? `${this.editingInstance.name} (#${this.editingInstance.index})` : ''
-        },
+        title: { title: '新建 Android 设备', subtitle: '支持批量创建，每台设备拥有独立隔离数据分区' },
         shadow: ShadowStyle.OUTER_DEFAULT_LG
       })
+
+      // 3. Bottom Bar: HarmonyOS Mobile Bottom Navigation (sm) OR Desktop Status Footer (md/lg)
+      // Anchor for Backup & Restore Half-Modal Sheet
+      if (this.bp === 'sm') {
+        Row() {
+          this.mobileBottomTabItem('devices', '设备', $r('sys.symbol.display'), 0, () => {
+            this.switchNavAnimated('devices');
+          })
+          this.mobileBottomTabItem('apps', '应用', $r('sys.symbol.square_grid_2x2'), this.appList.length, () => {
+            this.switchNavAnimated('apps');
+          })
+          this.mobileBottomTabItem('settings', '设置', $r('sys.symbol.gearshape'), 0, () => {
+            this.openGlobalSettingsSheet();
+          })
+        }
+        .width('100%')
+        .height(56)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
+        .bindSheet($$this.showBackupSheet, this.backupSheetBuilder(), {
+          preferType: SheetType.BOTTOM,
+          width: '100%',
+          height: SheetSize.LARGE,
+          blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+          dragBar: true,
+          showClose: true,
+          title: {
+            title: '备份与还原',
+            subtitle: this.editingInstance ? `${this.editingInstance.name} (#${this.editingInstance.index})` : ''
+          },
+          shadow: ShadowStyle.OUTER_DEFAULT_LG
+        })
+      } else {
+        Row({ space: Spacing.MD }) {
+          Text(`共 ${this.instances.length} 台设备 · ${this.running ? '1 台运行中' : '全部已停止'}`)
+            .fontSize(FontSize.MICRO)
+            .fontColor($r('sys.color.font_secondary'))
+
+          if (this.cloningBusy) {
+            Row({ space: Spacing.XS + 2 }) {
+              LoadingProgress().width(14).height(14).color($r('sys.color.brand'))
+              Text('正在复制设备数据...')
+                .fontSize(FontSize.MICRO)
+                .fontColor($r('sys.color.font_emphasize'))
+            }
+            .transition(Motion.pillPopTransition())
+          } else if (this.statusText.length > 0) {
+            Text(`· ${this.statusText === 'Idle' ? '就绪' : this.statusText}`)
+              .fontSize(FontSize.MICRO)
+              .fontColor($r('sys.color.font_tertiary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          } else {
+            Blank()
+          }
+
+          if (this.bp === 'lg') {
+            Text(this.gpuRenderer.length > 0 ? this.gpuRenderer : 'Maleoon Vulkan · svbox Runtime')
+              .fontSize(FontSize.MICRO)
+              .fontColor($r('sys.color.font_tertiary'))
+              .maxLines(1)
+          }
+        }
+        .width('100%')
+        .height(ControlSize.FOOTER_BAR_H)
+        .padding({ left: Spacing.LG, right: Spacing.LG })
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
+        .alignItems(VerticalAlign.Center)
+        .bindSheet($$this.showBackupSheet, this.backupSheetBuilder(), {
+          preferType: SheetType.CENTER,
+          width: this.computeSheetWidth(540),
+          height: 520,
+          blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+          dragBar: false,
+          showClose: true,
+          title: {
+            title: '备份与还原',
+            subtitle: this.editingInstance ? `${this.editingInstance.name} (#${this.editingInstance.index})` : ''
+          },
+          shadow: ShadowStyle.OUTER_DEFAULT_LG
+        })
+      }
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('sys.color.background_secondary'))
+    .onAreaChange((_oldVal: Area, newVal: Area) => {
+      this.updateBreakpoint(Number(newVal.width));
+    })
   }
 }

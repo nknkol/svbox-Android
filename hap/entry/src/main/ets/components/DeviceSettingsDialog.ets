@@ -53,6 +53,7 @@ export struct DeviceSettingsSheet {
   instance: DeviceInstance | undefined = undefined;
   filesDir: string = '';
   isInstanceRunning: boolean = false;
+  compactLayout: boolean = false;
   onSave: (updated: DeviceInstance) => void = (): void => {};
   onCancel: () => void = (): void => {};
   onToast: (msg: string) => void = (): void => {};
@@ -287,7 +288,10 @@ export struct DeviceSettingsSheet {
           .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: Spacing.SM }) {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
           this.optionPill('性能模式', this.draftProfile === 'Performance', () => {
             this.draftProfile = 'Performance';
             this.draftCpuCores = profileToCpuCores('Performance');
@@ -301,6 +305,7 @@ export struct DeviceSettingsSheet {
             this.draftCpuCores = profileToCpuCores('Eco');
           })
         }
+        .width('100%')
       }
       .width('100%')
       .padding(Spacing.LG)
@@ -319,8 +324,11 @@ export struct DeviceSettingsSheet {
           Text('CPU 核数')
             .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(68)
-          Row({ space: Spacing.SM }) {
+            .width(64)
+          Flex({
+            wrap: FlexWrap.Wrap,
+            space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+          }) {
             this.optionPill('2 核', this.draftCpuCores === 2, () => {
               this.draftCpuCores = 2;
               this.draftProfile = cpuCoresToProfile(2);
@@ -338,6 +346,7 @@ export struct DeviceSettingsSheet {
               this.draftProfile = cpuCoresToProfile(8);
             })
           }
+          .layoutWeight(1)
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -346,13 +355,17 @@ export struct DeviceSettingsSheet {
           Text('内存上限')
             .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(68)
-          Row({ space: Spacing.SM }) {
+            .width(64)
+          Flex({
+            wrap: FlexWrap.Wrap,
+            space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+          }) {
             this.optionPill('2 GB', this.draftMemMb === 2048, () => { this.draftMemMb = 2048; })
             this.optionPill('4 GB', this.draftMemMb === 4096, () => { this.draftMemMb = 4096; })
             this.optionPill('6 GB', this.draftMemMb === 6144, () => { this.draftMemMb = 6144; })
             this.optionPill('8 GB', this.draftMemMb === 8192, () => { this.draftMemMb = 8192; })
           }
+          .layoutWeight(1)
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -374,12 +387,16 @@ export struct DeviceSettingsSheet {
           Text('显卡渲染')
             .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(68)
-          Row({ space: Spacing.SM }) {
+            .width(64)
+          Flex({
+            wrap: FlexWrap.Wrap,
+            space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+          }) {
             this.optionPill('Vulkan（推荐）', this.draftGpuMode === 'vulkan', () => { this.draftGpuMode = 'vulkan'; })
             this.optionPill('OpenGL ES', this.draftGpuMode === 'gles', () => { this.draftGpuMode = 'gles'; })
             this.optionPill('CPU 软渲', this.draftGpuMode === 'swiftshader', () => { this.draftGpuMode = 'swiftshader'; })
           }
+          .layoutWeight(1)
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -388,8 +405,11 @@ export struct DeviceSettingsSheet {
           Text('屏幕帧率')
             .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(68)
-          Row({ space: Spacing.SM }) {
+            .width(64)
+          Flex({
+            wrap: FlexWrap.Wrap,
+            space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+          }) {
             ForEach(
               REFRESH_RATES,
               (hz: number) => {
@@ -398,6 +418,7 @@ export struct DeviceSettingsSheet {
               (hz: number): string => String(hz)
             )
           }
+          .layoutWeight(1)
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -947,148 +968,247 @@ export struct DeviceSettingsSheet {
     .width('100%')
   }
 
+  @Builder
+  private tabBodyRouter() {
+    Column() {
+      if (this.activeTab === 'perf') {
+        Column() { this.perfTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'display') {
+        Column() { this.displayTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'audio') {
+        Column() { this.audioTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'disk') {
+        Column() { this.diskTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'network') {
+        Column() { this.networkTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'model') {
+        Column() { this.modelTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'shortcuts') {
+        Column() { this.shortcutsTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else if (this.activeTab === 'other') {
+        Column() { this.otherTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      } else {
+        Column() { this.diagTabBody() }.width('100%').transition(Motion.tabContentTransition())
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
   build() {
     Column({ space: 0 }) {
       Divider().color($r('sys.color.comp_divider')).opacity(0.35)
 
-      Row({ space: 0 }) {
-        // Left Sidebar with smooth spring-sliding selection indicator
-        Column({ space: 0 }) {
-          Stack({ alignContent: Alignment.TopStart }) {
-            // Sliding active pill indicator for main 8 tabs
-            if (this.activeMainTabIndex >= 0) {
-              Column()
-                .width('100%')
-                .height(NAV_ITEM_H)
-                .borderRadius(Radius.MD)
-                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
-                .translate({ y: this.activeMainTabIndex * (NAV_ITEM_H + NAV_ITEM_GAP) })
-                .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
-            }
-
-            Column({ space: NAV_ITEM_GAP }) {
-              ForEach(
-                this.mainTabs,
-                (tab: SettingsNavTab, idx: number) => {
-                  Row({ space: Spacing.MD }) {
+      if (this.compactLayout) {
+        // Mobile / Narrow Foldable Layout: Top Horizontally Scrollable Pill Bar + Top-Aligned Content
+        Scroll() {
+          Row({ space: Spacing.SM }) {
+            ForEach(
+              this.mainTabs,
+              (tab: SettingsNavTab, idx: number) => {
+                Button({ type: ButtonType.Capsule }) {
+                  Row({ space: Spacing.XS + 2 }) {
                     SymbolGlyph(tab.icon)
                       .fontSize(IconSize.SM)
                       .fontColor([
                         this.activeTab === tab.key
-                          ? $r('sys.color.icon_emphasize')
+                          ? $r('sys.color.icon_on_primary')
                           : $r('sys.color.icon_secondary')
                       ])
                     Text(tab.label)
-                      .fontSize(FontSize.BODY_MD)
+                      .fontSize(FontSize.CAPTION)
                       .fontWeight(this.activeTab === tab.key ? FontWeight.Medium : FontWeight.Normal)
                       .fontColor(
                         this.activeTab === tab.key
-                          ? $r('sys.color.font_emphasize')
+                          ? $r('sys.color.font_on_primary')
                           : $r('sys.color.font_primary')
                       )
                   }
-                  .width('100%')
-                  .height(NAV_ITEM_H)
-                  .padding({ left: Spacing.MD, right: Spacing.MD })
-                  .borderRadius(Radius.MD)
-                  .hoverEffect(HoverEffect.Highlight)
-                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
-                  .onClick(() => {
-                    this.switchTab(tab.key, idx);
-                  })
-                },
-                (tab: SettingsNavTab): string => tab.key
-              )
-            }
-            .width('100%')
-          }
-          .width('100%')
+                }
+                .height(ControlSize.BTN_SM)
+                .padding({ left: Spacing.MD, right: Spacing.MD })
+                .backgroundColor(
+                  this.activeTab === tab.key
+                    ? $r('sys.color.brand')
+                    : $r('sys.color.comp_background_tertiary')
+                )
+                .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+                .onClick(() => { this.switchTab(tab.key, idx); })
+              },
+              (tab: SettingsNavTab): string => tab.key
+            )
 
-          Blank()
-
-          Divider().color($r('sys.color.comp_divider')).opacity(0.35).margin({ top: Spacing.SM, bottom: Spacing.SM })
-
-          Row({ space: Spacing.MD }) {
-            SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
-              .fontSize(IconSize.SM)
-              .fontColor([
-                this.activeTab === 'diag'
-                  ? $r('sys.color.icon_emphasize')
-                  : $r('sys.color.icon_secondary')
-              ])
-            Text('设备诊断')
-              .fontSize(FontSize.BODY_MD)
-              .fontWeight(this.activeTab === 'diag' ? FontWeight.Medium : FontWeight.Normal)
-              .fontColor(
-                this.activeTab === 'diag'
-                  ? $r('sys.color.font_emphasize')
-                  : $r('sys.color.font_primary')
-              )
-          }
-          .width('100%')
-          .height(NAV_ITEM_H)
-          .padding({ left: Spacing.MD, right: Spacing.MD })
-          .borderRadius(Radius.MD)
-          .backgroundColor(
-            this.activeTab === 'diag'
-              ? $r('sys.color.comp_emphasize_tertiary')
-              : Color.Transparent
-          )
-          .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-          .hoverEffect(HoverEffect.Highlight)
-          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
-          .onClick(() => {
-            this.switchTab('diag', -1);
-          })
-        }
-        .width(168)
-        .height('100%')
-        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.MD, bottom: Spacing.MD })
-        .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
-
-        // Right Content Area with animated tab transitions
-        Column({ space: 0 }) {
-          Scroll() {
-            Column() {
-              if (this.activeTab === 'perf') {
-                Column() { this.perfTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'display') {
-                Column() { this.displayTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'audio') {
-                Column() { this.audioTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'disk') {
-                Column() { this.diskTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'network') {
-                Column() { this.networkTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'model') {
-                Column() { this.modelTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'shortcuts') {
-                Column() { this.shortcutsTabBody() }.transition(Motion.tabContentTransition())
-              } else if (this.activeTab === 'other') {
-                Column() { this.otherTabBody() }.transition(Motion.tabContentTransition())
-              } else {
-                Column() { this.diagTabBody() }.transition(Motion.tabContentTransition())
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Spacing.XS + 2 }) {
+                SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([
+                    this.activeTab === 'diag'
+                      ? $r('sys.color.icon_on_primary')
+                      : $r('sys.color.icon_secondary')
+                  ])
+                Text('诊断')
+                  .fontSize(FontSize.CAPTION)
+                  .fontWeight(this.activeTab === 'diag' ? FontWeight.Medium : FontWeight.Normal)
+                  .fontColor(
+                    this.activeTab === 'diag'
+                      ? $r('sys.color.font_on_primary')
+                      : $r('sys.color.font_primary')
+                  )
               }
             }
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .backgroundColor(
+              this.activeTab === 'diag'
+                ? $r('sys.color.brand')
+                : $r('sys.color.comp_background_tertiary')
+            )
+            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+            .onClick(() => { this.switchTab('diag', -1); })
+          }
+          .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.MD, bottom: Spacing.MD })
+        }
+        .width('100%')
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+
+        Divider().color($r('sys.color.comp_divider')).opacity(0.3)
+
+        Scroll() {
+          Column() {
+            this.tabBodyRouter()
+          }
+          .width('100%')
+          .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.LG, bottom: Spacing.LG })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .align(Alignment.TopStart)
+        .scrollBar(BarState.Auto)
+        .scrollBarWidth(3)
+        .scrollBarColor($r('sys.color.comp_divider'))
+      } else {
+        // Tablet / PC Split-Pane Layout (24vp left/right baseline alignment)
+        Row({ space: 0 }) {
+          Column({ space: 0 }) {
+            Stack({ alignContent: Alignment.TopStart }) {
+              if (this.activeMainTabIndex >= 0) {
+                Column()
+                  .width('100%')
+                  .height(NAV_ITEM_H)
+                  .borderRadius(Radius.MD)
+                  .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                  .translate({ y: this.activeMainTabIndex * (NAV_ITEM_H + NAV_ITEM_GAP) })
+                  .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+              }
+
+              Column({ space: NAV_ITEM_GAP }) {
+                ForEach(
+                  this.mainTabs,
+                  (tab: SettingsNavTab, idx: number) => {
+                    Row({ space: Spacing.MD }) {
+                      SymbolGlyph(tab.icon)
+                        .fontSize(IconSize.SM)
+                        .fontColor([
+                          this.activeTab === tab.key
+                            ? $r('sys.color.icon_emphasize')
+                            : $r('sys.color.icon_secondary')
+                        ])
+                      Text(tab.label)
+                        .fontSize(FontSize.BODY_MD)
+                        .fontWeight(this.activeTab === tab.key ? FontWeight.Medium : FontWeight.Normal)
+                        .fontColor(
+                          this.activeTab === tab.key
+                            ? $r('sys.color.font_emphasize')
+                            : $r('sys.color.font_primary')
+                        )
+                    }
+                    .width('100%')
+                    .height(NAV_ITEM_H)
+                    .padding({ left: Spacing.SM, right: Spacing.MD })
+                    .borderRadius(Radius.MD)
+                    .hoverEffect(HoverEffect.Highlight)
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+                    .onClick(() => {
+                      this.switchTab(tab.key, idx);
+                    })
+                  },
+                  (tab: SettingsNavTab): string => tab.key
+                )
+              }
+              .width('100%')
+            }
             .width('100%')
-            .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.LG })
+
+            Blank()
+
+            Divider().color($r('sys.color.comp_divider')).opacity(0.35).margin({ top: Spacing.SM, bottom: Spacing.SM })
+
+            Row({ space: Spacing.MD }) {
+              SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
+                .fontSize(IconSize.SM)
+                .fontColor([
+                  this.activeTab === 'diag'
+                    ? $r('sys.color.icon_emphasize')
+                    : $r('sys.color.icon_secondary')
+                ])
+              Text('设备诊断')
+                .fontSize(FontSize.BODY_MD)
+                .fontWeight(this.activeTab === 'diag' ? FontWeight.Medium : FontWeight.Normal)
+                .fontColor(
+                  this.activeTab === 'diag'
+                    ? $r('sys.color.font_emphasize')
+                    : $r('sys.color.font_primary')
+                )
+            }
+            .width('100%')
+            .height(NAV_ITEM_H)
+            .padding({ left: Spacing.SM, right: Spacing.MD })
+            .borderRadius(Radius.MD)
+            .backgroundColor(
+              this.activeTab === 'diag'
+                ? $r('sys.color.comp_emphasize_tertiary')
+                : Color.Transparent
+            )
+            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+            .onClick(() => {
+              this.switchTab('diag', -1);
+            })
+          }
+          .width(172)
+          .height('100%')
+          .padding({ left: Spacing.LG, right: Spacing.MD, top: Spacing.LG, bottom: Spacing.LG })
+          .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
+
+          // Right Content Area: Strictly Top-Aligned + Subtle 3vp Scrollbar + 24vp Right Baseline
+          Scroll() {
+            Column() {
+              this.tabBodyRouter()
+            }
+            .width('100%')
+            .padding({ left: Spacing.XL, right: Spacing.XXL, top: Spacing.LG, bottom: Spacing.LG })
           }
           .layoutWeight(1)
+          .height('100%')
+          .align(Alignment.TopStart)
           .scrollBar(BarState.Auto)
+          .scrollBarWidth(3)
+          .scrollBarColor($r('sys.color.comp_divider'))
         }
+        .width('100%')
         .layoutWeight(1)
-        .height('100%')
       }
-      .width('100%')
-      .layoutWeight(1)
 
       Divider().color($r('sys.color.comp_divider')).opacity(0.35)
 
-      // Sheet Footer Bar
+      // Sheet Footer Bar (strictly 24vp left/right aligned with header and content cards)
       Row({ space: Spacing.MD }) {
         Button('恢复默认', { type: ButtonType.Capsule })
           .height(ControlSize.BTN_MD)
-          .padding({ left: Spacing.LG, right: Spacing.LG })
+          .padding({ left: Spacing.MD, right: Spacing.MD })
           .fontSize(FontSize.BODY_MD)
           .fontColor($r('sys.color.font_secondary'))
           .backgroundColor(Color.Transparent)
@@ -1126,7 +1246,7 @@ export struct DeviceSettingsSheet {
           })
       }
       .width('100%')
-      .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.MD, bottom: Spacing.LG })
+      .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.MD, bottom: Spacing.LG })
     }
     .width('100%')
     .height('100%')

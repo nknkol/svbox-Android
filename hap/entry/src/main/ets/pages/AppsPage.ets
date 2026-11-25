@@ -45,6 +45,13 @@ struct AppsPage {
   @State private pinnedIds: string[] = [];
   @State private prefEpoch: number = 0;
   @State private hoveredPkg: string = '';
+  @State private bp: string = 'lg';
+
+  private getGridTemplate(): string {
+    if (this.bp === 'sm') return '1fr 1fr';
+    if (this.bp === 'md') return '1fr 1fr 1fr 1fr';
+    return '1fr 1fr 1fr 1fr 1fr 1fr';
+  }
 
   private pollTimer: number = -1;
 
@@ -487,7 +494,6 @@ struct AppsPage {
                       : $r('sys.color.comp_divider')
                   })
                   .shadow(this.hoveredPkg === app.packageName ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
-                  .translate({ y: this.hoveredPkg === app.packageName ? -2 : 0 })
                   .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
                   .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
                   .onHover((isHover: boolean) => {
@@ -499,9 +505,13 @@ struct AppsPage {
               (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
             )
           }
-          .columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr')
+          .columnsTemplate(this.getGridTemplate())
           .columnsGap(Spacing.MD)
           .rowsGap(Spacing.MD)
+          .padding({ top: Spacing.XS, bottom: Spacing.MD })
+          .scrollBar(BarState.Auto)
+          .scrollBarWidth(3)
+          .scrollBarColor($r('sys.color.comp_divider'))
           .width('100%')
           .layoutWeight(1)
         }
@@ -513,5 +523,11 @@ struct AppsPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('sys.color.background_secondary'))
+    .onAreaChange((_oldVal: Area, newVal: Area) => {
+      const w: number = Number(newVal.width);
+      if (w > 0) {
+        this.bp = w < 600 ? 'sm' : (w < 840 ? 'md' : 'lg');
+      }
+    })
   }
 }

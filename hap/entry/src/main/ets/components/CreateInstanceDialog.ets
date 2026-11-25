@@ -1,3 +1,4 @@
+import { LengthUnit } from '@kit.ArkUI';
 import {
   ControlSize,
   FontSize,
@@ -10,6 +11,7 @@ import { CreateInstanceOptions } from '../model/InstanceModel';
 
 @Component
 export struct CreateInstanceSheet {
+  compactLayout: boolean = false;
   onConfirm: (opts: CreateInstanceOptions) => void = (): void => {};
   onCancel: () => void = (): void => {};
 
@@ -67,6 +69,8 @@ export struct CreateInstanceSheet {
         Text(desc)
           .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
@@ -82,10 +86,6 @@ export struct CreateInstanceSheet {
     .border({
       width: this.deviceType === key ? 1.5 : 0.6,
       color: this.deviceType === key ? $r('sys.color.brand') : $r('sys.color.comp_divider')
-    })
-    .scale({
-      x: this.deviceType === key ? 1.0 : 0.99,
-      y: this.deviceType === key ? 1.0 : 0.99
     })
     .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
     .hoverEffect(HoverEffect.Highlight)
@@ -128,7 +128,8 @@ export struct CreateInstanceSheet {
         .fontColor($r('sys.color.font_tertiary'))
         .maxLines(2)
     }
-    .layoutWeight(1)
+    .width(this.compactLayout ? '100%' : undefined)
+    .layoutWeight(this.compactLayout ? 0 : 1)
     .padding(Spacing.MD)
     .alignItems(HorizontalAlign.Start)
     .borderRadius(Radius.CARD)
@@ -171,6 +172,54 @@ export struct CreateInstanceSheet {
     })
   }
 
+  @Builder
+  private countStepper() {
+    Row({ space: Spacing.SM }) {
+      Button({ type: ButtonType.Normal }) {
+        SymbolGlyph($r('sys.symbol.minus'))
+          .fontSize(IconSize.SM)
+          .fontColor([this.count > 1 ? $r('sys.color.icon_primary') : $r('sys.color.icon_fourth')])
+      }
+      .width(ControlSize.BTN_SM)
+      .height(ControlSize.BTN_SM)
+      .padding(0)
+      .borderRadius(Radius.SM)
+      .backgroundColor($r('sys.color.comp_background_tertiary'))
+      .enabled(this.count > 1)
+      .hoverEffect(HoverEffect.Highlight)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+      .onClick(() => {
+        if (this.count > 1) this.count -= 1;
+      })
+
+      Text(`${this.count}`)
+        .fontSize(FontSize.BODY_LG)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'))
+        .width(24)
+        .textAlign(TextAlign.Center)
+
+      Button({ type: ButtonType.Normal }) {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(IconSize.SM)
+          .fontColor([this.count < 5 ? $r('sys.color.icon_primary') : $r('sys.color.icon_fourth')])
+      }
+      .width(ControlSize.BTN_SM)
+      .height(ControlSize.BTN_SM)
+      .padding(0)
+      .borderRadius(Radius.SM)
+      .backgroundColor($r('sys.color.comp_background_tertiary'))
+      .enabled(this.count < 5)
+      .hoverEffect(HoverEffect.Highlight)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+      .onClick(() => {
+        if (this.count < 5) this.count += 1;
+      })
+    }
+    .height(ControlSize.INPUT_H)
+    .alignItems(VerticalAlign.Center)
+  }
+
   build() {
     Column({ space: 0 }) {
       Scroll() {
@@ -182,108 +231,132 @@ export struct CreateInstanceSheet {
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
             Row({ space: Spacing.MD }) {
-              this.typeCard('phone', '手机', '720×1280 竖屏 · 320 DPI', $r('sys.symbol.phone_1'))
-              this.typeCard('tablet', '平板', '1600×900 横屏 · 280 DPI', $r('sys.symbol.pad_fill'))
+              this.typeCard('phone', '手机', '720×1280 竖屏', $r('sys.symbol.phone_1'))
+              this.typeCard('tablet', '平板', '1600×900 横屏', $r('sys.symbol.pad_fill'))
             }
             .width('100%')
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
 
-          // 2. Android Image + Count + Name
-          Row({ space: Spacing.LG }) {
-            Column({ space: Spacing.SM }) {
-              Text('系统镜像')
-                .fontSize(FontSize.BODY_MD)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_secondary'))
-              Row({ space: Spacing.SM }) {
-                Text('Android 14')
+          // 2. Android Image + Count + Name (responsive)
+          if (this.compactLayout) {
+            Column({ space: Spacing.MD }) {
+              Row({ space: Spacing.MD }) {
+                Column({ space: Spacing.SM }) {
+                  Text('系统镜像')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_secondary'))
+                  Row({ space: Spacing.SM }) {
+                    Text('Android 14')
+                      .fontSize(FontSize.BODY_MD)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor($r('sys.color.font_emphasize'))
+                    Text('API 34')
+                      .fontSize(FontSize.MICRO)
+                      .fontColor($r('sys.color.font_secondary'))
+                  }
+                  .height(ControlSize.INPUT_H)
+                  .padding({ left: Spacing.MD, right: Spacing.MD })
+                  .borderRadius(Radius.MD)
+                  .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                  .border({ width: 1, color: $r('sys.color.brand') })
+                }
+                .alignItems(HorizontalAlign.Start)
+
+                Blank()
+
+                Column({ space: Spacing.SM }) {
+                  Text('创建数量')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_secondary'))
+                  this.countStepper()
+                }
+                .alignItems(HorizontalAlign.Start)
+              }
+              .width('100%')
+
+              Column({ space: Spacing.SM }) {
+                Text('设备名称（可选）')
                   .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
-                  .fontColor($r('sys.color.font_emphasize'))
-                Text('API 34')
-                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_secondary'))
-              }
-              .height(ControlSize.INPUT_H)
-              .padding({ left: Spacing.MD, right: Spacing.MD })
-              .borderRadius(Radius.MD)
-              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
-              .border({ width: 1, color: $r('sys.color.brand') })
-            }
-            .alignItems(HorizontalAlign.Start)
-
-            Column({ space: Spacing.SM }) {
-              Text('创建数量')
-                .fontSize(FontSize.BODY_MD)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_secondary'))
-              Row({ space: Spacing.SM }) {
-                Button({ type: ButtonType.Normal }) {
-                  Text('−')
-                    .fontSize(FontSize.TITLE_MD)
-                    .fontColor($r('sys.color.font_primary'))
-                }
-                .width(ControlSize.BTN_SM)
-                .height(ControlSize.BTN_SM)
-                .borderRadius(Radius.SM)
-                .backgroundColor($r('sys.color.comp_background_tertiary'))
-                .enabled(this.count > 1)
-                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                .onClick(() => {
-                  if (this.count > 1) this.count -= 1;
-                })
-
-                Text(`${this.count}`)
-                  .fontSize(FontSize.BODY_LG)
-                  .fontWeight(FontWeight.Medium)
+                TextInput({ placeholder: '例如：工作环境 / 测试机', text: this.namePrefix })
+                  .width('100%')
+                  .height(ControlSize.INPUT_H)
+                  .fontSize(FontSize.BODY_MD)
                   .fontColor($r('sys.color.font_primary'))
-                  .width(24)
-                  .textAlign(TextAlign.Center)
-
-                Button({ type: ButtonType.Normal }) {
-                  Text('+')
-                    .fontSize(FontSize.TITLE_MD)
-                    .fontColor($r('sys.color.font_primary'))
-                }
-                .width(ControlSize.BTN_SM)
-                .height(ControlSize.BTN_SM)
-                .borderRadius(Radius.SM)
-                .backgroundColor($r('sys.color.comp_background_tertiary'))
-                .enabled(this.count < 5)
-                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                .onClick(() => {
-                  if (this.count < 5) this.count += 1;
-                })
+                  .placeholderColor($r('sys.color.font_tertiary'))
+                  .backgroundColor($r('sys.color.comp_background_primary'))
+                  .borderRadius(Radius.MD)
+                  .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+                  .maxLength(32)
+                  .onChange((val: string) => {
+                    this.namePrefix = val;
+                  })
               }
-              .height(ControlSize.INPUT_H)
-              .alignItems(VerticalAlign.Center)
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
             }
-            .alignItems(HorizontalAlign.Start)
-
-            Column({ space: Spacing.SM }) {
-              Text('设备名称（可选）')
-                .fontSize(FontSize.BODY_MD)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_secondary'))
-              TextInput({ placeholder: '例如：工作环境 / 测试机', text: this.namePrefix })
+            .width('100%')
+          } else {
+            Row({ space: Spacing.LG }) {
+              Column({ space: Spacing.SM }) {
+                Text('系统镜像')
+                  .fontSize(FontSize.BODY_MD)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_secondary'))
+                Row({ space: Spacing.SM }) {
+                  Text('Android 14')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_emphasize'))
+                  Text('API 34')
+                    .fontSize(FontSize.MICRO)
+                    .fontColor($r('sys.color.font_secondary'))
+                }
                 .height(ControlSize.INPUT_H)
-                .fontSize(FontSize.BODY_MD)
-                .fontColor($r('sys.color.font_primary'))
-                .placeholderColor($r('sys.color.font_tertiary'))
-                .backgroundColor($r('sys.color.comp_background_primary'))
+                .padding({ left: Spacing.MD, right: Spacing.MD })
                 .borderRadius(Radius.MD)
-                .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-                .maxLength(32)
-                .onChange((val: string) => {
-                  this.namePrefix = val;
-                })
+                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                .border({ width: 1, color: $r('sys.color.brand') })
+              }
+              .alignItems(HorizontalAlign.Start)
+
+              Column({ space: Spacing.SM }) {
+                Text('创建数量')
+                  .fontSize(FontSize.BODY_MD)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_secondary'))
+                this.countStepper()
+              }
+              .alignItems(HorizontalAlign.Start)
+
+              Column({ space: Spacing.SM }) {
+                Text('设备名称（可选）')
+                  .fontSize(FontSize.BODY_MD)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('sys.color.font_secondary'))
+                TextInput({ placeholder: '例如：工作环境 / 测试机', text: this.namePrefix })
+                  .height(ControlSize.INPUT_H)
+                  .fontSize(FontSize.BODY_MD)
+                  .fontColor($r('sys.color.font_primary'))
+                  .placeholderColor($r('sys.color.font_tertiary'))
+                  .backgroundColor($r('sys.color.comp_background_primary'))
+                  .borderRadius(Radius.MD)
+                  .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+                  .maxLength(32)
+                  .onChange((val: string) => {
+                    this.namePrefix = val;
+                  })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
             }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
+            .width('100%')
           }
-          .width('100%')
 
           // 3. Scenario Presets
           Column({ space: Spacing.SM }) {
@@ -291,12 +364,21 @@ export struct CreateInstanceSheet {
               .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
-            Row({ space: Spacing.MD }) {
-              this.scenarioCard('normal', '普通多开', '4 核 · 4 GB', '日常应用均衡流畅')
-              this.scenarioCard('performance', '性能模式', '8 核 · 6 GB', '高帧率满血体验')
-              this.scenarioCard('extreme', '极致多开', '2 核 · 2 GB', '轻量低占用环境')
+            if (this.compactLayout) {
+              Column({ space: Spacing.SM }) {
+                this.scenarioCard('normal', '普通多开', '4 核 · 4 GB', '日常应用均衡流畅')
+                this.scenarioCard('performance', '性能模式', '8 核 · 6 GB', '高帧率满血体验')
+                this.scenarioCard('extreme', '极致多开', '2 核 · 2 GB', '轻量低占用环境')
+              }
+              .width('100%')
+            } else {
+              Row({ space: Spacing.MD }) {
+                this.scenarioCard('normal', '普通多开', '4 核 · 4 GB', '日常应用均衡流畅')
+                this.scenarioCard('performance', '性能模式', '8 核 · 6 GB', '高帧率满血体验')
+                this.scenarioCard('extreme', '极致多开', '2 核 · 2 GB', '轻量低占用环境')
+              }
+              .width('100%')
             }
-            .width('100%')
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
@@ -307,12 +389,16 @@ export struct CreateInstanceSheet {
               Text('渲染引擎')
                 .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(68)
-              Row({ space: Spacing.SM }) {
+                .width(64)
+              Flex({
+                wrap: FlexWrap.Wrap,
+                space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+              }) {
                 this.segmentChip('Vulkan 加速', this.gpuMode === 'vulkan', () => { this.gpuMode = 'vulkan'; })
                 this.segmentChip('OpenGL ES', this.gpuMode === 'gles', () => { this.gpuMode = 'gles'; })
                 this.segmentChip('CPU 软渲', this.gpuMode === 'swiftshader', () => { this.gpuMode = 'swiftshader'; })
               }
+              .layoutWeight(1)
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
@@ -321,12 +407,16 @@ export struct CreateInstanceSheet {
               Text('屏幕帧率')
                 .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(68)
-              Row({ space: Spacing.SM }) {
+                .width(64)
+              Flex({
+                wrap: FlexWrap.Wrap,
+                space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+              }) {
                 this.segmentChip('60 Hz', this.refreshRate === 60, () => { this.refreshRate = 60; })
                 this.segmentChip('90 Hz', this.refreshRate === 90, () => { this.refreshRate = 90; })
                 this.segmentChip('120 Hz', this.refreshRate === 120, () => { this.refreshRate = 120; })
               }
+              .layoutWeight(1)
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
@@ -335,11 +425,15 @@ export struct CreateInstanceSheet {
               Text('窗口模式')
                 .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(68)
-              Row({ space: Spacing.SM }) {
+                .width(64)
+              Flex({
+                wrap: FlexWrap.Wrap,
+                space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+              }) {
                 this.segmentChip('传统模拟器', this.runMode === 'emulator', () => { this.runMode = 'emulator'; })
                 this.segmentChip('自由多窗', this.runMode === 'multiwindow', () => { this.runMode = 'multiwindow'; })
               }
+              .layoutWeight(1)
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
@@ -376,18 +470,24 @@ export struct CreateInstanceSheet {
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         }
+        .width('100%')
         .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.LG })
       }
+      .width('100%')
       .layoutWeight(1)
+      .align(Alignment.TopStart)
       .scrollBar(BarState.Auto)
+      .scrollBarWidth(3)
+      .scrollBarColor($r('sys.color.comp_divider'))
 
       Divider().color($r('sys.color.comp_divider')).opacity(0.4)
 
-      // Sheet Footer
       Row({ space: Spacing.MD }) {
-        Text(`将创建 ${this.count} 台独立 Android 14 设备`)
-          .fontSize(FontSize.CAPTION)
-          .fontColor($r('sys.color.font_tertiary'))
+        if (!this.compactLayout) {
+          Text(`将创建 ${this.count} 台独立 Android 14 设备`)
+            .fontSize(FontSize.CAPTION)
+            .fontColor($r('sys.color.font_tertiary'))
+        }
         Blank()
         Button('取消', { type: ButtonType.Capsule })
           .height(ControlSize.BTN_MD)

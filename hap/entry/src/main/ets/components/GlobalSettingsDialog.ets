@@ -2,6 +2,7 @@ import native from 'libentry.so';
 import {
   ControlSize,
   FontSize,
+  IconSize,
   Motion,
   Radius,
   Spacing
@@ -11,6 +12,7 @@ import { GlobalSettings } from '../model/InstanceModel';
 @Component
 export struct GlobalSettingsSheet {
   initialSettings: GlobalSettings | undefined = undefined;
+  compactLayout: boolean = false;
   onSave: (next: GlobalSettings) => void = (): void => {};
   onCancel: () => void = (): void => {};
 
@@ -44,10 +46,47 @@ export struct GlobalSettingsSheet {
     }
   }
 
+  @Builder
+  private arrangeModeCard(key: string, title: string, desc: string) {
+    Column({ space: Spacing.XS }) {
+      Text(title)
+        .fontSize(FontSize.BODY_MD)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(
+          this.windowArrangeMode === key
+            ? $r('sys.color.font_emphasize')
+            : $r('sys.color.font_primary')
+        )
+      Text(desc)
+        .fontSize(FontSize.MICRO)
+        .fontColor($r('sys.color.font_tertiary'))
+    }
+    .width(this.compactLayout ? '100%' : undefined)
+    .layoutWeight(this.compactLayout ? 0 : 1)
+    .padding(Spacing.MD)
+    .alignItems(HorizontalAlign.Start)
+    .borderRadius(Radius.MD)
+    .backgroundColor(
+      this.windowArrangeMode === key
+        ? $r('sys.color.comp_emphasize_tertiary')
+        : $r('sys.color.background_secondary')
+    )
+    .border({
+      width: this.windowArrangeMode === key ? 1.5 : 0.6,
+      color: this.windowArrangeMode === key ? $r('sys.color.brand') : $r('sys.color.comp_divider')
+    })
+    .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+    .onClick(() => {
+      this.animateSelect(() => { this.windowArrangeMode = key; });
+    })
+  }
+
   build() {
     Column({ space: 0 }) {
       Scroll() {
-        Column({ space: Spacing.LG }) {
+        Column({ space: Spacing.MD }) {
           // Startup & Multi-instance behavior
           Column({ space: Spacing.MD }) {
             Text('启动与多开')
@@ -90,35 +129,56 @@ export struct GlobalSettingsSheet {
               .layoutWeight(1)
 
               Row({ space: Spacing.SM }) {
-                Button('−', { type: ButtonType.Normal })
-                  .width(ControlSize.BTN_SM)
-                  .height(ControlSize.BTN_SM)
-                  .borderRadius(Radius.SM)
-                  .fontColor($r('sys.color.font_primary'))
-                  .backgroundColor($r('sys.color.comp_background_tertiary'))
-                  .enabled(this.batchStartIntervalSec > 1)
-                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                  .onClick(() => {
-                    if (this.batchStartIntervalSec > 1) this.batchStartIntervalSec -= 1;
-                  })
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph($r('sys.symbol.minus'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([
+                      this.batchStartIntervalSec > 1
+                        ? $r('sys.color.icon_primary')
+                        : $r('sys.color.icon_fourth')
+                    ])
+                }
+                .width(ControlSize.BTN_SM)
+                .height(ControlSize.BTN_SM)
+                .padding(0)
+                .borderRadius(Radius.SM)
+                .backgroundColor($r('sys.color.comp_background_tertiary'))
+                .enabled(this.batchStartIntervalSec > 1)
+                .hoverEffect(HoverEffect.Highlight)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+                .onClick(() => {
+                  if (this.batchStartIntervalSec > 1) this.batchStartIntervalSec -= 1;
+                })
+
                 Text(`${this.batchStartIntervalSec} s`)
                   .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
                   .fontColor($r('sys.color.font_primary'))
                   .width(36)
                   .textAlign(TextAlign.Center)
-                Button('+', { type: ButtonType.Normal })
-                  .width(ControlSize.BTN_SM)
-                  .height(ControlSize.BTN_SM)
-                  .borderRadius(Radius.SM)
-                  .fontColor($r('sys.color.font_primary'))
-                  .backgroundColor($r('sys.color.comp_background_tertiary'))
-                  .enabled(this.batchStartIntervalSec < 15)
-                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
-                  .onClick(() => {
-                    if (this.batchStartIntervalSec < 15) this.batchStartIntervalSec += 1;
-                  })
+
+                Button({ type: ButtonType.Normal }) {
+                  SymbolGlyph($r('sys.symbol.plus'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([
+                      this.batchStartIntervalSec < 15
+                        ? $r('sys.color.icon_primary')
+                        : $r('sys.color.icon_fourth')
+                    ])
+                }
+                .width(ControlSize.BTN_SM)
+                .height(ControlSize.BTN_SM)
+                .padding(0)
+                .borderRadius(Radius.SM)
+                .backgroundColor($r('sys.color.comp_background_tertiary'))
+                .enabled(this.batchStartIntervalSec < 15)
+                .hoverEffect(HoverEffect.Highlight)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+                .onClick(() => {
+                  if (this.batchStartIntervalSec < 15) this.batchStartIntervalSec += 1;
+                })
               }
+              .alignItems(VerticalAlign.Center)
             }
             .width('100%')
           }
@@ -136,74 +196,19 @@ export struct GlobalSettingsSheet {
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
 
-            Row({ space: Spacing.MD }) {
-              Column({ space: Spacing.XS }) {
-                Text('网格平铺（并排）')
-                  .fontSize(FontSize.BODY_MD)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(
-                    this.windowArrangeMode === 'grid'
-                      ? $r('sys.color.font_emphasize')
-                      : $r('sys.color.font_primary')
-                  )
-                Text('按窗口宽度从左向右自动并排对齐')
-                  .fontSize(FontSize.MICRO)
-                  .fontColor($r('sys.color.font_tertiary'))
+            if (this.compactLayout) {
+              Column({ space: Spacing.SM }) {
+                this.arrangeModeCard('grid', '网格平铺（并排）', '按窗口宽度从左向右自动并排对齐')
+                this.arrangeModeCard('cascade', '对角层叠排列', '沿对角线错开排列，方便快速切换窗口')
               }
-              .layoutWeight(1)
-              .padding(Spacing.MD)
-              .alignItems(HorizontalAlign.Start)
-              .borderRadius(Radius.MD)
-              .backgroundColor(
-                this.windowArrangeMode === 'grid'
-                  ? $r('sys.color.comp_emphasize_tertiary')
-                  : $r('sys.color.background_secondary')
-              )
-              .border({
-                width: this.windowArrangeMode === 'grid' ? 1.5 : 0.6,
-                color: this.windowArrangeMode === 'grid' ? $r('sys.color.brand') : $r('sys.color.comp_divider')
-              })
-              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
-              .hoverEffect(HoverEffect.Highlight)
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
-              .onClick(() => {
-                this.animateSelect(() => { this.windowArrangeMode = 'grid'; });
-              })
-
-              Column({ space: Spacing.XS }) {
-                Text('对角层叠排列')
-                  .fontSize(FontSize.BODY_MD)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(
-                    this.windowArrangeMode === 'cascade'
-                      ? $r('sys.color.font_emphasize')
-                      : $r('sys.color.font_primary')
-                  )
-                Text('沿对角线错开排列，方便快速切换窗口')
-                  .fontSize(FontSize.MICRO)
-                  .fontColor($r('sys.color.font_tertiary'))
+              .width('100%')
+            } else {
+              Row({ space: Spacing.MD }) {
+                this.arrangeModeCard('grid', '网格平铺（并排）', '按窗口宽度从左向右自动并排对齐')
+                this.arrangeModeCard('cascade', '对角层叠排列', '沿对角线错开排列，方便快速切换窗口')
               }
-              .layoutWeight(1)
-              .padding(Spacing.MD)
-              .alignItems(HorizontalAlign.Start)
-              .borderRadius(Radius.MD)
-              .backgroundColor(
-                this.windowArrangeMode === 'cascade'
-                  ? $r('sys.color.comp_emphasize_tertiary')
-                  : $r('sys.color.background_secondary')
-              )
-              .border({
-                width: this.windowArrangeMode === 'cascade' ? 1.5 : 0.6,
-                color: this.windowArrangeMode === 'cascade' ? $r('sys.color.brand') : $r('sys.color.comp_divider')
-              })
-              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
-              .hoverEffect(HoverEffect.Highlight)
-              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
-              .onClick(() => {
-                this.animateSelect(() => { this.windowArrangeMode = 'cascade'; });
-              })
+              .width('100%')
             }
-            .width('100%')
           }
           .width('100%')
           .padding(Spacing.LG)
@@ -259,9 +264,15 @@ export struct GlobalSettingsSheet {
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(HorizontalAlign.Start)
         }
+        .width('100%')
         .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.LG })
       }
+      .width('100%')
       .layoutWeight(1)
+      .align(Alignment.TopStart)
+      .scrollBar(BarState.Auto)
+      .scrollBarWidth(3)
+      .scrollBarColor($r('sys.color.comp_divider'))
 
       Divider().color($r('sys.color.comp_divider')).opacity(0.4)
 

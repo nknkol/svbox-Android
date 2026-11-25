@@ -100,196 +100,206 @@ export struct BackupRestoreSheet {
   }
 
   build() {
-    Column({ space: Spacing.LG }) {
-      // Backup Card
+    Scroll() {
       Column({ space: Spacing.MD }) {
-        Row({ space: Spacing.MD }) {
-          Column({ space: Spacing.XS }) {
-            Text('备份设备数据')
-              .fontSize(FontSize.TITLE_SM)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.font_primary'))
-            Text(`备份路径：${this.backupDir}`)
-              .fontSize(FontSize.MICRO)
-              .fontColor($r('sys.color.font_tertiary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
+        // Backup Card
+        Column({ space: Spacing.MD }) {
+          Row({ space: Spacing.MD }) {
+            Column({ space: Spacing.XS }) {
+              Text('备份设备数据')
+                .fontSize(FontSize.TITLE_SM)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('sys.color.font_primary'))
+              Text(`备份路径：${this.backupDir}`)
+                .fontSize(FontSize.MICRO)
+                .fontColor($r('sys.color.font_tertiary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
 
-          Button('立即备份', { type: ButtonType.Capsule })
-            .height(ControlSize.BTN_MD)
-            .padding({ left: Spacing.LG, right: Spacing.LG })
-            .fontSize(FontSize.BODY_MD)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.font_on_primary'))
-            .backgroundColor($r('sys.color.brand'))
-            .enabled(!this.busy)
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
-            .onClick(() => {
-              this.runBackup();
-            })
-        }
-        .width('100%')
-
-        Row({ space: Spacing.SM }) {
-          Checkbox()
-            .select(this.compressBackup)
-            .selectedColor($r('sys.color.brand'))
-            .width(18)
-            .height(18)
-            .onChange((checked: boolean) => {
-              this.compressBackup = checked;
-            })
-          Text('启用 gzip 压缩（占用空间更小，耗时略增加）')
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_secondary'))
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-      }
-      .width('100%')
-      .padding(Spacing.LG)
-      .borderRadius(Radius.CARD)
-      .backgroundColor($r('sys.color.comp_background_primary'))
-      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-
-      // Restore Card
-      Column({ space: Spacing.MD }) {
-        Row({ space: Spacing.MD }) {
-          Column({ space: Spacing.XS }) {
-            Text('从已有备份还原')
-              .fontSize(FontSize.TITLE_SM)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.font_primary'))
-            Text(this.isInstanceRunning ? '设备正在运行中，请先停止后再还原' : '还原将覆盖当前设备的全部应用与数据')
-              .fontSize(FontSize.MICRO)
-              .fontColor(this.isInstanceRunning ? $r('sys.color.alert') : $r('sys.color.font_tertiary'))
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-
-          Button('刷新列表', { type: ButtonType.Capsule })
-            .height(ControlSize.BTN_SM)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-            .onClick(() => {
-              this.refreshBackups();
-            })
-        }
-        .width('100%')
-
-        if (this.backupFiles.length === 0) {
-          Column({ space: Spacing.SM }) {
-            SymbolGlyph($r('sys.symbol.archivebox'))
-              .fontSize(IconSize.LG)
-              .fontColor([$r('sys.color.icon_tertiary')])
-            Text('暂无历史备份文件')
+            Button('立即备份', { type: ButtonType.Capsule })
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.LG, right: Spacing.LG })
               .fontSize(FontSize.BODY_MD)
-              .fontColor($r('sys.color.font_tertiary'))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_on_primary'))
+              .backgroundColor($r('sys.color.brand'))
+              .enabled(!this.busy)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+              .onClick(() => {
+                this.runBackup();
+              })
           }
           .width('100%')
-          .height(128)
-          .justifyContent(FlexAlign.Center)
-        } else {
-          List({ space: Spacing.SM }) {
-            ForEach(
-              this.backupFiles,
-              (fname: string) => {
-                ListItem() {
-                  Row({ space: Spacing.MD }) {
-                    SymbolGlyph($r('sys.symbol.archivebox'))
-                      .fontSize(IconSize.SM)
-                      .fontColor([
-                        this.selectedBackup === fname
-                          ? $r('sys.color.icon_emphasize')
-                          : $r('sys.color.icon_secondary')
-                      ])
-                    Text(fname)
-                      .fontSize(FontSize.BODY_MD)
-                      .fontColor(
-                        this.selectedBackup === fname
-                          ? $r('sys.color.font_emphasize')
-                          : $r('sys.color.font_primary')
-                      )
-                      .layoutWeight(1)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    if (this.selectedBackup === fname) {
-                      SymbolGlyph($r('sys.symbol.checkmark'))
-                        .fontSize(IconSize.SM)
-                        .fontColor([$r('sys.color.icon_emphasize')])
-                        .transition(Motion.pillPopTransition())
-                    }
-                  }
-                  .width('100%')
-                  .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.SM, bottom: Spacing.SM })
-                  .borderRadius(Radius.MD)
-                  .backgroundColor(
-                    this.selectedBackup === fname
-                      ? $r('sys.color.comp_emphasize_tertiary')
-                      : $r('sys.color.background_secondary')
-                  )
-                  .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-                  .hoverEffect(HoverEffect.Highlight)
-                  .onClick(() => {
-                    this.selectedBackup = fname;
-                  })
-                }
-              },
-              (fname: string): string => fname
-            )
-          }
-          .width('100%')
-          .height(140)
-        }
 
-        Row() {
-          Blank()
-          Button('还原所选备份', { type: ButtonType.Capsule })
-            .height(ControlSize.BTN_MD)
-            .padding({ left: Spacing.LG, right: Spacing.LG })
-            .fontSize(FontSize.BODY_MD)
-            .fontColor($r('sys.color.font_on_primary'))
-            .backgroundColor($r('sys.color.warning'))
-            .enabled(!this.busy && !this.isInstanceRunning && this.selectedBackup.length > 0)
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
-            .onClick(() => {
-              this.runRestore();
-            })
+          Row({ space: Spacing.SM }) {
+            Checkbox()
+              .select(this.compressBackup)
+              .selectedColor($r('sys.color.brand'))
+              .width(18)
+              .height(18)
+              .onChange((checked: boolean) => {
+                this.compressBackup = checked;
+              })
+            Text('启用 gzip 压缩（占用空间更小，耗时略增加）')
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_secondary'))
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
         }
         .width('100%')
+        .padding(Spacing.LG)
+        .borderRadius(Radius.CARD)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+
+        // Restore Card
+        Column({ space: Spacing.MD }) {
+          Row({ space: Spacing.MD }) {
+            Column({ space: Spacing.XS }) {
+              Text('从已有备份还原')
+                .fontSize(FontSize.TITLE_SM)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('sys.color.font_primary'))
+              Text(this.isInstanceRunning ? '设备正在运行中，请先停止后再还原' : '还原将覆盖当前设备的全部应用与数据')
+                .fontSize(FontSize.MICRO)
+                .fontColor(this.isInstanceRunning ? $r('sys.color.alert') : $r('sys.color.font_tertiary'))
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+
+            Button('刷新列表', { type: ButtonType.Capsule })
+              .height(ControlSize.BTN_SM)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_primary'))
+              .backgroundColor($r('sys.color.comp_background_tertiary'))
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                this.refreshBackups();
+              })
+          }
+          .width('100%')
+
+          if (this.backupFiles.length === 0) {
+            Column({ space: Spacing.SM }) {
+              SymbolGlyph($r('sys.symbol.archivebox'))
+                .fontSize(IconSize.LG)
+                .fontColor([$r('sys.color.icon_tertiary')])
+              Text('暂无历史备份文件')
+                .fontSize(FontSize.BODY_MD)
+                .fontColor($r('sys.color.font_tertiary'))
+            }
+            .width('100%')
+            .height(124)
+            .justifyContent(FlexAlign.Center)
+          } else {
+            List({ space: Spacing.SM }) {
+              ForEach(
+                this.backupFiles,
+                (fname: string) => {
+                  ListItem() {
+                    Row({ space: Spacing.MD }) {
+                      SymbolGlyph($r('sys.symbol.archivebox'))
+                        .fontSize(IconSize.SM)
+                        .fontColor([
+                          this.selectedBackup === fname
+                            ? $r('sys.color.icon_emphasize')
+                            : $r('sys.color.icon_secondary')
+                        ])
+                      Text(fname)
+                        .fontSize(FontSize.BODY_MD)
+                        .fontColor(
+                          this.selectedBackup === fname
+                            ? $r('sys.color.font_emphasize')
+                            : $r('sys.color.font_primary')
+                        )
+                        .layoutWeight(1)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      if (this.selectedBackup === fname) {
+                        SymbolGlyph($r('sys.symbol.checkmark'))
+                          .fontSize(IconSize.SM)
+                          .fontColor([$r('sys.color.icon_emphasize')])
+                          .transition(Motion.pillPopTransition())
+                      }
+                    }
+                    .width('100%')
+                    .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.SM, bottom: Spacing.SM })
+                    .borderRadius(Radius.MD)
+                    .backgroundColor(
+                      this.selectedBackup === fname
+                        ? $r('sys.color.comp_emphasize_tertiary')
+                        : $r('sys.color.background_secondary')
+                    )
+                    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+                    .hoverEffect(HoverEffect.Highlight)
+                    .onClick(() => {
+                      this.selectedBackup = fname;
+                    })
+                  }
+                },
+                (fname: string): string => fname
+              )
+            }
+            .width('100%')
+            .height(140)
+            .scrollBar(BarState.Auto)
+            .scrollBarWidth(3)
+            .scrollBarColor($r('sys.color.comp_divider'))
+          }
+
+          Row() {
+            Blank()
+            Button('还原所选备份', { type: ButtonType.Capsule })
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.LG, right: Spacing.LG })
+              .fontSize(FontSize.BODY_MD)
+              .fontColor($r('sys.color.font_on_primary'))
+              .backgroundColor($r('sys.color.warning'))
+              .enabled(!this.busy && !this.isInstanceRunning && this.selectedBackup.length > 0)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+              .onClick(() => {
+                this.runRestore();
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(Spacing.LG)
+        .borderRadius(Radius.CARD)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+
+        if (this.busy) {
+          Row({ space: Spacing.SM }) {
+            LoadingProgress()
+              .width(IconSize.MD)
+              .height(IconSize.MD)
+              .color($r('sys.color.brand'))
+            Text(this.busyText)
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_secondary'))
+          }
+          .width('100%')
+          .justifyContent(FlexAlign.Center)
+          .transition(Motion.pillPopTransition())
+        }
       }
       .width('100%')
-      .padding(Spacing.LG)
-      .borderRadius(Radius.CARD)
-      .backgroundColor($r('sys.color.comp_background_primary'))
-      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-
-      if (this.busy) {
-        Row({ space: Spacing.SM }) {
-          LoadingProgress()
-            .width(IconSize.MD)
-            .height(IconSize.MD)
-            .color($r('sys.color.brand'))
-          Text(this.busyText)
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_secondary'))
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.Center)
-        .transition(Motion.pillPopTransition())
-      }
+      .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.XL })
     }
     .width('100%')
     .height('100%')
-    .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.XL })
+    .align(Alignment.TopStart)
+    .scrollBar(BarState.Auto)
+    .scrollBarWidth(3)
+    .scrollBarColor($r('sys.color.comp_divider'))
   }
 }
