@@ -954,6 +954,18 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   2. **[`binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L559-L570)**：`proc_mem_alloc()` 严格按 `min(proc->mem_size, proc->guest_map_len)` 分配。
   3. **真机实测（`HAD-W32`）**：《月圆之夜》顺利越过「更新完成!」与全量 YooAsset 配置加载进入 **`[GameEntrancePanel]` 主入口与登录界面**，`GameManager` 启动加载耗时从 `24.57s` 降至 **`14.20s`**（快 42%），**零 `SIGSEGV` / 零新 tombstone / 零 `system_server` 崩溃**，`hwcomposer` 连续稳定输出 3,900+ 帧。
 
+### 11.8 根治 `system_server` 偶发 `SIGSEGV` 导致酷安/全系统卡死（`svbox-binderd` 在途 `BINDER` 节点引用计数 UAF）
+- **现象**：正常浏览酷安一段时间（尤其在子服务退出或释放句柄后），界面卡死且日志报 `DeadSystemException`，随后整个 Android 系统无响应。
+- **真实根因（`F/DEBUG` 回溯 100% 实证）**：
+  - `system_server`（`binder:64357_1`）在 `IActivityManager$Stub.onTransact` → `Parcel::unflattenBinder()` → `RefBase::incStrongRequireStrong()` 处触发空指针/悬垂指针 `SIGSEGV`（`x9 = 0x73622a85 = SV_BINDER_TYPE_BINDER`），进而导致 `Zygote` 退出、所有应用陷入 `DeadSystemException`。
+  - 定位到 [`binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c) 两处引用计数缺口：
+    1. 将客户端 `SV_BINDER_TYPE_HANDLE` 还原为 `SV_BINDER_TYPE_BINDER`（`node->ptr / node->cookie`）发回属主进程（如 `system_server`）时，未在目标事务 `mem_block` 上为该 `node` 保活在途强引用；一旦客户端紧接着执行 `BC_RELEASE` 或退出，`node->strong_ref_total` 归零立刻下发 `BR_RELEASE` 销毁 `JavaBBinder`，随后 `system_server` 读到在途事务调用 `incStrongRequireStrong()` 立即 UAF 崩溃；
+    2. `BR_TRANSACTION` 的目标节点 `target_node` 同样未在 `mem_block` 中保活在途强引用，且对已发过 `BR_RELEASE` 的节点未做空指针/死节点防护。
+- **修复与真机压测（`HAD-W32`）**：
+  - [`binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L535-L580)：在 `struct mem_block` 中新增在途节点追踪 `mem_block_add_node()`（在 `BC_FREE_BUFFER` 与进程 `drop_conn` 时成对释放 `strong_ref_total`）；同时新增 `bnode.released_strong_once` 标记，对 `target_node` 与 `HANDLE → BINDER` 还原均保活在途强引用并对已释放节点安全降级（`SV_BR_DEAD_REPLY` / 空 binder）。
+  - 真机执行酷安两轮连续滑动 + 进贴返回 + 强杀重启压测（模拟活跃句柄突然销毁），`system_server` 与酷安全程稳定存活（`P50 = 9 ms`、`GPU P99 = 1 ms`），`SIGSEGV / unflattenBinder / DeadSystemException / ANR` 全为 **0**。
+
+
 
 
 

@@ -53,6 +53,10 @@ struct mem_block {
     uint32_t  handles[INLINE_BLK_HANDLES];
     uint32_t *extra_handles;
     uint32_t  extra_cap;
+    uint32_t  node_count;
+    uint32_t  nodes[INLINE_BLK_HANDLES];
+    uint32_t *extra_nodes;
+    uint32_t  extra_nodes_cap;
 };
 
 struct bhandle {
@@ -117,6 +121,7 @@ struct bnode {
     bool     has_strong_ref;
     bool     pending_weak_ref;
     bool     pending_strong_ref;
+    bool     released_strong_once;
     bool     has_async_txn;
     int32_t  handle_count;
     int32_t  strong_ref_total;
@@ -527,6 +532,32 @@ static void mem_block_add_handle(struct mem_block *blk, uint32_t handle)
     blk->handle_count++;
 }
 
+static void mem_block_add_node(struct mem_block *blk, uint32_t node_id)
+{
+    if (!blk || node_id == 0)
+        return;
+    struct bnode *nd = find_node(node_id);
+    if (!nd || !nd->used || nd->ptr == 0 || nd->is_ctx_mgr)
+        return;
+    if (blk->node_count < INLINE_BLK_HANDLES) {
+        blk->nodes[blk->node_count++] = node_id;
+        nd->strong_ref_total++;
+        return;
+    }
+    uint32_t eidx = blk->node_count - INLINE_BLK_HANDLES;
+    if (eidx >= blk->extra_nodes_cap) {
+        uint32_t ncap = blk->extra_nodes_cap > 0 ? blk->extra_nodes_cap * 2 : 32;
+        uint32_t *ng = (uint32_t *)realloc(blk->extra_nodes, ncap * sizeof(uint32_t));
+        if (!ng)
+            return;
+        blk->extra_nodes = ng;
+        blk->extra_nodes_cap = ncap;
+    }
+    blk->extra_nodes[eidx] = node_id;
+    blk->node_count++;
+    nd->strong_ref_total++;
+}
+
 static void mem_block_release_handles(struct bproc *proc, struct mem_block *blk)
 {
     if (!blk)
@@ -553,6 +584,21 @@ static void mem_block_release_handles(struct bproc *proc, struct mem_block *blk)
         free(blk->extra_handles);
         blk->extra_handles = NULL;
         blk->extra_cap = 0;
+    }
+    for (uint32_t i = 0; i < blk->node_count; i++) {
+        uint32_t nid = (i < INLINE_BLK_HANDLES) ? blk->nodes[i] : blk->extra_nodes[i - INLINE_BLK_HANDLES];
+        struct bnode *nd = nid ? find_node(nid) : NULL;
+        if (nd && nd->strong_ref_total > 0) {
+            nd->strong_ref_total--;
+            if (nd->strong_ref_total == 0)
+                node_check_release(nd);
+        }
+    }
+    blk->node_count = 0;
+    if (blk->extra_nodes) {
+        free(blk->extra_nodes);
+        blk->extra_nodes = NULL;
+        blk->extra_nodes_cap = 0;
     }
 }
 
@@ -591,6 +637,9 @@ static int proc_mem_alloc(struct bproc *proc, uint32_t size, uint32_t *out_off, 
             proc->allocs[i].handle_count = 0;
             proc->allocs[i].extra_handles = NULL;
             proc->allocs[i].extra_cap = 0;
+            proc->allocs[i].node_count = 0;
+            proc->allocs[i].extra_nodes = NULL;
+            proc->allocs[i].extra_nodes_cap = 0;
             *out_off = cand;
             if (out_idx) *out_idx = i;
             return 0;
@@ -834,6 +883,7 @@ static void node_check_release(struct bnode *node)
     uint64_t pc[2] = { node->ptr, node->cookie };
     if (!any_strong && node->has_strong_ref && !node->pending_strong_ref) {
         node->has_strong_ref = false;
+        node->released_strong_once = true;
         push_inbox(owner, make_simple_br(SV_BR_RELEASE, pc, sizeof(pc)));
         wake_proc_waiters(owner);
     }
@@ -869,6 +919,7 @@ static void node_inc_refs(struct bnode *node, bool strong, struct bthread *prefe
     if (send_strong) {
         node->has_strong_ref = true;
         node->pending_strong_ref = true;
+        node->released_strong_once = false;
     }
     if (prefer_t && prefer_t->used && prefer_t->proc_id == owner->proc_id) {
         if (send_weak)
@@ -975,6 +1026,23 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
         DLOG("target proc=%u memfd OOM (need=%u)", target_p->proc_id, total_alloc);
         push_direct(sender_t, make_simple_br(SV_BR_FAILED_REPLY, NULL, 0));
         return;
+    }
+
+    /* Hold an in-flight strong ref on target_node until target_p calls BC_FREE_BUFFER
+     * so target_node cannot receive BR_RELEASE while BR_TRANSACTION is queued. */
+    if (!is_reply && target_node_id != 0 && alloc_idx >= 0) {
+        struct bnode *tn = find_node(target_node_id);
+        if (tn && tn->ptr != 0 && !tn->is_ctx_mgr) {
+            if (tn->released_strong_once && !tn->has_strong_ref && !tn->pending_strong_ref) {
+                proc_mem_free(target_p, target_p->guest_base + mem_off);
+                if (is_oneway)
+                    push_direct(sender_t, make_simple_br(SV_BR_TRANSACTION_COMPLETE, NULL, 0));
+                else
+                    push_direct(sender_t, make_simple_br(SV_BR_DEAD_REPLY, NULL, 0));
+                return;
+            }
+            mem_block_add_node(&target_p->allocs[alloc_idx], target_node_id);
+        }
     }
 
     uint8_t *dst_data = target_p->mem_base + mem_off;
@@ -1090,8 +1158,18 @@ static void handle_transaction(struct bthread *sender_t, struct bproc *sender_p,
                 uint32_t nid = node->node_id;
                 if (node->owner_proc_id == target_p->proc_id) {
                     obj.type = is_strong ? SV_BINDER_TYPE_BINDER : SV_BINDER_TYPE_WEAK_BINDER;
-                    obj.binder = node->ptr;
-                    obj.cookie = node->cookie;
+                    if (is_strong && node->released_strong_once &&
+                        !node->has_strong_ref && !node->pending_strong_ref) {
+                        /* Owner already received BR_RELEASE; avoid passing a freed cookie
+                         * to libbinder Parcel::unflattenBinder() -> incStrongRequireStrong(). */
+                        obj.binder = 0;
+                        obj.cookie = 0;
+                    } else {
+                        obj.binder = node->ptr;
+                        obj.cookie = node->cookie;
+                        if (is_strong && alloc_idx >= 0)
+                            mem_block_add_node(&target_p->allocs[alloc_idx], nid);
+                    }
                 } else {
                     uint32_t h = 0;
                     if (nid != g_ctx_mgr_node_id) {
@@ -1503,14 +1581,32 @@ static void drop_conn(struct conn_entry *ce)
                 }
                 free_bmsg(m);
             }
-            /* Free any overflow handle arrays tracked in pending mem_blocks. */
+            /* Free any overflow handle/node arrays tracked in pending mem_blocks,
+             * releasing in-flight node strong refs held by this dying process. */
             for (int ai = 0; ai < MAX_ALLOCS; ai++) {
+                for (uint32_t ni = 0; ni < p->allocs[ai].node_count; ni++) {
+                    uint32_t nid = (ni < INLINE_BLK_HANDLES)
+                        ? p->allocs[ai].nodes[ni]
+                        : p->allocs[ai].extra_nodes[ni - INLINE_BLK_HANDLES];
+                    struct bnode *nd = nid ? find_node(nid) : NULL;
+                    if (nd && nd->strong_ref_total > 0) {
+                        nd->strong_ref_total--;
+                        if (nd->strong_ref_total == 0)
+                            node_check_release(nd);
+                    }
+                }
                 if (p->allocs[ai].extra_handles) {
                     free(p->allocs[ai].extra_handles);
                     p->allocs[ai].extra_handles = NULL;
                     p->allocs[ai].extra_cap = 0;
                 }
+                if (p->allocs[ai].extra_nodes) {
+                    free(p->allocs[ai].extra_nodes);
+                    p->allocs[ai].extra_nodes = NULL;
+                    p->allocs[ai].extra_nodes_cap = 0;
+                }
                 p->allocs[ai].handle_count = 0;
+                p->allocs[ai].node_count = 0;
                 p->allocs[ai].used = false;
             }
             /* Release all handles held by this dying process so target owners get BR_RELEASE/BR_DECREFS. */
