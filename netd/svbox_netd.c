@@ -809,11 +809,14 @@ static void vold_mkdir_p(const char *path, mode_t mode)
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            (void)mkdir(tmp, mode);
+            if (mkdir(tmp, mode) == 0 && (mode & 0002))
+                (void)chmod(tmp, mode);
             *p = '/';
         }
     }
     (void)mkdir(tmp, mode);
+    if (mode & 0002)
+        (void)chmod(tmp, mode);
 }
 
 static void vold_ensure_host_dir(const char *guest_path)
@@ -821,19 +824,26 @@ static void vold_ensure_host_dir(const char *guest_path)
     if (!g_data_dir[0] || !guest_path || !guest_path[0]) return;
     if (strstr(guest_path, "..") != NULL) return;
     char host[1024];
+    int is_ext = 0;
     if (strncmp(guest_path, "/storage/emulated/", 18) == 0) {
         snprintf(host, sizeof(host), "%s/data/media/%s", g_data_dir, guest_path + 18);
+        is_ext = 1;
     } else if (strncmp(guest_path, "/sdcard/", 8) == 0) {
         snprintf(host, sizeof(host), "%s/data/media/0/%s", g_data_dir, guest_path + 8);
+        is_ext = 1;
     } else if (strncmp(guest_path, "/data/media/", 12) == 0) {
         snprintf(host, sizeof(host), "%s/data/media/%s", g_data_dir, guest_path + 12);
+        is_ext = 1;
     } else if (strncmp(guest_path, "/data/user/", 11) == 0 ||
                strncmp(guest_path, "/data/user_de/", 14) == 0) {
         snprintf(host, sizeof(host), "%s%s", g_data_dir, guest_path);
     } else {
         return;
     }
-    vold_mkdir_p(host, 0775);
+    /* Emulated external storage (/data/media/...) has no FUSE/sdcardfs layer
+     * here; host-created dirs appear as root:root inside svbox, so grant 0777
+     * so non-root app UIDs can create files/caches inside their app dirs. */
+    vold_mkdir_p(host, is_ext ? 0777 : 0775);
 }
 
 static void vold_prepare_user_dirs(int32_t user_id)
@@ -861,7 +871,7 @@ static void vold_prepare_user_dirs(int32_t user_id)
         char rel[128];
         snprintf(rel, sizeof(rel), sub[i], user_id);
         snprintf(path, sizeof(path), "%s/%s", g_data_dir, rel);
-        vold_mkdir_p(path, 0775);
+        vold_mkdir_p(path, strncmp(sub[i], "data/media/", 11) == 0 ? 0777 : 0775);
     }
 }
 

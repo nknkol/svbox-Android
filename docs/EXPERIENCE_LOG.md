@@ -965,6 +965,21 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - [`binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L535-L580)：在 `struct mem_block` 中新增在途节点追踪 `mem_block_add_node()`（在 `BC_FREE_BUFFER` 与进程 `drop_conn` 时成对释放 `strong_ref_total`）；同时新增 `bnode.released_strong_once` 标记，对 `target_node` 与 `HANDLE → BINDER` 还原均保活在途强引用并对已释放节点安全降级（`SV_BR_DEAD_REPLY` / 空 binder）。
   - 真机执行酷安两轮连续滑动 + 进贴返回 + 强杀重启压测（模拟活跃句柄突然销毁），`system_server` 与酷安全程稳定存活（`P50 = 9 ms`、`GPU P99 = 1 ms`），`SIGSEGV / unflattenBinder / DeadSystemException / ANR` 全为 **0**。
 
+### 11.9 根治《王者荣耀》启动无响应 ANR（`madvise(MADV_DONTNEED)` 误清零 `map_exec_copy` 匿名代码段致 `SIGILL` + `IVold` 外部应用目录权限修复）
+- **现象**：启动《王者荣耀》（`com.tencent.tmgp.sgame`）停留在黑屏约 5 秒后弹出「应用无响应（ANR）」。
+- **精准根因（从 CrashSight tombstone、`/proc/<pid>/smaps`、运行时 `mprotect`/`SIGILL` 实测抓包 100% 实证）**：
+  1. **主因（Layer 1 `svbox` 通用语义缺口：`madvise(MADV_DONTNEED)` 清零 `map_exec_copy` 匿名化文件代码段）**：
+     - 鸿蒙内核不允许直接执行文件映射，因此 `svbox` 的 `map_exec_copy()` 将 `libunity.so` 的 `24 MiB` 可执行 `.text` 段（`PT_LOAD[2]`）转为 `MAP_ANONYMOUS` 匿名拷贝并记录至 `vma_track`。
+     - 启动 `StartUnity` 时，腾讯运行时库 `libtprt.so` 按标准 Linux 语义对 `libunity.so` `.text` 执行 `mprotect(RWX)` → `madvise(MADV_DONTNEED)`（在真实 Linux 文件私密映射上仅释放干净页 RSS、下次访问自动从磁盘重读）→ `mprotect(RX)`；但在 `svbox` 匿名拷贝 VMA 上直接透传 `MADV_DONTNEED` 导致内核把 ~18 MiB `.text` **永久清零为 `0x00000000` (`udf #0`)**。
+     - 随后 `libtprt.so + 0x739a8` (`blr x8`) 调用第一个 `.text` 构造函数 `libunity.so + 0x54bf28`，立即触发 `SIGILL (ILL_ILLOPC)` → CrashSight 捕获信号拉起 Crashpad → 主线程卡在 `procmgr_wait` 等待被沙箱禁止的 ptrace → 触发 5 秒 `FocusEvent` ANR。
+  2. **次因（`svbox-netd` `IVold` 外部应用目录权限不足）**：
+     - `svbox-netd` 在宿主机创建 `/storage/emulated/0/Android/data/<pkg>` 时默认 `0775`（容器内映射为 `root:root 0775`），导致非 root 应用 UID（`u0_a91`）写缓存目录报 `EACCES`，刷屏 `GCloudCore: CreatePath .../cache/GCloudSDKLog failed!`。
+- **修复与真机验证（`HAD-W32`）**：
+  1. **[`svbox/src/payload/logic/hook_runtime.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/hook_runtime.c#L306-L346) & [`svbox/src/payload/logic/dispatch.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c#L304-L352)**（严格通用 Linux 语义，零 Android/游戏代码）：新增 `vma_track_next_overlap()`（覆盖动态 `g_vmas` 与启动期 `init_vmas`，同时将 `VMA_TRACK_MAX` 扩至 `2048` 并在 `readlinkat` 失败时仍登记匿名执行拷贝 VMA）；在 `__NR_madvise` 对破坏性匿名建议（`MADV_DONTNEED` / `MADV_FREE` / `MADV_DONTNEED_LOCKED`）按重叠区间拆分，仅对真正匿名子区间透传，绝不向内核转发会清零模拟文件代码段的破坏性 `madvise`。
+  2. **[`netd/svbox_netd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/netd/svbox_netd.c#L801-L876)**：`vold_mkdir_p()` 对外部存储目录（`/storage/emulated/*`、`/sdcard/*`、`/data/media/*`）显式 `chmod 0777`，确保所有应用 UID 可正常读写外部 `Android/data/<pkg>` 目录。
+  3. **真机实测（`HAD-W32`）**：重编 `svbox`、`svbox-netd` 并重新打入 `svbox.hnp` 安装验证：《王者荣耀》**`+4.81s` 完成 `Fully drawn`**，顺利通过 `StartUnity`、`Sgame UnityReady1` 与 Maleoon 916 GLES 3.2 渲染初始化，进入「下载推荐 / 资源更新（3258MB）」3D 动态主界面，稳定 `30 FPS`（`avg=33.33ms`），**`SIGILL` / `ANR` / `CreatePath failed!` 全部清零**。
+  4. **附带观测（独立于无响应问题）**：进入游戏更新界面持续运行约 15–25s 后，游戏自身安全模块线程（`libtersafe.so`）会主动向自身进程发送 `kill(getpid(), SIGKILL)` 退出（已通过 `svbox` 系统调用实测确认发送方为 `sgame` 自身线程，非容器崩溃或 ANR）。
+
 
 
 
