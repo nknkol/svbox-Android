@@ -416,7 +416,8 @@ struct OwnerHdr {
     uint32_t count;
     uint32_t lock;
     uint32_t version;
-    uint32_t reserved[10];
+    uint32_t symlinks;
+    uint32_t reserved[9];
 };
 struct OwnerRec {
     uint64_t dev;
@@ -428,6 +429,7 @@ struct OwnerRec {
 };
 static_assert(sizeof(OwnerHdr) == 64 && sizeof(OwnerRec) == 32, "ELFOWN1 layout");
 constexpr uint32_t kOwnerDead = 8u;
+constexpr uint32_t kOwnerSymlink = 16u;
 
 inline uint64_t OwnerHash(uint64_t dev, uint64_t ino) {
     uint64_t h = ino * 0x9E3779B97F4A7C15ull ^ dev * 0xC2B2AE3D27D4EB4Full;
@@ -469,17 +471,20 @@ void EnsureOwnerDb(const std::string& path) {
                     std::memset(recs, 0, static_cast<size_t>(h->capacity) * sizeof(OwnerRec));
                     const uint32_t mask = h->capacity - 1u;
                     uint32_t newCount = 0;
+                    uint32_t newSymlinks = 0;
                     for (const auto& r : live) {
                         uint32_t at = static_cast<uint32_t>(OwnerHash(r.dev, r.ino)) & mask;
                         for (uint32_t n = 0; n <= mask; ++n, at = (at + 1u) & mask) {
                             if (recs[at].flags == 0) {
                                 recs[at] = r;
                                 ++newCount;
+                                if (r.flags & kOwnerSymlink) ++newSymlinks;
                                 break;
                             }
                         }
                     }
                     h->count = newCount;
+                    h->symlinks = newSymlinks;
                     h->version = (h->version & ~1u) + 2u;
                     munmap(mem, mapLen);
                 }
@@ -569,6 +574,7 @@ int ForgetOwnerDbTree(const std::string& ownerDbPath, const std::vector<std::str
                 if (fl == 0) break;
                 if (fl & kOwnerDead) continue;
                 if (recs[at].dev == di.first && recs[at].ino == di.second) {
+                    if ((fl & kOwnerSymlink) && h->symlinks > 0) --h->symlinks;
                     recs[at].flags = kOwnerDead;
                     ++cleared;
                     break;
@@ -1286,6 +1292,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--emulate-mounts",
         "--emulate-bpf",
         "--mount-scratch", runBase_ + "/tmpfs",
+        "--glue-dir", runBase_ + "/tmp",
         "--owner-db", dataBase_ + "/owner.db",
     });
     if (!cpuset.empty()) {
@@ -1347,6 +1354,18 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/mnt:/mnt",
         "-v", runBase_ + "/storage:/storage",
     };
+    if (FileExists(injectLayer_ + "/system/product/etc/build.prop")) {
+        mounts.push_back("-v");
+        mounts.push_back(injectLayer_ + "/system/product/etc/build.prop:/product/etc/build.prop");
+    }
+    if (FileExists(injectLayer_ + "/system/system_ext/etc/build.prop")) {
+        mounts.push_back("-v");
+        mounts.push_back(injectLayer_ + "/system/system_ext/etc/build.prop:/system_ext/etc/build.prop");
+    }
+    if (FileExists(injectLayer_ + "/system/etc/prop.default")) {
+        mounts.push_back("-v");
+        mounts.push_back(injectLayer_ + "/system/etc/prop.default:/etc/prop.default");
+    }
     if (includeStorageSubmounts) {
         mounts.push_back("-v");
         mounts.push_back(dataBase_ + "/data/media/0:/sdcard");
@@ -1427,6 +1446,35 @@ pid_t AndroidRuntime::Spawn(const std::vector<std::string>& argv,
     }
     cargs.push_back(nullptr);
 
+    // For container processes launched via svbox, pass only the container's
+    // explicit -e KEY=VALUE entries to execve() so HarmonyOS host environment
+    // variables never enter the kernel's /proc/<pid>/environ.
+    bool useCleanEnv = (!svboxPath_.empty() && argv[0] == svboxPath_);
+    std::vector<char*> cenv;
+    if (useCleanEnv) {
+        for (size_t i = 1; i < argv.size(); ++i) {
+            if (argv[i] == "--") break;
+            if ((argv[i] == "-e" || argv[i] == "--env") && i + 1 < argv.size()) {
+                const std::string& kv = argv[++i];
+                auto eq = kv.find('=');
+                if (eq == std::string::npos) continue;
+                size_t klen = eq + 1;
+                bool replaced = false;
+                for (char*& existing : cenv) {
+                    if (std::strncmp(existing, kv.c_str(), klen) == 0) {
+                        existing = const_cast<char*>(kv.c_str());
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    cenv.push_back(const_cast<char*>(kv.c_str()));
+                }
+            }
+        }
+        cenv.push_back(nullptr);
+    }
+
     pid_t pid = -1;
     for (int attempt = 0; attempt < 4; ++attempt) {
         pid = fork();
@@ -1484,7 +1532,11 @@ pid_t AndroidRuntime::Spawn(const std::vector<std::string>& argv,
                 if (!keep) close(fd);
             }
         }
-        execv(cargs[0], cargs.data());
+        if (useCleanEnv) {
+            execve(cargs[0], cargs.data(), cenv.data());
+        } else {
+            execv(cargs[0], cargs.data());
+        }
         int err = errno;
         char msg[256];
         int n = snprintf(msg, sizeof(msg), "execv(%s) failed: errno=%d (%s)\n",
@@ -2301,7 +2353,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/mnt/pass_through/0/emulated/0", "/mnt/installer/0/emulated/0",
         "/mnt/androidwritable/0/emulated/0",
         "/storage/emulated/0", "/storage/self/primary",
-        "/tmpfs"
+        "/tmpfs", "/tmp"
     };
     for (const char* sub : runDirs) {
         MkdirP(runBase_ + sub);
@@ -2724,6 +2776,67 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Stage all Android-compat injected HALs/services/configs into ephemeral injectLayer_
     // (mounted as svbox --lower #1 above strictly read-only rootfs_ as --lower #2).
     {
+        // Stage consistent partition build.prop / default.prop copies into injectLayer_
+        // by applying override.prop key=value overrides so on-disk prop files agree with
+        // getprop (never modifying read-only rootfs_).
+        std::vector<std::pair<std::string, std::string>> propOverrides;
+        {
+            std::ifstream ov(overrideProp);
+            std::string line;
+            while (std::getline(ov, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                auto eq = line.find('=');
+                if (eq == std::string::npos || eq == 0) continue;
+                std::string k = line.substr(0, eq);
+                std::string v = line.substr(eq + 1);
+                if (!v.empty() && v.back() == '\r') v.pop_back();
+                bool found = false;
+                for (auto& kv : propOverrides) {
+                    if (kv.first == k) { kv.second = v; found = true; break; }
+                }
+                if (!found) propOverrides.emplace_back(std::move(k), std::move(v));
+            }
+        }
+        const char* propRelPaths[] = {
+            "system/etc/prop.default",
+            "default.prop",
+            "system/build.prop",
+            "system/system_ext/etc/build.prop",
+            "system/product/etc/build.prop",
+            "vendor/build.prop",
+            "vendor/default.prop",
+            "vendor/odm/etc/build.prop",
+        };
+        for (const char* rel : propRelPaths) {
+            std::string src = rootfs_ + "/" + rel;
+            if (!FileExists(src)) continue;
+            std::string dst = injectLayer_ + "/" + rel;
+            auto slash = dst.rfind('/');
+            if (slash != std::string::npos) MkdirP(dst.substr(0, slash));
+            std::ifstream in(src);
+            std::string outBuf;
+            std::string line;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty() && line[0] != '#') {
+                    auto eq = line.find('=');
+                    if (eq != std::string::npos && eq > 0) {
+                        std::string k = line.substr(0, eq);
+                        for (const auto& kv : propOverrides) {
+                            if (kv.first == k) {
+                                line = k + "=" + kv.second;
+                                break;
+                            }
+                        }
+                    }
+                }
+                outBuf += line;
+                outBuf.push_back('\n');
+            }
+            WriteFile(dst, outBuf);
+            chmod(dst.c_str(), 0644);
+        }
+
         MkdirP(injectLayer_ + "/system/usr/idc");
         const std::string idcDst = injectLayer_ + "/system/usr/idc/svbox-touchscreen.idc";
         WriteFile(idcDst,

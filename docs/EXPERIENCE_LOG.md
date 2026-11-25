@@ -995,6 +995,30 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - **真机实测**：`adaptive` 模式下 Android 14 冷启动至桌面约 **7s**，《王者荣耀》**`Displayed +2.71s`、`Fully drawn +4.35s`**（与混合模式 `+4.81s` 相比甚至略快），稳态渲染 **`avg=33.31–33.35ms`（稳态 30 FPS，零帧率损耗）**。
   - **追加通用 Linux `/proc` & `prctl` 一致性补齐**：进一步修复了 `/proc/self/smaps` 中 `map_exec_copy` 只读代码段的 `Anonymous`/`Private_Dirty`/`VmFlags` 虚拟化（还原为 `Private_Clean: <Rss> kB` / `Private_Dirty: 0 kB` / `Anonymous: 0 kB` / `VmFlags: pr`）、`/proc/self/fd/<N>` 对 `--vdev` 返回客体设备路径（如 `/dev/binder`）、跨 PID `/proc/<pid>/maps` 过滤固定地址 loader/payload 与 `/memfd:svbox_net_state`，以及 `/proc/self/status` `NoNewPrivs` 与 `prctl(PR_GET_SECCOMP / PR_GET_NO_NEW_PRIVS)` 的一致性。经真机实测，《王者荣耀》在零代码段改写 + `maps`/`smaps`/`status`/`fd`/`prctl` 一致条件下仍会于 15–20s 后由自身安全线程发 `SIGKILL` 退出，说明退出与用户态容器/非 VM 架构差异（如 `SIGSYS` 陷入、`/proc` memfd、以及当前 `redroid` `userdebug/test-keys` + `/system/xbin/su` + `ro.debuggable=1` 等镜像环境）相关。
 
+### 11.11 容器 VFS 虚拟符号链接与完整隔离一致性修复：彻底解决《王者荣耀》启动闪退（2026-11-25）
+
+- **根因定位（严格通过通用 Linux 系统调用审计定位，未触碰任何第三方二进制）**：
+  - 在 `HAD-W32` 鸿蒙应用沙箱中，宿主内核禁止 `symlinkat(2)` 并返回 `-EACCES`/`-EPERM`。`svbox` 原 `vfs_ops.c` 回退逻辑将失败的 `symlinkat` 转为「创建普通文件 + 添加 `MOUNT_BIND` 挂载项」：
+    1. 对新建符号链接调用 `lstat()` 返回 **`S_IFREG`** 而非 **`S_IFLNK`**；
+    2. 调用 `readlinkat()` 返回 **`-EINVAL`** 而非目标路径；
+    3. 调用 `unlinkat()` 删除该符号链接时被 `contains_mount()` 拦截返回 **`-EBUSY`（`-16`）**，且在 `/proc/self/mounts` 残留伪造挂载项。
+  - 同时审计并修复了以下真实容器隔离与属性一致性漏洞：
+    1. 宿主环境变量（`HAP_DEBUGGABLE=true`、`OHOS_SOCKET_AppSpawn`、`HNP_*`、`UBSAN_OPTIONS`、`TMPDIR=/data/storage/el2/...` 等）通过 `execv()` 泄漏至容器内所有进程的 `/proc/<pid>/environ`；
+    2. `/proc/<pid>/cgroup` 泄漏宿主路径（`/100/org.svbox.android/app_<pid>`），`/proc/<pid>/attr/current` 与 `getxattr("security.selinux")` 泄漏宿主标签（`u:r:debug_hap:s0` / `u:object_r:debug_hap_data_file:s0`）；
+    3. `/proc/<pid>/status` 中 `Groups:` 泄漏宿主附加组（`1006 1097 3099`）且 `SigCgt:` 未与客体 `rt_sigaction(SIGSYS)` 状态保持一致；
+    4. 磁盘 5 分区 `build.prop`（`/system/build.prop` 等）与 `getprop`（`override.prop`）不一致（磁盘仍含 `redroid`/`userdebug`/`test-keys`/`ro.debuggable=1`）；
+    5. 虚拟 procfs memfd 的 `ioctl(FIONREAD)` 返回 `-EACCES` 而非标准 `-ENOTTY`；`sched_setaffinity`/`sched_getaffinity` 拒绝 4 字节 `cpu_set_t` 返回 `-EINVAL`。
+- **Layer 1 `svbox` 通用 Linux 修复（零 Android/游戏硬编码）**：
+  1. **完整 POSIX 虚拟符号链接（[`container_state.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/container_state.h)、[`container_state.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/container_state.c)、[`vfs_ops.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_ops.c)、[`vfs_walk.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_walk.c)）**：在 `owner.db` 新增 `OWNER_SYMLINK` 标志与 `symlinks` 计数；当宿主拒绝 `symlinkat` 且 `owner.db` 启用时，将链接目标写入普通备份文件并打标 `OWNER_SYMLINK`，全面支持 `lstat`（`S_IFLNK | 0777`）、`stat`/路径跟随、`readlinkat`、`openat(O_NOFOLLOW -> -ELOOP)` 与 `unlinkat -> 0`，不再污染挂载表。
+  2. **容器 procfs / LSM / 环境与系统调用一致性（[`main.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/main.c)、[`options.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/options.c)、[`vfs_procfs.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_procfs.c)、[`vfs_ops.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_ops.c)、[`dispatch.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c)、[`integrity.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/integrity.c)）**：新增 `--glue-dir` 与 `/proc/self/environ` 虚拟化；实现 `/proc/<pid>/cgroup` 容器根路径剥离（cgroup namespace 语义）、`/proc/<pid>/status` 的 `Groups:` 与 `SigCgt:/SigIgn:` 一致性、`/proc/<pid>/attr/*` 返回 `-EINVAL` 与 `getxattr/lgetxattr/fgetxattr("security.selinux")` 返回 `-ENODATA`；修正虚拟 procfs `ioctl -> -ENOTTY` 及 `sched_{get,set}affinity` 4 字节位图支持。
+- **Layer 2 `svbox-Android` 修复（[`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)）**：
+  1. `Spawn()` 启动 `svbox` 时改为 `execve()` 并仅传入显式 `-e` 干净 Android 环境变量，配合 `--glue-dir <runBase>/tmp` 彻底消除宿主环境变量进入内核 `/proc/<pid>/environ`。
+  2. 在临时 `inject_layer` 中基于 `override.prop` 同步生成一致的 5 分区 `build.prop`/`default.prop`（不修改只读 `rootfs14`），并在 `EnsureOwnerDb` / `ForgetOwnerDbTree` 中同步维护 `symlinks` 计数。
+- **真机实测与回归验证（`HAD-W32`）**：
+  - `svbox` 全部 VFS/FS Policy/OCI 回归套件通过；容器内 `ln -s` / `ls -l`（`lrwxrwxrwx`）/ `readlink` / 跟随读取 / `rm` 全部符合 POSIX。
+  - 正式构建安装后在 `enableRoot=false` 下启动《王者荣耀》（PID 51231），**连续稳定运行 98 秒以上无任何 `SIGKILL` 或闪退**，`mResumed=true`，稳态 30 FPS 流畅渲染（`avg=33.34ms`）。
+
+
 
 
 
