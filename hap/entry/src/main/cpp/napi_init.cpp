@@ -815,13 +815,18 @@ napi_value CleanInstanceCacheNapi(napi_env env, napi_callback_info info) {
     std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
     double freedMb = 0.0;
     if (!baseDir.empty() && IsSafeSubdir(subdir)) {
+        auto& rt = AndroidRuntime::Instance();
+        if (rt.IsRunning() && rt.DataSubdir() == subdir) {
+            napi_value out = nullptr;
+            napi_create_double(env, -1.0, &out);
+            return out;
+        }
         std::string root = baseDir + "/" + subdir;
         uint64_t freed = 0;
         freed += RemoveTreeBytes(root + "/data/tombstones", true);
         freed += RemoveTreeBytes(root + "/data/anr", true);
         freed += RemoveTreeBytes(root + "/data/system/dropbox", true);
-        freed += RemoveTreeBytes(root + "/data/cache", true);
-        // Clean per-app cache & code_cache dirs under /data/data
+        // Clean per-app cache & code_cache dirs under /data/data (preserve /data/cache system dir)
         DIR* d = opendir((root + "/data/data").c_str());
         if (d) {
             while (struct dirent* e = readdir(d)) {

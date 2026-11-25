@@ -910,6 +910,17 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 - **原生半模态面板重构（`bindSheet` + `SheetType.CENTER` + `BlurStyle.COMPONENT_ULTRA_THICK`）**：将设备设置（[DeviceSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/DeviceSettingsDialog.ets)）、新建设备（[CreateInstanceDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/CreateInstanceDialog.ets)）、备份与还原（[BackupRestoreDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/BackupRestoreDialog.ets)）及全局设置中心（[GlobalSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/GlobalSettingsDialog.ets)）全部重构为鸿蒙 PC 居中半模态面板，自带系统沉浸毛玻璃材质、原生双行标题栏与关闭按钮及弹簧转场动效，并分散挂载于 4 个独立结构锚点避免冲突。
 - **全链路交互动效**：左侧导航轨、设置侧边栏与视图切换分段开关采用弹簧滑移选中指示器；「设备 ↔ 应用」主工作区、设置 9 子页签、常规/批量工具栏、设备卡片增删与排序、复选框滑入及状态胶囊均配置 `animateTo` + `TransitionEffect` 过渡；卡片与按钮全面覆盖 PC 悬浮微浮起（`onHover` + `ShadowStyle`）与 `ClickEffectLevel.LIGHT` 按压回弹反馈。
 
+### 11.4 根因定位与修复：`svbox-netd` Binder Pipe `EPIPE` 导致 `system_server` 崩溃卡开机动画 + 磁盘清理安全加固
+- **现象**：用户执行磁盘清理后再次启动 Android 14，画面一直停留在开机动画无法进桌面。
+- **真实根因（100% 从 `hap_logs/logcat.txt` 实证）**：
+  1. 并非用户数据损坏——`logcat.txt` 明确记录 `StatsCompanionService.lambda$informAllUids$0()` 在后台线程 `statsCompanionService.bg` 向 `stats` (`NODE_STATSD`) 服务传入的管道写端执行 `ProtoOutputStream.flush()` 时触发 `IOException: write failed: EPIPE (Broken pipe)` → 未捕获 `RuntimeException` → `system_server` 收到 `SIGKILL (9)` 退出 → `Zygote` 随之退出，开机动画无限循环。
+  2. 定位到 [`netd/svbox_netd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/netd/svbox_netd.c) `binder_wr()` 在通过 `SCM_RIGHTS` 收到 Binder 传递的文件描述符后直接 `close(fds[i])`——把 `StatsCompanionService.informAllUids()` 传来的管道读端 `readFd` 立刻关掉了！此前缓存热态启动快时写端偶尔先写完赢下竞态，清理缓存后启动时序略微变化便稳定踩中 `EPIPE`。
+- **双端修复**：
+  1. **[`netd/svbox_netd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/netd/svbox_netd.c)**：新增 `dispose_received_fd()` + `drain_pipe_thread()`；对收到的 `S_ISFIFO` 管道读端启动 64KB 栈分离线程异步 `poll` + `read` 排空至 EOF 后再 `close()`（15s 空闲兜底超时），既彻底消灭 `EPIPE` 又防止超过 64KB 管道缓冲导致对端写阻塞。
+  2. **[`napi_init.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/napi_init.cpp) / [`DeviceSettingsDialog.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/DeviceSettingsDialog.ets) / [`Index.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/Index.ets)**：`CleanInstanceCacheNapi` 运行态禁止清理同一运行中实例（返回 `-1.0`），移除对系统级 `/data/cache` 的清空，仅安全清理 `/data/tombstones`、`/data/anr`、`/data/system/dropbox` 及 `/data/data/*/cache`、`code_cache`；UI 侧在设备运行中禁用「立即清理 / 磁盘清理」并给出明确提示。
+- **真机实测（`HAD-W32`）**：重编 `svbox-netd`、HAP 与 `svbox.hnp` 安装验证，Android 14 秒进桌面（`sys.boot_completed=1`、`Starting phase 1000`、`QuickstepLauncher`、`SvboxWmAgent`、`ADB 127.0.0.1:5555` 全部在线），`StatsCompanionService` 零报错，已装应用（酷安/贴吧/CPU Info）100% 保留。
+
+
 
 
 

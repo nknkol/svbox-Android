@@ -578,8 +578,16 @@ struct Index {
   }
 
   private cleanDeviceDisk(inst: DeviceInstance): void {
+    if (this.isInstanceRunning(inst)) {
+      this.showToast('请先停止该设备后再执行磁盘清理');
+      return;
+    }
     try {
       const freed: number = native.cleanInstanceCache(this.getSandboxFilesDir(), inst.dataSubdir);
+      if (freed < 0) {
+        this.showToast('请先停止该设备后再执行磁盘清理');
+        return;
+      }
       this.showToast(`「${inst.name}」清理完成，释放 ${freed.toFixed(1)} MB`);
     } catch (e) {
       this.showToast(`清理失败：${String(e)}`);
@@ -664,14 +672,29 @@ struct Index {
       return;
     }
     let totalFreed: number = 0;
+    let cleanedCount: number = 0;
+    let skippedRunning: number = 0;
     const filesDir: string = this.getSandboxFilesDir();
     for (let i: number = 0; i < this.selectedIds.length; i++) {
       const inst: DeviceInstance | undefined = this.getInstanceById(this.selectedIds[i]);
-      if (inst) {
-        totalFreed += native.cleanInstanceCache(filesDir, inst.dataSubdir);
+      if (!inst) continue;
+      if (this.isInstanceRunning(inst)) {
+        skippedRunning++;
+        continue;
+      }
+      const freed: number = native.cleanInstanceCache(filesDir, inst.dataSubdir);
+      if (freed >= 0) {
+        totalFreed += freed;
+        cleanedCount++;
       }
     }
-    this.showToast(`已批量清理 ${this.selectedIds.length} 台设备，共释放 ${totalFreed.toFixed(1)} MB`);
+    if (cleanedCount === 0 && skippedRunning > 0) {
+      this.showToast('所选设备正在运行，请先停止后再执行磁盘清理');
+    } else if (skippedRunning > 0) {
+      this.showToast(`已清理 ${cleanedCount} 台设备（释放 ${totalFreed.toFixed(1)} MB），已跳过 ${skippedRunning} 台运行中设备`);
+    } else {
+      this.showToast(`已批量清理 ${cleanedCount} 台设备，共释放 ${totalFreed.toFixed(1)} MB`);
+    }
   }
 
   private batchDeleteSelected(): void {
@@ -932,6 +955,7 @@ struct Index {
           }
         })
       MenuItem({ content: '磁盘清理' })
+        .enabled(!this.isInstanceRunning(inst))
         .onClick(() => { this.cleanDeviceDisk(inst); })
       MenuItem({ content: '重命名' })
         .onClick(() => { this.openRenameDialog(inst); })

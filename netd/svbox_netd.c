@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -509,6 +510,52 @@ static int vdev_init(const char *sock_path)
     return 0;
 }
 
+static void *drain_pipe_thread(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    uint8_t buf[4096];
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 15000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) break; /* 15s idle timeout */
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r > 0) continue;
+        if (r < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fd);
+    return NULL;
+}
+
+static void dispose_received_fd(int fd)
+{
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || (fl & O_ACCMODE) != O_WRONLY) {
+            /* Drain pipe read-ends to EOF asynchronously so writers like Android 14
+             * StatsCompanionService.informAllUids() never hit EPIPE or block. */
+            pthread_attr_t attr;
+            pthread_t tid;
+            if (pthread_attr_init(&attr) == 0) {
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                pthread_attr_setstacksize(&attr, 65536);
+                if (pthread_create(&tid, &attr, drain_pipe_thread, (void *)(intptr_t)fd) == 0) {
+                    pthread_attr_destroy(&attr);
+                    return;
+                }
+                pthread_attr_destroy(&attr);
+            }
+        }
+    }
+    close(fd);
+}
+
 static int binder_wr(const uint8_t *packed, size_t packed_len, size_t raw_write_size,
                      uint8_t *rbuf, size_t rcap, size_t *rconsumed)
 {
@@ -539,7 +586,7 @@ static int binder_wr(const uint8_t *packed, size_t packed_len, size_t raw_write_
         for (int i = 0; i < nfds; i++) close(fds[i]);
         return -1;
     }
-    for (int i = 0; i < nfds; i++) close(fds[i]);
+    for (int i = 0; i < nfds; i++) dispose_received_fd(fds[i]);
     if (rsp.status < 0 || rsp.payload_len < sizeof(struct vdev_binder_wr_rep))
         return -1;
 

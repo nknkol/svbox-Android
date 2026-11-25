@@ -593,9 +593,11 @@ export struct DeviceSettingsSheet {
               .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
-            Text('安全清理应用缓存、崩溃日志与 ANR 临时文件，保留已安装应用与账号数据')
+            Text(this.isInstanceRunning
+              ? '设备运行中，请先停止该设备后再执行磁盘清理'
+              : '安全清理应用缓存、崩溃日志与 ANR 临时文件，保留已安装应用与账号数据')
               .fontSize(FontSize.MICRO)
-              .fontColor($r('sys.color.font_tertiary'))
+              .fontColor(this.isInstanceRunning ? $r('sys.color.warning') : $r('sys.color.font_tertiary'))
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
@@ -606,14 +608,23 @@ export struct DeviceSettingsSheet {
             .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_on_primary'))
             .backgroundColor($r('sys.color.brand'))
-            .enabled(!this.cleaningDisk)
+            .enabled(!this.cleaningDisk && !this.isInstanceRunning)
+            .opacity(this.isInstanceRunning ? 0.45 : 1.0)
             .hoverEffect(HoverEffect.Highlight)
             .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
               if (!this.instance) return;
+              if (this.isInstanceRunning) {
+                this.onToast('请先停止该设备后再执行磁盘清理');
+                return;
+              }
               this.cleaningDisk = true;
               try {
                 const freed: number = native.cleanInstanceCache(this.filesDir, this.instance.dataSubdir);
+                if (freed < 0) {
+                  this.onToast('请先停止该设备后再执行磁盘清理');
+                  return;
+                }
                 this.diskUsageMb = native.getInstanceDiskMb(this.filesDir, this.instance.dataSubdir);
                 this.onToast(`磁盘清理完成，释放 ${freed.toFixed(1)} MB`);
               } catch (e) {
