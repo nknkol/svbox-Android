@@ -459,6 +459,9 @@ export struct DeviceSettingsSheet {
           this.optionPill('混合模式', this.draftSyscallMode === 'hybrid', () => {
             this.draftSyscallMode = 'hybrid';
           })
+          this.optionPill('原版内联', this.draftSyscallMode === 'inline', () => {
+            this.draftSyscallMode = 'inline';
+          })
         }
         .width('100%')
 
@@ -467,7 +470,9 @@ export struct DeviceSettingsSheet {
             ? '纯净模式：所有容器进程均采用纯 seccomp 拦截 + BPF 热路径直通，完全不修改任何可执行代码段（重启后生效）'
             : (this.draftSyscallMode === 'hybrid'
               ? '混合模式：系统库使用内联补丁加速，仅第三方应用库（/data）走纯 seccomp（重启后生效）'
-              : '自适应：系统守护进程保留内联补丁，Zygote 与全部 Android 应用采用纯 seccomp + BPF 直通，兼顾代码段纯净度与帧率（重启后生效）')
+              : (this.draftSyscallMode === 'inline'
+                ? '原版内联：系统库与第三方应用库均使用 svbox 原版内联指令替换（性能最高，仅部分反作弊/加壳校验可能敏感，重启后生效）'
+                : '自适应：系统守护进程保留内联补丁，Zygote 与全部 Android 应用采用纯 seccomp + BPF 直通，兼顾代码段纯净度与帧率（重启后生效）'))
         )
           .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))

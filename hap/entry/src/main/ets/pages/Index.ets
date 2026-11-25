@@ -233,6 +233,13 @@ struct Index {
         AppStorage.setOrCreate<string>('requestedEnableRoot', '');
         dirty = true;
       }
+      const reqSyscall: string | undefined = AppStorage.get<string>('requestedSyscallMode');
+      if (reqSyscall === 'adaptive' || reqSyscall === 'pure_seccomp' ||
+          reqSyscall === 'hybrid' || reqSyscall === 'inline') {
+        primary.syscallMode = reqSyscall;
+        AppStorage.setOrCreate<string>('requestedSyscallMode', '');
+        dirty = true;
+      }
       if (dirty) {
         instanceManager.updateInstance(filesDir, primary);
         this.reloadInstances(false);
@@ -299,6 +306,12 @@ struct Index {
           if (reqHz === 60 || reqHz === 90 || reqHz === 120) {
             target.refreshRate = reqHz;
             AppStorage.setOrCreate<number>('requestedRefreshRate', 0);
+          }
+          const reqSyscall: string | undefined = AppStorage.get<string>('requestedSyscallMode');
+          if (reqSyscall === 'adaptive' || reqSyscall === 'pure_seccomp' ||
+              reqSyscall === 'hybrid' || reqSyscall === 'inline') {
+            target.syscallMode = reqSyscall;
+            AppStorage.setOrCreate<string>('requestedSyscallMode', '');
           }
           instanceManager.updateInstance(this.getSandboxFilesDir(), target);
           this.reloadInstances(false);

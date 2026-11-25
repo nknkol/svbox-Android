@@ -147,7 +147,7 @@ export function formatGpuModeLabel(gpuMode: string): string {
 }
 
 export function normalizeSyscallMode(mode: string | undefined): string {
-  if (mode === 'pure_seccomp' || mode === 'hybrid' || mode === 'adaptive') {
+  if (mode === 'pure_seccomp' || mode === 'hybrid' || mode === 'adaptive' || mode === 'inline') {
     return mode;
   }
   return 'adaptive';
@@ -156,6 +156,7 @@ export function normalizeSyscallMode(mode: string | undefined): string {
 export function formatSyscallModeLabel(mode: string): string {
   if (mode === 'pure_seccomp') return '纯净模式';
   if (mode === 'hybrid') return '混合模式';
+  if (mode === 'inline') return '原版内联';
   return '自适应';
 }
 

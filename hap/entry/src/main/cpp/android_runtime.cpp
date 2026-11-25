@@ -938,7 +938,8 @@ std::string AndroidRuntime::GpuMode() const {
 
 void AndroidRuntime::SetSyscallMode(const std::string& syscallMode) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (syscallMode == "adaptive" || syscallMode == "pure_seccomp" || syscallMode == "hybrid") {
+    if (syscallMode == "adaptive" || syscallMode == "pure_seccomp" ||
+        syscallMode == "hybrid" || syscallMode == "inline") {
         syscallMode_ = syscallMode;
     }
 }
@@ -1278,7 +1279,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
     };
     if (syscallMode == "pure_seccomp") {
         args.push_back("--no-inline-patch");
-    } else {
+    } else if (syscallMode != "inline") {
         args.push_back("--no-inline-patch-prefix");
         args.push_back("/data");
         args.push_back("--no-inline-patch-prefix");

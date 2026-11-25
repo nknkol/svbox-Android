@@ -24,6 +24,7 @@ export default class EntryAbility extends UIAbility {
     const rawDump: Object | undefined = want.parameters ? want.parameters['dumpProcs'] : undefined;
     const rawTap: Object | undefined = want.parameters ? want.parameters['injectTap'] : undefined;
     const rawRoot: Object | undefined = want.parameters ? want.parameters['enableRoot'] : undefined;
+    const rawSyscall: Object | undefined = want.parameters ? want.parameters['syscallMode'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const uiModeStr: string = typeof rawUiMode === 'string' ? rawUiMode : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
@@ -36,6 +37,7 @@ export default class EntryAbility extends UIAbility {
     const dumpStr: string = typeof rawDump === 'string' ? rawDump : '';
     const tapStr: string = typeof rawTap === 'string' ? rawTap : '';
     const rootStr: string = typeof rawRoot === 'string' ? rawRoot : (typeof rawRoot === 'boolean' ? String(rawRoot) : '');
+    const syscallStr: string = typeof rawSyscall === 'string' ? rawSyscall : '';
 
     if (setHzStr.length > 0 && autoStr.length === 0) {
       const hz: number = Number(setHzStr);
@@ -81,6 +83,10 @@ export default class EntryAbility extends UIAbility {
     }
     if (rootStr === 'true' || rootStr === 'false') {
       AppStorage.setOrCreate<string>('requestedEnableRoot', rootStr);
+    }
+    if (syscallStr === 'adaptive' || syscallStr === 'pure_seccomp' ||
+        syscallStr === 'hybrid' || syscallStr === 'inline') {
+      AppStorage.setOrCreate<string>('requestedSyscallMode', syscallStr);
     }
     if (resStr.length > 0) {
       AppStorage.setOrCreate<string>('resolution', resStr);

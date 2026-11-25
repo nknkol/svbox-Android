@@ -1547,6 +1547,23 @@ VkResult ResourceTracker::on_vkGetFenceStatus(
     return resources->on_vkGetFenceStatus(vkEnc, VK_SUCCESS, device, fence);
 }""",
     )
+    # Synchronous rcMakeCurrent prevents cross-thread EGLContext handoff races
+    # (e.g. UnityMain unbinding EGL_NO_CONTEXT before UnityGfxDeviceW binds it).
+    patch_file(
+        "system/egl/egl.cpp",
+        """    DEFINE_AND_VALIDATE_HOST_CONNECTION(EGL_FALSE);
+    if (rcEnc->hasAsyncFrameCommands()) {
+        rcEnc->rcMakeCurrentAsync(rcEnc, ctxHandle, drawHandle, readHandle);
+    } else {
+        rcEnc->rcMakeCurrent(rcEnc, ctxHandle, drawHandle, readHandle);
+    }""",
+        """    DEFINE_AND_VALIDATE_HOST_CONNECTION(EGL_FALSE);
+    // Always synchronize rcMakeCurrent with the host RenderThread so cross-thread
+    // EGLContext handoff (Thread A unbinding EGL_NO_CONTEXT, then Thread B binding
+    // the same context) cannot race on separate host sockets and fail with
+    // EGL_BAD_ACCESS (leaving subsequent glGenBuffers/glGenTextures returning 0).
+    rcEnc->rcMakeCurrent(rcEnc, ctxHandle, drawHandle, readHandle);""",
+    )
 
 if __name__ == "__main__":
     main()
