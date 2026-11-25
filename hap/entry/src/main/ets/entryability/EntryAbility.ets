@@ -1,9 +1,9 @@
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 import native from 'libentry.so';
-import { applyImmersiveDecor } from '../common/WindowHelper';
+import { applyImmersiveDecor, updateDecorButtonTheme } from '../common/WindowHelper';
 
 const TAG = 'SvboxAndroid';
 
@@ -84,6 +84,7 @@ export default class EntryAbility extends UIAbility {
       const hz: number = Number(hzStr);
       if (hz === 60 || hz === 90 || hz === 120) {
         AppStorage.setOrCreate<number>('refreshRate', hz);
+        AppStorage.setOrCreate<number>('requestedRefreshRate', hz);
       }
     }
     if (autoStr.length > 0 || !isNewWant) {
@@ -124,7 +125,15 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate<string>('sandboxTempDir', this.context.tempDir);
     AppStorage.setOrCreate<string>('sandboxFilesDir', this.context.filesDir);
     AppStorage.setOrCreate<number>('launchSeq', 0);
+    const isDark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    AppStorage.setOrCreate<boolean>('isDarkMode', isDark);
     this.applyWant(want, false);
+  }
+
+  onConfigurationUpdate(newConfig: Configuration): void {
+    const isDark: boolean = newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    AppStorage.setOrCreate<boolean>('isDarkMode', isDark);
+    updateDecorButtonTheme(this.mainWindow, isDark);
   }
 
   onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
@@ -158,7 +167,8 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       if (this.mainWindow) {
-        const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 44, true);
+        const isDark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+        const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 48, isDark);
         AppStorage.setOrCreate<number>('mainDecorRightAvoidVp', rightAvoid);
       }
     });

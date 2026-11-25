@@ -21,6 +21,8 @@ export interface RuntimeStatus {
   cpuset: string;
   topology: string;
   statusText: string;
+  activeInstanceId: string;
+  shareDir: string;
 }
 
 export interface DisplayStats {
@@ -49,6 +51,34 @@ export const sendNavKey: (key: string) => boolean;
 export const sendScroll: (x: number, y: number, deltaY: number) => boolean;
 export const sendDisplayScroll: (slot: number, x: number, y: number, deltaY: number) => boolean;
 export const setResourceConfig: (profile: string, cpuset: string, memMb: number) => boolean;
+export const setInstanceConfig: (
+  instanceId: string,
+  dataSubdir: string,
+  dpi: number,
+  enableAudio: boolean,
+  enableRoot: boolean,
+  brand: string,
+  model: string,
+  adbPort: number
+) => boolean;
+export const getActiveInstanceId: () => string;
+export const getInstanceDiskMb: (filesDir: string, dataSubdir: string) => number;
+export const cleanInstanceCache: (filesDir: string, dataSubdir: string) => number;
+export const cloneInstanceAsync: (filesDir: string, srcSubdir: string, dstSubdir: string) => Promise<boolean>;
+export const deleteInstanceData: (filesDir: string, dataSubdir: string) => boolean;
+export const backupInstanceAsync: (
+  filesDir: string,
+  dataSubdir: string,
+  outTarPath: string,
+  compress: boolean
+) => Promise<string>;
+export const restoreInstanceAsync: (
+  filesDir: string,
+  dataSubdir: string,
+  inTarPath: string
+) => Promise<string>;
+export const listBackupFiles: (backupDir: string) => string[];
+export const ensureDir: (path: string) => boolean;
 export const setGpuMode: (gpuMode: string) => boolean;
 export const setRefreshRate: (hz: number) => boolean;
 export const setDisplayRefreshRate: (slot: number, hz: number) => boolean;

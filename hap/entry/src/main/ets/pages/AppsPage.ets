@@ -24,16 +24,16 @@ interface ListAppsReply {
 @Entry
 @Component
 struct AppsPage {
-  @StorageLink('mainDecorRightAvoidVp') decorRightAvoidVp: number = 136;
+  @StorageLink('mainDecorRightAvoidVp') decorRightAvoidVp: number = 148;
   @StorageLink('androidApps') appList: AndroidAppItem[] = [];
-  @StorageLink('refreshRate') refreshRate: number = 60;
+  @StorageLink('refreshRate') refreshRate: number = 120;
 
   @State private wmAgentReady: boolean = false;
   @State private running: boolean = false;
   @State private iconsDir: string = '';
   @State private loadingApps: boolean = false;
   @State private searchQuery: string = '';
-  @State private appFilter: string = 'all'; // 'all' | 'user' | 'system'
+  @State private appFilter: string = 'all';
   @State private pinnedIds: string[] = [];
   @State private prefEpoch: number = 0;
 
@@ -204,97 +204,94 @@ struct AppsPage {
   }
 
   build() {
-    Column() {
-      // Single integrated dark titlebar
+    Column({ space: 0 }) {
+      // HarmonyOS PC Adaptive Title Bar
       Row({ space: 10 }) {
-        Button({ type: ButtonType.Normal }) {
+        Button({ type: ButtonType.Capsule }) {
           Row({ space: 4 }) {
             SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(15)
-              .fontColor(['#E5E7EB'])
-            Text('实例管理')
+              .fontSize(14)
+              .fontColor([$r('sys.color.icon_primary')])
+            Text('设备管理')
               .fontSize(13)
-              .fontColor('#E5E7EB')
+              .fontColor($r('sys.color.font_primary'))
           }
         }
-        .height(30)
-        .padding({ left: 8, right: 10 })
-        .borderRadius(7)
-        .backgroundColor('#1E232D')
+        .height(32)
+        .padding({ left: 10, right: 12 })
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
         .onClick(() => {
           this.getUIContext().getRouter().back();
         })
 
         Row({ space: 6 }) {
           SymbolGlyph($r('sys.symbol.square_grid_2x2'))
-            .fontSize(15)
-            .fontColor(['#38BDF8'])
+            .fontSize(16)
+            .fontColor([$r('sys.color.icon_emphasize')])
           Text('应用中心')
-            .fontSize(14)
-            .fontWeight(600)
-            .fontColor('#F9FAFB')
+            .fontSize(15)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'))
         }
 
         Text(`${this.appList.length} 个应用`)
           .fontSize(11)
-          .fontColor('#9CA3AF')
+          .fontColor($r('sys.color.font_secondary'))
           .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-          .backgroundColor('#1A1F29')
-          .borderRadius(6)
+          .borderRadius(8)
+          .backgroundColor($r('sys.color.background_secondary'))
 
         Blank()
 
         Row({ space: 5 }) {
           SymbolGlyph($r('sys.symbol.pin_fill'))
             .fontSize(12)
-            .fontColor(['#93C5FD'])
+            .fontColor([$r('sys.color.icon_emphasize')])
           Text(`桌面 ${this.pinnedIds.length}/10`)
             .fontSize(11)
-            .fontColor('#93C5FD')
+            .fontColor($r('sys.color.font_emphasize'))
         }
         .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-        .backgroundColor('#172554')
-        .borderRadius(7)
+        .borderRadius(12)
+        .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
 
-        Button({ type: ButtonType.Normal }) {
+        Button({ type: ButtonType.Capsule }) {
           Row({ space: 5 }) {
             SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(14)
-              .fontColor(['#E5E7EB'])
+              .fontSize(13)
+              .fontColor([$r('sys.color.icon_primary')])
             Text('刷新')
               .fontSize(12)
-              .fontColor('#E5E7EB')
+              .fontColor($r('sys.color.font_primary'))
           }
         }
-        .height(28)
-        .padding({ left: 10, right: 10 })
-        .borderRadius(7)
-        .backgroundColor('#1F2530')
+        .height(30)
+        .padding({ left: 12, right: 12 })
+        .backgroundColor($r('sys.color.comp_background_tertiary'))
         .enabled(this.wmAgentReady && !this.loadingApps)
         .onClick(() => {
           this.refreshApps(true);
         })
       }
       .width('100%')
-      .height(44)
-      .padding({ left: 14, right: Math.max(152, this.decorRightAvoidVp) })
-      .backgroundColor('#13161D')
-      .border({ width: { bottom: 1 }, color: '#222733' })
+      .height(48)
+      .padding({ left: 16, right: Math.max(152, this.decorRightAvoidVp) })
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
 
-      // Search & Filter Toolbar
       Column({ space: 14 }) {
         Row({ space: 12 }) {
           Row({ space: 8 }) {
             SymbolGlyph($r('sys.symbol.magnifyingglass'))
               .fontSize(15)
-              .fontColor(['#6B7280'])
+              .fontColor([$r('sys.color.icon_tertiary')])
             TextInput({ placeholder: '搜索 Android 应用名称或包名...', text: this.searchQuery })
               .layoutWeight(1)
               .height(34)
               .fontSize(13)
-              .fontColor('#F3F4F6')
-              .placeholderColor('#6B7280')
+              .fontColor($r('sys.color.font_primary'))
+              .placeholderColor($r('sys.color.font_tertiary'))
               .backgroundColor(Color.Transparent)
               .padding({ left: 0, right: 0 })
               .onChange((val: string) => {
@@ -302,53 +299,55 @@ struct AppsPage {
               })
           }
           .layoutWeight(1)
-          .height(36)
-          .padding({ left: 12, right: 10 })
-          .backgroundColor('#181C24')
-          .borderRadius(9)
-          .border({ width: 1, color: '#262C38' })
+          .height(38)
+          .padding({ left: 14, right: 12 })
+          .borderRadius(19)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(VerticalAlign.Center)
 
-          Row({ space: 4 }) {
-            Button('全部')
+          Row({ space: 2 }) {
+            Button('全部', { type: ButtonType.Normal })
               .height(30)
+              .padding({ left: 12, right: 12 })
+              .borderRadius(15)
               .fontSize(12)
-              .fontColor(this.appFilter === 'all' ? '#FFFFFF' : '#9CA3AF')
-              .backgroundColor(this.appFilter === 'all' ? '#2563EB' : Color.Transparent)
-              .borderRadius(7)
+              .fontColor(this.appFilter === 'all' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'all' ? $r('sys.color.brand') : Color.Transparent)
               .onClick(() => { this.appFilter = 'all'; })
-            Button('第三方')
+            Button('第三方', { type: ButtonType.Normal })
               .height(30)
+              .padding({ left: 12, right: 12 })
+              .borderRadius(15)
               .fontSize(12)
-              .fontColor(this.appFilter === 'user' ? '#FFFFFF' : '#9CA3AF')
-              .backgroundColor(this.appFilter === 'user' ? '#2563EB' : Color.Transparent)
-              .borderRadius(7)
+              .fontColor(this.appFilter === 'user' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'user' ? $r('sys.color.brand') : Color.Transparent)
               .onClick(() => { this.appFilter = 'user'; })
-            Button('系统')
+            Button('系统', { type: ButtonType.Normal })
               .height(30)
+              .padding({ left: 12, right: 12 })
+              .borderRadius(15)
               .fontSize(12)
-              .fontColor(this.appFilter === 'system' ? '#FFFFFF' : '#9CA3AF')
-              .backgroundColor(this.appFilter === 'system' ? '#2563EB' : Color.Transparent)
-              .borderRadius(7)
+              .fontColor(this.appFilter === 'system' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
+              .backgroundColor(this.appFilter === 'system' ? $r('sys.color.brand') : Color.Transparent)
               .onClick(() => { this.appFilter = 'system'; })
           }
           .padding(3)
-          .backgroundColor('#181C24')
-          .borderRadius(9)
-          .border({ width: 1, color: '#262C38' })
+          .borderRadius(18)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         }
         .width('100%')
 
-        // App Grid Content
         if (!this.wmAgentReady) {
           Column({ space: 12 }) {
             LoadingProgress()
-              .width(38)
-              .height(38)
-              .color('#38BDF8')
-            Text(this.running ? 'Android 14 正在启动，应用列表即将就绪...' : '请先在实例管理中启动 Android 14')
+              .width(36)
+              .height(36)
+              .color($r('sys.color.brand'))
+            Text(this.running ? 'Android 14 正在启动，应用列表即将就绪...' : '请先在设备管理中启动 Android 14')
               .fontSize(14)
-              .fontColor('#D1D5DB')
+              .fontColor($r('sys.color.font_secondary'))
           }
           .width('100%')
           .layoutWeight(1)
@@ -357,7 +356,7 @@ struct AppsPage {
           Column({ space: 8 }) {
             Text(this.loadingApps ? '正在同步应用与图标...' : '暂无匹配应用')
               .fontSize(14)
-              .fontColor('#9CA3AF')
+              .fontColor($r('sys.color.font_secondary'))
           }
           .width('100%')
           .layoutWeight(1)
@@ -374,19 +373,19 @@ struct AppsPage {
                         Image(`file://${this.iconsDir}/${app.iconFile}`)
                           .width(54)
                           .height(54)
-                          .borderRadius(13)
+                          .borderRadius(14)
                           .objectFit(ImageFit.Contain)
                       } else {
                         Row() {
                           Text(app.label.length > 0 ? app.label.substring(0, 1).toUpperCase() : 'A')
                             .fontSize(22)
                             .fontWeight(FontWeight.Bold)
-                            .fontColor('#F9FAFB')
+                            .fontColor($r('sys.color.font_on_primary'))
                         }
                         .width(54)
                         .height(54)
-                        .borderRadius(13)
-                        .backgroundColor('#1E3A8A')
+                        .borderRadius(14)
+                        .backgroundColor($r('sys.color.brand'))
                         .justifyContent(FlexAlign.Center)
                         .alignItems(VerticalAlign.Center)
                       }
@@ -394,7 +393,7 @@ struct AppsPage {
                       Text(app.label)
                         .fontSize(13)
                         .fontWeight(FontWeight.Medium)
-                        .fontColor('#F3F4F6')
+                        .fontColor($r('sys.color.font_primary'))
                         .maxLines(1)
                         .textOverflow({ overflow: TextOverflow.Ellipsis })
                         .textAlign(TextAlign.Center)
@@ -411,41 +410,53 @@ struct AppsPage {
                         Row({ space: 3 }) {
                           SymbolGlyph($r('sys.symbol.screen_rotation'))
                             .fontSize(11)
-                            .fontColor(['#D1D5DB'])
+                            .fontColor([$r('sys.color.icon_secondary')])
                           Text(this.getEffectiveModeLabel(app))
                             .fontSize(10)
-                            .fontColor('#D1D5DB')
+                            .fontColor($r('sys.color.font_secondary'))
                         }
                       }
                       .height(24)
-                      .padding({ left: 7, right: 7 })
-                      .borderRadius(6)
-                      .backgroundColor('#232936')
+                      .padding({ left: 8, right: 8 })
+                      .borderRadius(12)
+                      .backgroundColor($r('sys.color.background_secondary'))
                       .onClick(() => { this.cycleAppWindowPref(app); })
 
                       Button({ type: ButtonType.Normal }) {
                         Row({ space: 3 }) {
                           SymbolGlyph(this.isAppPinned(app.packageName) ? $r('sys.symbol.pin_fill') : $r('sys.symbol.pin'))
                             .fontSize(11)
-                            .fontColor([this.isAppPinned(app.packageName) ? '#6EE7B7' : '#93C5FD'])
+                            .fontColor([
+                              this.isAppPinned(app.packageName)
+                                ? $r('sys.color.confirm')
+                                : $r('sys.color.icon_emphasize')
+                            ])
                           Text(this.isAppPinned(app.packageName) ? '已加桌' : '加桌')
                             .fontSize(10)
-                            .fontColor(this.isAppPinned(app.packageName) ? '#6EE7B7' : '#93C5FD')
+                            .fontColor(
+                              this.isAppPinned(app.packageName)
+                                ? $r('sys.color.confirm')
+                                : $r('sys.color.font_emphasize')
+                            )
                         }
                       }
                       .height(24)
-                      .padding({ left: 7, right: 7 })
-                      .borderRadius(6)
-                      .backgroundColor(this.isAppPinned(app.packageName) ? '#064E3B' : '#172554')
+                      .padding({ left: 8, right: 8 })
+                      .borderRadius(12)
+                      .backgroundColor(
+                        this.isAppPinned(app.packageName)
+                          ? '#1F64BB5C'
+                          : $r('sys.color.comp_emphasize_tertiary')
+                      )
                       .onClick(() => { this.toggleDesktopShortcut(app); })
                     }
                     .justifyContent(FlexAlign.Center)
                   }
                   .width('100%')
                   .padding({ left: 10, right: 10, top: 14, bottom: 12 })
-                  .backgroundColor('#151922')
-                  .borderRadius(12)
-                  .border({ width: 1, color: '#222836' })
+                  .borderRadius(16)
+                  .backgroundColor($r('sys.color.comp_background_primary'))
+                  .border({ width: 0.6, color: $r('sys.color.comp_divider') })
                 }
               },
               (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
@@ -460,10 +471,10 @@ struct AppsPage {
       }
       .width('100%')
       .layoutWeight(1)
-      .padding({ left: 18, right: 18, top: 14, bottom: 14 })
+      .padding({ left: 20, right: 20, top: 16, bottom: 14 })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#0E1117')
+    .backgroundColor($r('sys.color.background_secondary'))
   }
 }

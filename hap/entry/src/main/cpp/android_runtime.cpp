@@ -1343,6 +1343,47 @@ bool AndroidRuntime::SleepCancelableMs(int totalMs) const {
     return running_.load();
 }
 
+void AndroidRuntime::SetInstanceConfig(const std::string& instanceId,
+                                       const std::string& dataSubdir,
+                                       int32_t customDpi,
+                                       bool enableAudio,
+                                       bool enableRoot,
+                                       const std::string& brand,
+                                       const std::string& model,
+                                       int32_t adbPort) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!instanceId.empty()) {
+        activeInstanceId_ = instanceId;
+    }
+    std::string cleanSubdir = dataSubdir;
+    while (!cleanSubdir.empty() && cleanSubdir.front() == '/') cleanSubdir.erase(cleanSubdir.begin());
+    if (cleanSubdir.empty() || cleanSubdir.find("..") != std::string::npos) {
+        cleanSubdir = "userdata14";
+    }
+    dataSubdir_ = cleanSubdir;
+    customDpi_.store(customDpi >= 120 && customDpi <= 640 ? customDpi : 0);
+    enableAudio_.store(enableAudio);
+    enableRoot_.store(enableRoot);
+    deviceBrand_ = brand;
+    deviceModel_ = model;
+    adbPort_.store((adbPort >= 1024 && adbPort <= 65535) ? adbPort : 5555);
+}
+
+std::string AndroidRuntime::ActiveInstanceId() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return activeInstanceId_;
+}
+
+std::string AndroidRuntime::DataSubdir() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return dataSubdir_;
+}
+
+std::string AndroidRuntime::ShareHostDir() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return shareHostDir_.empty() ? "/storage/Users/currentUser/Download/svbox-share" : shareHostDir_;
+}
+
 std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
                                   const std::string& svboxPath,
                                   const std::string& androidDir,
@@ -1404,6 +1445,8 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     const bool useSandboxTar = FileExists(sandboxRootfs + "/.imported_a14_v1") || FileExists(rootfsTar);
     const std::string rootfs = useSandboxTar ? sandboxRootfs : externalRootfs;
 
+    OH_LOG_INFO(LOG_APP, "AndroidRuntime::Start temp=%{public}s svbox=%{public}s rootfs=%{public}s mode=%{public}s %dx%d",
+                sandboxTempDir.c_str(), resolvedSvbox.c_str(), rootfs.c_str(), mode.c_str(), width, height);
     if (!FileExists(resolvedSvbox)) return "Missing svbox binary: " + resolvedSvbox;
     if (!FileExists(binderd)) return "Missing svbox-binderd: " + binderd;
     if (!FileExists(propd)) return "Missing svbox-propd: " + propd;
@@ -1413,7 +1456,12 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
 
     sandboxFiles_ = sandboxFiles;
     runBase_ = sandboxTempDir + "/svbox-android14-hap";
-    dataBase_ = sandboxFiles + "/userdata14";
+    std::string activeSubdir;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        activeSubdir = dataSubdir_.empty() ? "userdata14" : dataSubdir_;
+    }
+    dataBase_ = sandboxFiles + "/" + activeSubdir;
     rootUpper_ = runBase_ + "/root_upper";
     injectLayer_ = runBase_ + "/inject_layer";
     shareHostDir_ = "/storage/Users/currentUser/Download/svbox-share";
@@ -2227,7 +2275,25 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const bool useVk = (gpuModeSnap == "vulkan");
 
     const int32_t targetHz = refreshRate_.load();
-    const int32_t targetDpi = ComputeDpiForResolution(width, height);
+    const int32_t overrideDpi = customDpi_.load();
+    const int32_t targetDpi = overrideDpi > 0 ? overrideDpi : ComputeDpiForResolution(width, height);
+    const bool allowRoot = enableRoot_.load();
+    const int32_t targetAdbPort = adbPort_.load();
+    std::string devBrandSnap;
+    std::string devModelSnap;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        devBrandSnap = deviceBrand_;
+        devModelSnap = deviceModel_;
+    }
+    std::string deviceProps;
+    if (!devBrandSnap.empty()) {
+        deviceProps += "ro.product.brand=" + devBrandSnap + "\n";
+        deviceProps += "ro.product.manufacturer=" + devBrandSnap + "\n";
+    }
+    if (!devModelSnap.empty()) {
+        deviceProps += "ro.product.model=" + devModelSnap + "\n";
+    }
     const std::string overrideProp = runBase_ + "/override.prop";
     std::string gpuProps;
     if (useGfx) {
@@ -2253,6 +2319,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     WriteFile(overrideProp,
         gpuProps +
+        deviceProps +
         "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
         "ro.boot.redroid_dpi=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
@@ -2280,12 +2347,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "persist.sys.fuse.bpf.override=false\n"
         "external_storage.sdcardfs.enabled=false\n"
         "ro.sys.sdcardfs=false\n"
-        "ro.secure=0\n"
+        "ro.secure=" + std::string(allowRoot ? "0" : "1") + "\n"
         "ro.adb.secure=0\n"
         "ro.debuggable=1\n"
-        "service.adb.root=1\n"
-        "service.adb.tcp.port=5555\n"
-        "persist.adb.tcp.port=5555\n");
+        "service.adb.root=" + std::string(allowRoot ? "1" : "0") + "\n"
+        "service.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n"
+        "persist.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n");
 
     unlink((ipcDir + "/hwcomposer.sock").c_str());
     unlink((ipcDir + "/gfxstream.sock").c_str());
@@ -2494,7 +2561,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     for (int i = 1; i <= InputBridge::kMaxSecondaryDisplays; ++i) {
         InputBridge::Instance().StartSecondaryTouch(i, sockDir + "/input_touch_" + std::to_string(i) + ".sock");
     }
-    AudioBridge::Instance().Start(ipcDir + "/audio.sock");
+    if (enableAudio_.load()) {
+        AudioBridge::Instance().Start(ipcDir + "/audio.sock");
+    }
     UsbBridge::Instance().Start(sockDir + "/usb_001_002.sock", sockDir + "/ttyusb0.sock");
     if (useGfx) {
         HwcRenderer::Instance().ClearWindow();

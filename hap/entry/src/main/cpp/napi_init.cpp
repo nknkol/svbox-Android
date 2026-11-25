@@ -8,15 +8,22 @@
 #include "ohos_bridge/usb_bridge.h"
 
 #include <ace/xcomponent/native_interface_xcomponent.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <hilog/log.h>
 #include <mutex>
 #include <napi/native_api.h>
 #include <string>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #undef LOG_TAG
 #define LOG_TAG "SvboxNapi"
@@ -613,6 +620,427 @@ napi_value InjectGamepadAxisNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// --- Multi-Instance Storage & Lifecycle Helpers ---
+bool IsSafeSubdir(const std::string& s) {
+    if (s.empty() || s[0] == '/') return false;
+    if (s.find("..") != std::string::npos) return false;
+    return true;
+}
+
+bool MkdirPLocal(const std::string& path) {
+    if (path.empty()) return false;
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur.push_back(path[i]);
+        if (path[i] == '/' && cur.size() > 1) {
+            mkdir(cur.c_str(), 0755);
+        }
+    }
+    return mkdir(cur.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
+uint64_t SumDirBytes(const std::string& root) {
+    uint64_t total = 0;
+    std::vector<std::string> stack;
+    stack.push_back(root);
+    while (!stack.empty()) {
+        std::string cur = std::move(stack.back());
+        stack.pop_back();
+        struct stat st = {};
+        if (lstat(cur.c_str(), &st) != 0) continue;
+        if (S_ISREG(st.st_mode)) {
+            total += static_cast<uint64_t>(st.st_size);
+        } else if (S_ISDIR(st.st_mode)) {
+            DIR* d = opendir(cur.c_str());
+            if (!d) continue;
+            while (struct dirent* e = readdir(d)) {
+                if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+                stack.push_back(cur + "/" + e->d_name);
+            }
+            closedir(d);
+        }
+    }
+    return total;
+}
+
+uint64_t RemoveTreeBytes(const std::string& path, bool keepRootDir = false) {
+    struct stat st = {};
+    if (lstat(path.c_str(), &st) != 0) return 0;
+    if (!S_ISDIR(st.st_mode)) {
+        uint64_t sz = S_ISREG(st.st_mode) ? static_cast<uint64_t>(st.st_size) : 0;
+        unlink(path.c_str());
+        return sz;
+    }
+    uint64_t freed = 0;
+    DIR* d = opendir(path.c_str());
+    if (d) {
+        while (struct dirent* e = readdir(d)) {
+            if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+            freed += RemoveTreeBytes(path + "/" + e->d_name, false);
+        }
+        closedir(d);
+    }
+    if (!keepRootDir) {
+        rmdir(path.c_str());
+    }
+    return freed;
+}
+
+bool CopyFileRaw(const std::string& src, const std::string& dst, mode_t mode) {
+    int inFd = open(src.c_str(), O_RDONLY | O_CLOEXEC);
+    if (inFd < 0) return false;
+    int outFd = open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode & 0777);
+    if (outFd < 0) {
+        close(inFd);
+        return false;
+    }
+    char buf[131072];
+    ssize_t n = 0;
+    bool ok = true;
+    while ((n = read(inFd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(outFd, buf + off, static_cast<size_t>(n - off));
+            if (w <= 0) { ok = false; break; }
+            off += w;
+        }
+        if (!ok) break;
+    }
+    close(outFd);
+    close(inFd);
+    return ok;
+}
+
+bool CopyTreeRecursive(const std::string& src, const std::string& dst) {
+    struct stat st = {};
+    if (lstat(src.c_str(), &st) != 0) return false;
+    if (S_ISLNK(st.st_mode)) {
+        char linkBuf[4096];
+        ssize_t ln = readlink(src.c_str(), linkBuf, sizeof(linkBuf) - 1);
+        if (ln >= 0) {
+            linkBuf[ln] = '\0';
+            unlink(dst.c_str());
+            symlink(linkBuf, dst.c_str());
+        }
+        return true;
+    }
+    if (S_ISREG(st.st_mode)) {
+        return CopyFileRaw(src, dst, st.st_mode);
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (!MkdirPLocal(dst)) return false;
+        DIR* d = opendir(src.c_str());
+        if (!d) return false;
+        while (struct dirent* e = readdir(d)) {
+            if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+            CopyTreeRecursive(src + "/" + e->d_name, dst + "/" + e->d_name);
+        }
+        closedir(d);
+        return true;
+    }
+    return true;
+}
+
+int RunTarCmd(const std::vector<std::string>& args) {
+    const char* tarBin = (access("/usr/bin/tar", X_OK) == 0) ? "/usr/bin/tar"
+                       : (access("/bin/tar", X_OK) == 0 ? "/bin/tar" : "/system/bin/tar");
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        std::vector<char*> cargs;
+        cargs.push_back(const_cast<char*>(tarBin));
+        for (const auto& a : args) cargs.push_back(const_cast<char*>(a.c_str()));
+        cargs.push_back(nullptr);
+        int devNull = open("/dev/null", O_RDWR);
+        if (devNull >= 0) {
+            dup2(devNull, 0);
+            dup2(devNull, 1);
+            dup2(devNull, 2);
+            if (devNull > 2) close(devNull);
+        }
+        execv(tarBin, cargs.data());
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+napi_value SetInstanceConfigNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value args[8] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = argc > 0 ? GetStringArg(env, args[0]) : "inst_0";
+    std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "userdata14";
+    int32_t dpi = argc > 2 ? GetInt32Arg(env, args[2], 0) : 0;
+    bool audio = argc > 3 ? GetBoolArg(env, args[3], true) : true;
+    bool root = argc > 4 ? GetBoolArg(env, args[4], true) : true;
+    std::string brand = argc > 5 ? GetStringArg(env, args[5]) : "";
+    std::string model = argc > 6 ? GetStringArg(env, args[6]) : "";
+    int32_t adbPort = argc > 7 ? GetInt32Arg(env, args[7], 5555) : 5555;
+    AndroidRuntime::Instance().SetInstanceConfig(id, subdir, dpi, audio, root, brand, model, adbPort);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value GetActiveInstanceIdNapi(napi_env env, napi_callback_info) {
+    std::string id = AndroidRuntime::Instance().ActiveInstanceId();
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, id.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
+napi_value GetInstanceDiskMbNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
+    double mb = 0.0;
+    if (!baseDir.empty() && IsSafeSubdir(subdir)) {
+        uint64_t bytes = SumDirBytes(baseDir + "/" + subdir);
+        mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
+    }
+    napi_value out = nullptr;
+    napi_create_double(env, mb, &out);
+    return out;
+}
+
+napi_value CleanInstanceCacheNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
+    double freedMb = 0.0;
+    if (!baseDir.empty() && IsSafeSubdir(subdir)) {
+        std::string root = baseDir + "/" + subdir;
+        uint64_t freed = 0;
+        freed += RemoveTreeBytes(root + "/data/tombstones", true);
+        freed += RemoveTreeBytes(root + "/data/anr", true);
+        freed += RemoveTreeBytes(root + "/data/system/dropbox", true);
+        freed += RemoveTreeBytes(root + "/data/cache", true);
+        // Clean per-app cache & code_cache dirs under /data/data
+        DIR* d = opendir((root + "/data/data").c_str());
+        if (d) {
+            while (struct dirent* e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                std::string pkgDir = root + "/data/data/" + e->d_name;
+                freed += RemoveTreeBytes(pkgDir + "/cache", true);
+                freed += RemoveTreeBytes(pkgDir + "/code_cache", true);
+            }
+            closedir(d);
+        }
+        freedMb = static_cast<double>(freed) / (1024.0 * 1024.0);
+    }
+    napi_value out = nullptr;
+    napi_create_double(env, freedMb, &out);
+    return out;
+}
+
+napi_value DeleteInstanceDataNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
+    bool ok = false;
+    if (!baseDir.empty() && IsSafeSubdir(subdir)) {
+        auto& rt = AndroidRuntime::Instance();
+        if (!rt.IsRunning() || rt.DataSubdir() != subdir) {
+            RemoveTreeBytes(baseDir + "/" + subdir, false);
+            ok = true;
+        }
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
+struct CloneAsyncCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string srcPath;
+    std::string dstPath;
+    bool ok = false;
+};
+
+void CloneAsyncExec(napi_env, void* data) {
+    auto* ctx = static_cast<CloneAsyncCtx*>(data);
+    struct stat st = {};
+    if (stat(ctx->srcPath.c_str(), &st) != 0) {
+        // Source hasn't been booted yet — just create empty dir
+        ctx->ok = MkdirPLocal(ctx->dstPath);
+    } else {
+        ctx->ok = CopyTreeRecursive(ctx->srcPath, ctx->dstPath);
+    }
+}
+
+void CloneAsyncDone(napi_env env, napi_status, void* data) {
+    auto* ctx = static_cast<CloneAsyncCtx*>(data);
+    napi_value v = nullptr;
+    napi_get_boolean(env, ctx->ok, &v);
+    napi_resolve_deferred(env, ctx->deferred, v);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+napi_value CloneInstanceAsyncNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::string srcSub = argc > 1 ? GetStringArg(env, args[1]) : "";
+    std::string dstSub = argc > 2 ? GetStringArg(env, args[2]) : "";
+    auto* ctx = new CloneAsyncCtx();
+    if (!baseDir.empty() && IsSafeSubdir(srcSub) && IsSafeSubdir(dstSub)) {
+        ctx->srcPath = baseDir + "/" + srcSub;
+        ctx->dstPath = baseDir + "/" + dstSub;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "svbox_clone_inst", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, nullptr, name, CloneAsyncExec, CloneAsyncDone, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+struct BackupAsyncCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    bool isRestore = false;
+    bool compress = true;
+    std::string baseDir;
+    std::string subdir;
+    std::string tarPath;
+    std::string result;
+};
+
+void BackupAsyncExec(napi_env, void* data) {
+    auto* ctx = static_cast<BackupAsyncCtx*>(data);
+    if (ctx->baseDir.empty() || !IsSafeSubdir(ctx->subdir) || ctx->tarPath.empty()) {
+        ctx->result = "ERR:参数无效";
+        return;
+    }
+    if (!ctx->isRestore) {
+        std::string fullDir = ctx->baseDir + "/" + ctx->subdir;
+        struct stat st = {};
+        if (stat(fullDir.c_str(), &st) != 0) {
+            ctx->result = "ERR:该实例尚未初始化数据目录";
+            return;
+        }
+        auto slash = ctx->tarPath.find_last_of('/');
+        if (slash != std::string::npos) {
+            MkdirPLocal(ctx->tarPath.substr(0, slash));
+        }
+        std::string flags = ctx->compress ? "-czf" : "-cf";
+        int rc = RunTarCmd({ flags, ctx->tarPath, "-C", fullDir, "." });
+        ctx->result = (rc == 0) ? ("OK:" + ctx->tarPath) : ("ERR:tar 退出码 " + std::to_string(rc));
+    } else {
+        struct stat st = {};
+        if (stat(ctx->tarPath.c_str(), &st) != 0) {
+            ctx->result = "ERR:备份文件不存在";
+            return;
+        }
+        std::string fullDir = ctx->baseDir + "/" + ctx->subdir;
+        RemoveTreeBytes(fullDir, false);
+        MkdirPLocal(fullDir);
+        bool isGz = (ctx->tarPath.size() >= 3 &&
+                     ctx->tarPath.compare(ctx->tarPath.size() - 3, 3, ".gz") == 0);
+        int rc = RunTarCmd({ isGz ? "-xzf" : "-xf", ctx->tarPath, "-C", fullDir });
+        ctx->result = (rc == 0) ? "OK" : ("ERR:还原失败 (tar=" + std::to_string(rc) + ")");
+    }
+}
+
+void BackupAsyncDone(napi_env env, napi_status, void* data) {
+    auto* ctx = static_cast<BackupAsyncCtx*>(data);
+    napi_value v = nullptr;
+    napi_create_string_utf8(env, ctx->result.c_str(), NAPI_AUTO_LENGTH, &v);
+    napi_resolve_deferred(env, ctx->deferred, v);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+napi_value BackupInstanceAsyncNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    auto* ctx = new BackupAsyncCtx();
+    ctx->isRestore = false;
+    ctx->baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    ctx->subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
+    ctx->tarPath = argc > 2 ? GetStringArg(env, args[2]) : "";
+    ctx->compress = argc > 3 ? GetBoolArg(env, args[3], true) : true;
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "svbox_backup_inst", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, nullptr, name, BackupAsyncExec, BackupAsyncDone, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value RestoreInstanceAsyncNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    auto* ctx = new BackupAsyncCtx();
+    ctx->isRestore = true;
+    ctx->baseDir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    ctx->subdir = argc > 1 ? GetStringArg(env, args[1]) : "";
+    ctx->tarPath = argc > 2 ? GetStringArg(env, args[2]) : "";
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "svbox_restore_inst", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, nullptr, name, BackupAsyncExec, BackupAsyncDone, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value ListBackupFilesNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string dir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    std::vector<std::string> files;
+    if (!dir.empty()) {
+        DIR* d = opendir(dir.c_str());
+        if (d) {
+            while (struct dirent* e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                std::string fn(e->d_name);
+                if (fn.find(".tar") != std::string::npos) {
+                    files.push_back(fn);
+                }
+            }
+            closedir(d);
+            std::sort(files.begin(), files.end(), std::greater<std::string>());
+        }
+    }
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, files.size(), &arr);
+    for (size_t i = 0; i < files.size(); ++i) {
+        napi_value s = nullptr;
+        napi_create_string_utf8(env, files[i].c_str(), NAPI_AUTO_LENGTH, &s);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), s);
+    }
+    return arr;
+}
+
+napi_value EnsureDirNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string dir = argc > 0 ? GetStringArg(env, args[0]) : "";
+    bool ok = !dir.empty() && MkdirPLocal(dir);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return out;
+}
+
 napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
@@ -677,6 +1105,8 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setStr("cpuset", rt.ActiveCpuset());
     setStr("topology", topo.summary);
     setStr("statusText", rt.StatusText());
+    setStr("activeInstanceId", rt.ActiveInstanceId());
+    setStr("shareDir", rt.ShareHostDir());
     return obj;
 }
 
@@ -690,6 +1120,16 @@ napi_value Init(napi_env env, napi_value exports) {
         { "sendNavKey", nullptr, SendNavKeyNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "sendScroll", nullptr, SendScrollNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setResourceConfig", nullptr, SetResourceConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setInstanceConfig", nullptr, SetInstanceConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getActiveInstanceId", nullptr, GetActiveInstanceIdNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getInstanceDiskMb", nullptr, GetInstanceDiskMbNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "cleanInstanceCache", nullptr, CleanInstanceCacheNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "cloneInstanceAsync", nullptr, CloneInstanceAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "deleteInstanceData", nullptr, DeleteInstanceDataNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "backupInstanceAsync", nullptr, BackupInstanceAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "restoreInstanceAsync", nullptr, RestoreInstanceAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "listBackupFiles", nullptr, ListBackupFilesNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "ensureDir", nullptr, EnsureDirNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setGpuMode", nullptr, SetGpuModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRefreshRate", nullptr, SetRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setDisplayRefreshRate", nullptr, SetDisplayRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

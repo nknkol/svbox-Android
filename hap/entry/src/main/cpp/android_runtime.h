@@ -30,6 +30,17 @@ public:
     void SetResourceConfig(const std::string& profile,
                            const std::string& customCpuset,
                            uint32_t memLimitMb);
+    void SetInstanceConfig(const std::string& instanceId,
+                           const std::string& dataSubdir,
+                           int32_t customDpi,
+                           bool enableAudio,
+                           bool enableRoot,
+                           const std::string& brand,
+                           const std::string& model,
+                           int32_t adbPort);
+    std::string ActiveInstanceId() const;
+    std::string DataSubdir() const;
+    std::string ShareHostDir() const;
     void SetGpuMode(const std::string& gpuMode);
     std::string GpuMode() const;
     bool UseGfxstream() const;
@@ -89,6 +100,14 @@ private:
     std::string profile_ = "perf";
     std::string gpuMode_ = "vulkan";
     std::string activeGpuMode_ = "vulkan";
+    std::string activeInstanceId_ = "inst_0";
+    std::string dataSubdir_ = "userdata14";
+    std::string deviceBrand_;
+    std::string deviceModel_;
+    std::atomic<int32_t> customDpi_{0};
+    std::atomic<bool> enableAudio_{true};
+    std::atomic<bool> enableRoot_{true};
+    std::atomic<int32_t> adbPort_{5555};
     std::string customCpuset_;
     std::string activeCpuset_;
     int32_t activeNice_ = 0x7fffffff;

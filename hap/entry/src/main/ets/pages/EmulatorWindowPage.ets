@@ -4,10 +4,9 @@ import native, { RuntimeStatus } from 'libentry.so';
 import {
   AndroidAppItem,
   findPresetByKey,
-  InstanceConfig,
-  instanceConfigStore,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
+import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 
 const TAG: string = 'SvboxEmuPage';
 
@@ -26,13 +25,15 @@ struct EmulatorWindowPage {
   @LocalStorageProp('sandboxTempDir') sandboxTempDir: string = '';
   @LocalStorageProp('sandboxFilesDir') sandboxFilesDir: string = '';
   @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 152;
+  @LocalStorageProp('emuInstanceName') emuInstanceName: string = '';
+  @LocalStorageProp('emuInstanceId') emuInstanceId: string = '';
 
   @State private running: boolean = false;
   @State private wmAgentReady: boolean = false;
   @State private dispW: number = 720;
   @State private dispH: number = 1280;
   @State private fps: number = 0;
-  @State private refreshRate: number = 60;
+  @State private refreshRate: number = 120;
   @State private statusText: string = '正在连接 Android 14 模拟器屏幕...';
   @State private stageW: number = 420;
   @State private stageH: number = 720;
@@ -49,8 +50,8 @@ struct EmulatorWindowPage {
   }
 
   private computeFitWidth(): number {
-    const padW: number = Math.max(120, this.stageW * 0.99);
-    const padH: number = Math.max(120, this.stageH * 0.99);
+    const padW: number = Math.max(120, this.stageW);
+    const padH: number = Math.max(120, this.stageH);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
     if (padW / padH > aspect) {
       return Math.floor(padH * aspect);
@@ -59,8 +60,8 @@ struct EmulatorWindowPage {
   }
 
   private computeFitHeight(): number {
-    const padW: number = Math.max(120, this.stageW * 0.99);
-    const padH: number = Math.max(120, this.stageH * 0.99);
+    const padW: number = Math.max(120, this.stageW);
+    const padH: number = Math.max(120, this.stageH);
     const aspect: number = this.dispW / Math.max(1, this.dispH);
     if (padW / padH > aspect) {
       return Math.floor(padH);
@@ -71,21 +72,32 @@ struct EmulatorWindowPage {
   aboutToAppear(): void {
     const filesDir: string = this.sandboxFilesDir.length > 0
       ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
-    const cfg: InstanceConfig = instanceConfigStore.get(filesDir);
-    const preset: ResolutionPresetItem = findPresetByKey(cfg.resolutionKey);
-    this.dispW = preset.w;
-    this.dispH = preset.h;
-    this.refreshRate = cfg.refreshRate;
+    const inst: DeviceInstance | undefined = this.emuInstanceId.length > 0
+      ? instanceManager.getById(filesDir, this.emuInstanceId)
+      : instanceManager.getAll(filesDir)[0];
+    if (inst) {
+      this.dispW = inst.width;
+      this.dispH = inst.height;
+      this.refreshRate = inst.refreshRate;
+    } else {
+      const preset: ResolutionPresetItem = findPresetByKey('720x1280');
+      this.dispW = preset.w;
+      this.dispH = preset.h;
+    }
 
     const st: RuntimeStatus = native.getStatus();
-    if (!st.running) {
+    if (!st.running && inst) {
       const tempDir: string = this.sandboxTempDir.length > 0
         ? this.sandboxTempDir : '/data/storage/el2/base/haps/entry/temp';
       try {
-        native.setResourceConfig(cfg.profile, '', 4096);
-        native.setGpuMode(cfg.gpuMode);
-        native.setRefreshRate(cfg.refreshRate);
-        this.statusText = native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', preset.w, preset.h);
+        native.setInstanceConfig(
+          inst.id, inst.dataSubdir, inst.dpi, inst.enableAudio,
+          inst.enableRoot, inst.deviceBrand, inst.deviceModel, inst.adbPort
+        );
+        native.setResourceConfig(inst.profile, '', inst.memLimitMb);
+        native.setGpuMode(inst.gpuMode);
+        native.setRefreshRate(inst.refreshRate);
+        this.statusText = native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', inst.width, inst.height);
       } catch (_e) {
       }
     }
@@ -184,63 +196,109 @@ struct EmulatorWindowPage {
       }
     } catch (err) {
       hilog.warn(0x0000, TAG, 'popOut failed: %{public}s', String(err));
-      this.showToast(`拆出失败: ${String(err)}`);
+      this.showToast(`拆出失败：${String(err)}`);
     }
   }
 
-  build() {
-    Column() {
-      // Single Immersive Dark Title Bar (38vp, strictly avoiding native 3-button area)
-      Row({ space: 6 }) {
-        Row({ space: 6 }) {
-          SymbolGlyph($r('sys.symbol.display'))
-            .fontSize(15)
-            .fontColor(['#38BDF8'])
+  @Builder
+  private emuMoreMenuBuilder() {
+    Menu() {
+      MenuItem({ content: '音量加' })
+        .onClick(() => { native.sendNavKey('vol_up'); })
+      MenuItem({ content: '音量减' })
+        .onClick(() => { native.sendNavKey('vol_down'); })
+      MenuItem({ content: '电源键 / 锁屏唤醒' })
+        .onClick(() => { native.sendNavKey('power'); })
+      MenuItem({ content: '拆出前台应用到独立窗口' })
+        .enabled(this.wmAgentReady)
+        .onClick(() => { this.handlePopOutCurrentApp(); })
+    }
+  }
 
-          Text('传统模拟器')
+  @Builder
+  private topIconBtn(iconRes: Resource, onTap: () => void) {
+    Button({ type: ButtonType.Normal }) {
+      SymbolGlyph(iconRes)
+        .fontSize(15)
+        .fontColor([$r('sys.color.icon_primary')])
+    }
+    .width(28)
+    .height(28)
+    .borderRadius(8)
+    .backgroundColor(Color.Transparent)
+    .stateStyles({
+      pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
+    })
+    .onClick(onTap)
+  }
+
+  build() {
+    Column({ space: 0 }) {
+      // MuMu-Style Ultra-Clean Integrated HarmonyOS PC Top Toolbar (40vp, ZERO bottom chrome!)
+      Row({ space: 4 }) {
+        Row({ space: 7 }) {
+          Stack({ alignContent: Alignment.Center }) {
+            Column()
+              .width(22)
+              .height(22)
+              .borderRadius(6)
+              .backgroundColor($r('sys.color.brand'))
+            SymbolGlyph($r('sys.symbol.pad_fill'))
+              .fontSize(12)
+              .fontColor([$r('sys.color.icon_on_primary')])
+          }
+
+          Text(this.emuInstanceName.length > 0 ? this.emuInstanceName : 'Android 14 · 默认设备')
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
-            .fontColor('#F3F4F6')
+            .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .layoutWeight(1)
 
           Text(`${this.fps}/${this.refreshRate}Hz`)
             .fontSize(10)
-            .fontColor('#9CA3AF')
-            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-            .backgroundColor('#1E2430')
-            .borderRadius(5)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_emphasize'))
+            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+            .borderRadius(6)
+            .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
             .maxLines(1)
         }
         .layoutWeight(1)
         .alignItems(VerticalAlign.Center)
 
-        Button({ type: ButtonType.Normal }) {
-          Row({ space: 4 }) {
-            SymbolGlyph($r('sys.symbol.arrow_up_right'))
-              .fontSize(12)
-              .fontColor(['#E5E7EB'])
-            Text('拆出')
-              .fontSize(11)
-              .fontColor('#E5E7EB')
+        // Compact Android Navigation & Quick Tools directly in slim top toolbar (MuMu 26459fce style)
+        Row({ space: 2 }) {
+          this.topIconBtn($r('sys.symbol.chevron_left'), () => { native.sendNavKey('back'); })
+          this.topIconBtn($r('sys.symbol.house'), () => { native.sendNavKey('home'); })
+          this.topIconBtn($r('sys.symbol.rectangle_on_rectangle'), () => { native.sendNavKey('recents'); })
+          this.topIconBtn($r('sys.symbol.arrow_up_right'), () => { this.handlePopOutCurrentApp(); })
+
+          Button({ type: ButtonType.Normal }) {
+            SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
+              .fontSize(15)
+              .fontColor([$r('sys.color.icon_primary')])
           }
+          .width(28)
+          .height(28)
+          .borderRadius(8)
+          .backgroundColor(Color.Transparent)
+          .stateStyles({
+            pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
+          })
+          .bindMenu(this.emuMoreMenuBuilder())
         }
-        .height(26)
-        .padding({ left: 8, right: 8 })
-        .borderRadius(6)
-        .backgroundColor('#1E2430')
-        .enabled(this.wmAgentReady)
-        .onClick(() => { this.handlePopOutCurrentApp(); })
+        .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .height(38)
+      .height(40)
       .padding({ left: 10, right: Math.max(152, this.decorRightAvoidVp) })
-      .backgroundColor('#13161D')
-      .border({ width: { bottom: 1 }, color: '#222733' })
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
 
-      // Display 0 Zero-Copy Vulkan Viewport
+      // Full-Height Zero-Copy Vulkan Viewport (No wasted bottom bar!)
       Stack({ alignContent: Alignment.Center }) {
         XComponent({
           id: 'svbox_display_0',
@@ -254,23 +312,24 @@ struct EmulatorWindowPage {
           .backgroundColor('#000000')
 
         if (!this.running) {
-          Column({ space: 10 }) {
+          Column({ space: 12 }) {
             LoadingProgress()
-              .width(34)
-              .height(34)
-              .color('#38BDF8')
+              .width(36)
+              .height(36)
+              .color($r('sys.color.brand'))
             Text(this.statusText)
               .fontSize(13)
-              .fontColor('#D1D5DB')
+              .fontColor($r('sys.color.font_primary'))
           }
-          .padding(20)
-          .backgroundColor('#CC11141B')
-          .borderRadius(12)
+          .padding({ left: 24, right: 24, top: 20, bottom: 20 })
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .borderRadius(16)
+          .shadow({ radius: 24, color: '#33000000', offsetY: 6 })
         }
       }
       .width('100%')
       .layoutWeight(1)
-      .backgroundColor('#0B0D12')
+      .backgroundColor('#0D0F14')
       .onAreaChange((_oldVal: Area, newVal: Area) => {
         const w: number = Number(newVal.width);
         const h: number = Number(newVal.height);
@@ -279,51 +338,9 @@ struct EmulatorWindowPage {
           this.stageH = h;
         }
       })
-
-      // Compact Android Navigation Dock (100% HarmonyOS SymbolGlyph)
-      Row({ space: 22 }) {
-        Button({ type: ButtonType.Normal }) {
-          SymbolGlyph($r('sys.symbol.chevron_left'))
-            .fontSize(16)
-            .fontColor(['#E5E7EB'])
-        }
-        .width(42)
-        .height(28)
-        .borderRadius(7)
-        .backgroundColor('#1E2430')
-        .onClick(() => { native.sendNavKey('back'); })
-
-        Button({ type: ButtonType.Normal }) {
-          SymbolGlyph($r('sys.symbol.house'))
-            .fontSize(15)
-            .fontColor(['#E5E7EB'])
-        }
-        .width(42)
-        .height(28)
-        .borderRadius(7)
-        .backgroundColor('#1E2430')
-        .onClick(() => { native.sendNavKey('home'); })
-
-        Button({ type: ButtonType.Normal }) {
-          SymbolGlyph($r('sys.symbol.rectangle_on_rectangle'))
-            .fontSize(14)
-            .fontColor(['#E5E7EB'])
-        }
-        .width(42)
-        .height(28)
-        .borderRadius(7)
-        .backgroundColor('#1E2430')
-        .onClick(() => { native.sendNavKey('recents'); })
-      }
-      .width('100%')
-      .height(40)
-      .backgroundColor('#13161D')
-      .border({ width: { top: 1 }, color: '#222733' })
-      .justifyContent(FlexAlign.Center)
-      .alignItems(VerticalAlign.Center)
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#0B0D12')
+    .backgroundColor('#0D0F14')
   }
 }

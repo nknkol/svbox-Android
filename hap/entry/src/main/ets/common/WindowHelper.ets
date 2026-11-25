@@ -23,6 +23,43 @@ export function getSlotWindow(slot: number): window.Window | undefined {
   return slotWindows.get(slot);
 }
 
+export async function arrangeOpenWindows(mode: string): Promise<number> {
+  const wins: window.Window[] = [];
+  slotWindows.forEach((w: window.Window) => {
+    wins.push(w);
+  });
+  if (wins.length === 0) return 0;
+
+  let arranged: number = 0;
+  const startX: number = 80;
+  const startY: number = 72;
+  if (mode === 'cascade') {
+    for (let i: number = 0; i < wins.length; i++) {
+      try {
+        await wins[i].moveWindowTo(startX + i * 56, startY + i * 44);
+        arranged += 1;
+      } catch (_e) {
+      }
+    }
+    return arranged;
+  }
+
+  // Grid / Side-by-side arrangement (MuMu-style)
+  let curX: number = startX;
+  const gap: number = 24;
+  for (let i: number = 0; i < wins.length; i++) {
+    try {
+      const props: window.WindowProperties = wins[i].getWindowProperties();
+      const w: number = props.windowRect.width > 200 ? props.windowRect.width : 820;
+      await wins[i].moveWindowTo(curX, startY);
+      curX += w + gap;
+      arranged += 1;
+    } catch (_e) {
+    }
+  }
+  return arranged;
+}
+
 export function isColorDark(argb: number): boolean {
   const r: number = (argb >>> 16) & 0xff;
   const g: number = (argb >>> 8) & 0xff;

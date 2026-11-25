@@ -890,6 +890,22 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 | **滑动连续帧间隔** | `35–95 ms` | `13–19 ms` | **`6.9–8.33 ms`（锁 120 FPS）** | **`6.7–7.7 ms`（锁 120 FPS）** |
 | **稳定性 & 画面** | 9–12s 闪退 | 0 崩溃 | **0 崩溃 · 100% 像素无撕裂** | **0 崩溃 · 100% 像素无撕裂** |
 
+---
+
+## 第 11 章：鸿蒙设计规范（HarmonyOS PC）+ MuMu 布局 ArkUI 重写与多实例管理
+
+### 11.1 视觉规范与布局重构
+对照华为官方《HarmonyOS 设计指南 — 电脑应用设计 / 色彩 / 圆角参数》及 `mumu/` 参考图，彻底移除硬编码深色 hex 色值，使用官方语义分层色（`$r('sys.color.background_secondary')`、`comp_background_primary`、`brand`、`confirm`、`warning`、`font_primary/secondary/tertiary`、`comp_divider`）及系统圆角体系（`6/12/16/20/24 vp`）重写全量 ArkUI 界面，**自动适配鸿蒙 PC 浅色/深色系统主题**及窗口三键栏主题同步（[EntryAbility.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/entryability/EntryAbility.ets)、[EmulatorWindowAbility.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/entryability/EmulatorWindowAbility.ets)）：
+- **主管理器（[Index.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/Index.ets)）**：采用双分栏架构（`72vp` 左侧图标导航轨「设备 / 应用 / 设置」+ 右侧工作区），顶部工具栏提供 `+ 新建设备`、`批量操作`、`排列窗口`、排序菜单（按编号/时间/名称）及卡片/紧凑列表视图切换；应用中心直接内嵌于主窗，支持搜索、分类过滤与桌面快捷方式管理。
+- **传统模拟器窗口（[EmulatorWindowPage.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/EmulatorWindowPage.ets)）**：参考 MuMu 设备窗，去除冗余底栏，将返回/主页/多任务/拆出独立窗/音量与电源菜单集成至 `40vp` 极简顶栏，最大化 Android 渲染视口面积。
+- **完整弹窗体系**：新建设备（[CreateInstanceDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/CreateInstanceDialog.ets)）、分栏式 9 页签设备设置（[DeviceSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/DeviceSettingsDialog.ets)）、重命名（[RenameDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/RenameDialog.ets)）、备份与还原（[BackupRestoreDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/BackupRestoreDialog.ets)）及全局设置中心（[GlobalSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/GlobalSettingsDialog.ets)）。
+
+### 11.2 原生多实例隔离与存储运维能力
+- **持久化多实例模型（[InstanceModel.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/model/InstanceModel.ets)）**：自动兼容迁移原有默认实例 `#0`（保留 `userdata14` 已有应用与数据），支持一次批量新建 1–5 台独立 Android 14 设备（`instances/<id>` 独立 `/data` 与 `owner.db`）。
+- **C++ Runtime & NAPI 后端（[android_runtime.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)、[napi_init.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/napi_init.cpp)）**：新增 `setInstanceConfig`（隔离数据目录、自定义 DPI、音频开关、ADB Root 开关、自定义机型 `ro.product.*`、自定义 ADB 端口）、实时磁盘占用统计（`getInstanceDiskMb`）、缓存清理（`cleanInstanceCache`）、后台异步复制实例（`cloneInstanceAsync`）、安全删除（`deleteInstanceData`）及 `tar/tar.gz` 异步备份还原（`backupInstanceAsync` / `restoreInstanceAsync`）。
+- **真机验收（`HAD-W32`）**：已完成待机态与 120Hz Vulkan 运行态截屏视觉核验（`2090×1394`），并确认 `Android 14` + `SvboxWmAgent` + `ADB 127.0.0.1:5555` + `Maleoon 916 Vulkan` 全链路正常开机。
+
+
 
 
 

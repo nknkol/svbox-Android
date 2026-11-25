@@ -1,9 +1,9 @@
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import native from 'libentry.so';
 import { findPresetByKey, InstanceConfig, instanceConfigStore, ResolutionPresetItem } from '../common/AppWindowPrefs';
-import { applyImmersiveDecor, registerSlotWindow, unregisterSlotWindow } from '../common/WindowHelper';
+import { applyImmersiveDecor, registerSlotWindow, unregisterSlotWindow, updateDecorButtonTheme } from '../common/WindowHelper';
 
 const TAG: string = 'SvboxEmuWin';
 
@@ -15,11 +15,26 @@ export default class EmulatorWindowAbility extends UIAbility {
     const params = want.parameters;
     const resKey: string = params && typeof params['resolutionKey'] === 'string'
       ? (params['resolutionKey'] as string) : '';
+    const instName: string = params && typeof params['instanceName'] === 'string'
+      ? (params['instanceName'] as string) : '';
+    const instId: string = params && typeof params['instanceId'] === 'string'
+      ? (params['instanceId'] as string) : '';
     if (resKey.length > 0) {
       this.localStorage.setOrCreate<string>('emuResKey', resKey);
     }
+    if (instName.length > 0) {
+      this.localStorage.setOrCreate<string>('emuInstanceName', instName);
+    }
+    if (instId.length > 0) {
+      this.localStorage.setOrCreate<string>('emuInstanceId', instId);
+    }
     this.localStorage.setOrCreate<string>('sandboxTempDir', this.context.tempDir);
     this.localStorage.setOrCreate<string>('sandboxFilesDir', this.context.filesDir);
+  }
+
+  onConfigurationUpdate(newConfig: Configuration): void {
+    const isDark: boolean = newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    updateDecorButtonTheme(this.mainWindow, isDark);
   }
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
@@ -83,11 +98,13 @@ export default class EmulatorWindowAbility extends UIAbility {
         return;
       }
       if (!this.mainWindow) return;
-      const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 38, true);
+      const isDark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 40, isDark);
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', rightAvoid);
+      const title: string = this.localStorage.get<string>('emuInstanceName') ?? 'Android 14 · 默认设备';
       try {
-        this.mainWindow.setWindowTitle('Android 14 · 传统模拟器');
-        this.context.setMissionLabel('Android 14 · 传统模拟器');
+        this.mainWindow.setWindowTitle(title);
+        this.context.setMissionLabel(title);
       } catch (_e) {
       }
     });
