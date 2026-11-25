@@ -38,7 +38,7 @@
 #define MAX_THREADS        4096
 #define MAX_CONNS          4096
 #define HASH_BUCKETS       8192
-#define PROC_MEM_SIZE      (4u * 1024u * 1024u) /* 4 MiB per process (demand-paged memfd) */
+#define PROC_MEM_SIZE      (2u * 1024u * 1024u) /* 2 MiB max backing memfd */
 #define MAX_ALLOCS         1024
 #define INLINE_BLK_HANDLES 16
 
@@ -556,14 +556,17 @@ static void mem_block_release_handles(struct bproc *proc, struct mem_block *blk)
     }
 }
 
-/* Simple first-fit allocator inside proc->mem_base[0..mem_size). */
+/* Simple first-fit allocator inside proc->mem_base[0..usable_size). */
 static int proc_mem_alloc(struct bproc *proc, uint32_t size, uint32_t *out_off, int *out_idx)
 {
     uint32_t need = align8(size < 8 ? 8 : size);
+    uint32_t usable = proc->mem_size;
+    if (proc->guest_map_len > 0 && proc->guest_map_len < usable)
+        usable = (uint32_t)proc->guest_map_len;
     /* Find lowest free gap [cand, cand+need) not overlapping any used block. */
     uint32_t cand = 0;
     for (;;) {
-        if (cand + need > proc->mem_size)
+        if (cand + need > usable)
             return -ENOMEM;
         bool overlap = false;
         for (int i = 0; i < MAX_ALLOCS; i++) {

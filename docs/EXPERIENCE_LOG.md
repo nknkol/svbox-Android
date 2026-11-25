@@ -940,6 +940,21 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   2. **[`svbox-Android/binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L41)**：将每进程按需分页的 `PROC_MEM_SIZE` 从 2 MiB 扩至 **4 MiB**，避免并发大事务碎片化。
   3. **真机实测（`HAD-W32`）**：已重编 `svbox`、`svbox-binderd` 并重新打入 `svbox.hnp` 安装验证；对 114 MB 酷安 APK 走系统 `PackageInstallerActivity` 点击安装/更新及 `pm install -r` 均无卡顿、`NO_MEMORY / OutOfMemoryError / ANR` 计数为 **0**。
 
+### 11.7 根治 Unity/IL2CPP（《月圆之夜》）更新完成卡死（Boehm GC `SIGSEGV`）+ `seccomp-backstop` 热点直通加速 + `binderd` `guest_map_len` 边界修复
+- **现象**：运行《月圆之夜》（Unity 2020.3 IL2CPP）时：① 首次启动较慢；② 走到「更新完成!」（`LoadConfigAndCache:zh-cn`）后画面锁死在 `0/120Hz`。
+- **三项精确根因（从 CrashSight `tomb_*.txt`、`/proc/$pid/maps`、`libil2cpp.so` 反汇编与 `logcat.txt` 完整实证）**：
+  1. **卡死根因（`svbox` `payload_stack` 期间投递异步信号导致 Boehm GC 越界 `SIGSEGV`）**：
+     - 反汇编 `libil2cpp.so` 崩溃 PC（`0x12ae5fc`: `ldr x24, [x20, #16]`，`r24 = 0x3f80050090` 为 `svbox` payload `.text` 返回地址，`r23 = 0x7f46897dd0` 在 64 KiB `payload_stack` 顶部 `0x7f46898000` 下方 560 字节）实证：某 IL2CPP 线程正在 `svbox` `payload_stack` 上执行拦截系统调用时，被 Boehm GC 的 `SIGPWR` 暂停信号打断，导致 `GC_suspend_handler` 把 `stop_info.stack_ptr` 记在了 `payload_stack` 上；随后 `UnityMain` 的 `GC_mark_from` 试图从 `payload_stack` 扫到线程真实 `pthread` 栈顶，跨越 `0x7f46898000` 撞上紧邻的 `---p` 保护页触发 `SEGV_ACCERR`，其余 14 条 IL2CPP 线程永远停在 `do_rt_sigsuspend`，画面停帧 `0/120Hz`。
+  2. **启动慢根因（`svbox/src/loader/backstop.c` BPF 过滤列表过窄）**：
+     - `--no-inline-patch-prefix /data` 下 `backstop_filter()` 仅放行 6 个系统调用，导致 `/data` 原生库中大量本就直通的 `futex`、`clock_gettime`、`nanosleep`、`sched_yield`、`tgkill`、`rt_sigsuspend`、`epoll_pwait`、`ppoll`、`gettid` 等热点调用全部走内核 `SIGSYS` 陷阱。
+  3. **顺手修复的隐藏隐患（`svbox-binderd` `proc_mem_alloc` 未按 `guest_map_len` 钳位）**：
+     - Android `libbinder` 仅映射 `1 MiB - 8 KiB`（`1040384` B），但 `proc_mem_alloc` 原先按 `PROC_MEM_SIZE` 分配，高并发大事务下可能越过进程实际 `mmap` 上界引发 `Parcel::unflattenBinder` `SEGV_MAPERR`。
+- **修复与真机验证（`HAD-W32`）**：
+  1. **[`svbox`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/entry.S)（通用 Linux 机制）**：`payload_stack_claim(guest_sp)` 记录线程真实栈指针；`integrity.c` 对未设 `SA_ONSTACK` 的异步用户信号处理器包装通用汇编跳板 `payload_sig_trampoline`——仅当信号打断 `payload_stack` 时切回真实 `guest_sp`、修补 `uc_mcontext.sp` 并临时挂起 `reentry_guard`，执行完毕无损切回 `rt_sigreturn`；同时移除 `SIGSYS` 的 `SA_ONSTACK`，并在 `backstop.c` 放行 27 个纯直通热点系统调用。
+  2. **[`binderd/svbox_binderd.c`](file:///storage/Users/currentUser/Workspace/svbox-Android/binderd/svbox_binderd.c#L559-L570)**：`proc_mem_alloc()` 严格按 `min(proc->mem_size, proc->guest_map_len)` 分配。
+  3. **真机实测（`HAD-W32`）**：《月圆之夜》顺利越过「更新完成!」与全量 YooAsset 配置加载进入 **`[GameEntrancePanel]` 主入口与登录界面**，`GameManager` 启动加载耗时从 `24.57s` 降至 **`14.20s`**（快 42%），**零 `SIGSEGV` / 零新 tombstone / 零 `system_server` 崩溃**，`hwcomposer` 连续稳定输出 3,900+ 帧。
+
+
 
 
 
