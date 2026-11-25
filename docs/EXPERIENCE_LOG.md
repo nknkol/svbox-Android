@@ -920,6 +920,17 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   2. **[`napi_init.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/napi_init.cpp) / [`DeviceSettingsDialog.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/DeviceSettingsDialog.ets) / [`Index.ets`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/pages/Index.ets)**：`CleanInstanceCacheNapi` 运行态禁止清理同一运行中实例（返回 `-1.0`），移除对系统级 `/data/cache` 的清空，仅安全清理 `/data/tombstones`、`/data/anr`、`/data/system/dropbox` 及 `/data/data/*/cache`、`code_cache`；UI 侧在设备运行中禁用「立即清理 / 磁盘清理」并给出明确提示。
 - **真机实测（`HAD-W32`）**：重编 `svbox-netd`、HAP 与 `svbox.hnp` 安装验证，Android 14 秒进桌面（`sys.boot_completed=1`、`Starting phase 1000`、`QuickstepLauncher`、`SvboxWmAgent`、`ADB 127.0.0.1:5555` 全部在线），`StatsCompanionService` 零报错，已装应用（酷安/贴吧/CPU Info）100% 保留。
 
+### 11.5 修复 Android 内 CPU 拓扑探测（`Cores: 1 / ARM Neon: No` → `Cores: 8 / ARM Neon: Yes`）与 `--cpuset` 档位大小写匹配
+- **现象**：在 Android 14 内运行 `CPU Info`（底层使用 PyTorch/Meta `libcpuinfo`）显示 `Cores: 1`、`ARM Neon: No`，且日志刷屏 `getMinMaxFreq() - cannot read file`；同时 `ps` 发现 `Performance` 档位未下发 `--cpuset`。
+- **双根因**：
+  1. **HAP 沙箱拦截宿主 `/sys` 且未挂载 `/sys/devices/system/cpu`**：容器虽然真实跑在 8 核 ARM64（`nproc=8`、`/proc/cpuinfo` 具备 `fp asimd ... sve`、`AT_HWCAP=0xffffffff`），但 `libcpuinfo` 的 `cpuinfo_initialize()` 第一步读取 `/sys/devices/system/cpu/{possible,present,kernel_max}` 即返回 `ENOENT` 并提前中止，未进入 `/proc/cpuinfo` 解析与 `cpuinfo_isa.neon` 置位，导致同时误报 `Cores: 1` 与 `ARM Neon: No`。
+  2. **[`ohos_bridge/src/sched_qos.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/ohos_bridge/src/sched_qos.cpp)**：`ResolveCpuset()` 仅匹配小写 `"perf"/"balanced"/"eco"`，而新 UI 传入 `"Performance"/"Balanced"/"Eco"` 导致返回空字符串、未下发 `--cpuset`。
+- **修复与实机验收**：
+  1. [`ohos_bridge/src/sched_qos.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/ohos_bridge/src/sched_qos.cpp#L262-L303)：统一小写归一化并兼容 `"perf"/"performance"`、`"balanced"`、`"eco"`，默认大核兜底。
+  2. [`hap/entry/src/main/cpp/android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp#L270-L410)：每次启动按实际 `--cpuset` 核数动态生成完整 `/sys/devices/system/cpu` 目录树（`possible/present/online/kernel_max`、`cpu0..N-1/{online,topology/*,cpufreq/*,cache/index0..3/*}`）并挂载进容器，同步从宿主 `/proc/cpuinfo` 读取 `Hardware` 写入 `ro.soc.{manufacturer,model}`、`ro.hardware.chipname`、`ro.board.platform`。
+  3. **真机实测（`HAD-W32`）**：`CPU Info` 实时界面恢复显示 **`Cores: 8`**、**`ARM Neon: Yes`**、8 核 L1d/L1i Cache 及 **`Core 0–7: 2.32 GHz`**，`ro.soc.model=KirinX90`，`logcat` 零 `getMinMaxFreq` 报错。
+
+
 
 
 

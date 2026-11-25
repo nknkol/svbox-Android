@@ -268,8 +268,13 @@ std::string ResolveCpuset(const std::string& profile,
     if (!customCpuset.empty()) {
         return customCpuset;
     }
+    std::string p;
+    p.reserve(profile.size());
+    for (unsigned char ch : profile) {
+        p.push_back(static_cast<char>(ch >= 'A' && ch <= 'Z' ? (ch - 'A' + 'a') : ch));
+    }
     CoreTopology topo = GetCoreTopology();
-    if (profile == "eco") {
+    if (p == "eco") {
         if (outNice) *outNice = 10;
         if (outSched) *outSched = "batch";
         if (topo.probed && !topo.littleCores.empty()) {
@@ -277,7 +282,7 @@ std::string ResolveCpuset(const std::string& profile,
         }
         return "0-3";
     }
-    if (profile == "balanced") {
+    if (p == "balanced") {
         if (topo.probed && !topo.mediumCores.empty()) {
             std::vector<int32_t> pick = topo.mediumCores;
             if (pick.size() > 6) pick.resize(6);
@@ -285,13 +290,16 @@ std::string ResolveCpuset(const std::string& profile,
         }
         return "4-9";
     }
-    if (profile == "perf") {
+    if (p == "perf" || p == "performance" || p.empty()) {
         if (topo.probed && !topo.bigCores.empty()) {
             return FormatCpuList(topo.bigCores);
         }
         return "12-19";
     }
-    return "";
+    if (topo.probed && !topo.bigCores.empty()) {
+        return FormatCpuList(topo.bigCores);
+    }
+    return "12-19";
 }
 
 Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {

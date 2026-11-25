@@ -267,6 +267,149 @@ void RemoveDirRecursive(const std::string& path) {
     rmdir(path.c_str());
 }
 
+int CountCpusetCores(const std::string& spec) {
+    if (spec.empty()) return 8;
+    int count = 0;
+    size_t i = 0;
+    while (i < spec.size()) {
+        while (i < spec.size() && (spec[i] == ',' || spec[i] == ' ' || spec[i] == '\t')) ++i;
+        if (i >= spec.size()) break;
+        int a = 0;
+        bool hasA = false;
+        while (i < spec.size() && spec[i] >= '0' && spec[i] <= '9') {
+            a = a * 10 + (spec[i] - '0');
+            hasA = true;
+            ++i;
+        }
+        if (!hasA) {
+            while (i < spec.size() && spec[i] != ',') ++i;
+            continue;
+        }
+        if (i < spec.size() && spec[i] == '-') {
+            ++i;
+            int b = 0;
+            bool hasB = false;
+            while (i < spec.size() && spec[i] >= '0' && spec[i] <= '9') {
+                b = b * 10 + (spec[i] - '0');
+                hasB = true;
+                ++i;
+            }
+            if (hasB && b >= a) {
+                count += (b - a + 1);
+            } else {
+                count += 1;
+            }
+        } else {
+            count += 1;
+        }
+    }
+    if (count < 1) return 8;
+    if (count > 32) return 32;
+    return count;
+}
+
+std::string ReadHostHardwareName() {
+    int fd = open("/proc/cpuinfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return "ARMv8";
+    std::string content;
+    char buf[4096];
+    ssize_t n = 0;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, static_cast<size_t>(n));
+        if (content.size() > 65536) break;
+    }
+    close(fd);
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t nl = content.find('\n', pos);
+        if (nl == std::string::npos) nl = content.size();
+        std::string line = content.substr(pos, nl - pos);
+        if (line.rfind("Hardware", 0) == 0) {
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string val = line.substr(colon + 1);
+                size_t s = val.find_first_not_of(" \t\r\n");
+                size_t e = val.find_last_not_of(" \t\r\n");
+                if (s != std::string::npos && e != std::string::npos && e >= s) {
+                    return val.substr(s, e - s + 1);
+                }
+            }
+        }
+        pos = nl + 1;
+    }
+    return "ARMv8";
+}
+
+void StageSyntheticSysCpu(const std::string& sysCpuDir, int cpuCount, const std::string& profile) {
+    RemoveDirRecursive(sysCpuDir);
+    MkdirP(sysCpuDir);
+    if (cpuCount < 1) cpuCount = 1;
+    if (cpuCount > 32) cpuCount = 32;
+    const std::string range = (cpuCount == 1) ? "0" : ("0-" + std::to_string(cpuCount - 1));
+    const std::string rangeNl = range + "\n";
+    WriteFile(sysCpuDir + "/possible", rangeNl);
+    WriteFile(sysCpuDir + "/present", rangeNl);
+    WriteFile(sysCpuDir + "/online", rangeNl);
+    WriteFile(sysCpuDir + "/kernel_max", std::to_string(cpuCount - 1) + "\n");
+
+    std::string p;
+    p.reserve(profile.size());
+    for (unsigned char ch : profile) {
+        p.push_back(static_cast<char>(ch >= 'A' && ch <= 'Z' ? (ch - 'A' + 'a') : ch));
+    }
+    const char* maxKhz = "2320000\n";
+    if (p == "balanced") maxKhz = "2010000\n";
+    else if (p == "eco") maxKhz = "2050000\n";
+
+    for (int i = 0; i < cpuCount; ++i) {
+        const std::string idx = std::to_string(i);
+        const std::string cdir = sysCpuDir + "/cpu" + idx;
+        MkdirP(cdir + "/topology");
+        MkdirP(cdir + "/cpufreq");
+        MkdirP(cdir + "/cache/index0");
+        MkdirP(cdir + "/cache/index1");
+        MkdirP(cdir + "/cache/index2");
+        MkdirP(cdir + "/cache/index3");
+
+        WriteFile(cdir + "/online", "1\n");
+        WriteFile(cdir + "/topology/physical_package_id", "0\n");
+        WriteFile(cdir + "/topology/core_id", idx + "\n");
+        WriteFile(cdir + "/topology/core_siblings_list", rangeNl);
+        WriteFile(cdir + "/topology/thread_siblings_list", idx + "\n");
+
+        WriteFile(cdir + "/cpufreq/cpuinfo_min_freq", "418000\n");
+        WriteFile(cdir + "/cpufreq/scaling_min_freq", "418000\n");
+        WriteFile(cdir + "/cpufreq/cpuinfo_max_freq", maxKhz);
+        WriteFile(cdir + "/cpufreq/scaling_max_freq", maxKhz);
+        WriteFile(cdir + "/cpufreq/scaling_cur_freq", maxKhz);
+
+        // L1d (64K), L1i (64K), L2 (512K per core), L3 (8192K shared)
+        WriteFile(cdir + "/cache/index0/level", "1\n");
+        WriteFile(cdir + "/cache/index0/type", "Data\n");
+        WriteFile(cdir + "/cache/index0/size", "64K\n");
+        WriteFile(cdir + "/cache/index0/coherency_line_size", "64\n");
+        WriteFile(cdir + "/cache/index0/shared_cpu_list", idx + "\n");
+
+        WriteFile(cdir + "/cache/index1/level", "1\n");
+        WriteFile(cdir + "/cache/index1/type", "Instruction\n");
+        WriteFile(cdir + "/cache/index1/size", "64K\n");
+        WriteFile(cdir + "/cache/index1/coherency_line_size", "64\n");
+        WriteFile(cdir + "/cache/index1/shared_cpu_list", idx + "\n");
+
+        WriteFile(cdir + "/cache/index2/level", "2\n");
+        WriteFile(cdir + "/cache/index2/type", "Unified\n");
+        WriteFile(cdir + "/cache/index2/size", "512K\n");
+        WriteFile(cdir + "/cache/index2/coherency_line_size", "64\n");
+        WriteFile(cdir + "/cache/index2/shared_cpu_list", idx + "\n");
+
+        WriteFile(cdir + "/cache/index3/level", "3\n");
+        WriteFile(cdir + "/cache/index3/type", "Unified\n");
+        WriteFile(cdir + "/cache/index3/size", "8192K\n");
+        WriteFile(cdir + "/cache/index3/coherency_line_size", "64\n");
+        WriteFile(cdir + "/cache/index3/shared_cpu_list", rangeNl);
+    }
+}
+
 struct OwnerHdr {
     char magic[8];
     uint32_t capacity;
@@ -1176,6 +1319,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/cgroup:/sys/fs/cgroup",
         "-v", runBase_ + "/sys_fs_bpf:/sys/fs/bpf",
         "-v", runBase_ + "/sys_power:/sys/power",
+        "-v", runBase_ + "/sys_cpu:/sys/devices/system/cpu",
         "-v", runBase_ + "/cpuset:/dev/cpuset",
         "-v", runBase_ + "/stune:/dev/stune",
         "-v", runBase_ + "/mnt:/mnt",
@@ -2143,7 +2287,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Rebuild ephemeral overlay upper + injection layer + linkerconfig cleanly on every boot
     // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
     // Forget any owner.db entries for ephemeral trees before deleting them on the host.
-    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig" });
+    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig", runBase_ + "/sys_cpu" });
     RemoveDirRecursive(rootUpper_);
     MkdirP(rootUpper_);
     RemoveDirRecursive(injectLayer_);
@@ -2244,11 +2388,22 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         chmod(p.c_str(), 0644);
     }
 
+    std::string activeCpusetSnap;
+    std::string profileSnap;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        activeCpusetSnap = activeCpuset_;
+        profileSnap = profile_;
+    }
+    const int stagedCpuCount = CountCpusetCores(activeCpusetSnap);
+    const std::string stagedCpuRange = (stagedCpuCount <= 1) ? "0" : ("0-" + std::to_string(stagedCpuCount - 1));
+    StageSyntheticSysCpu(runBase_ + "/sys_cpu", stagedCpuCount, profileSnap);
+
     for (const char* sub : { "", "/foreground", "/background", "/system-background", "/top-app" }) {
         const std::string base = runBase_ + "/cpuset" + sub;
         WriteFile(base + "/tasks", "");
         WriteFile(base + "/cgroup.procs", "");
-        WriteFile(base + "/cpus", "0-7\n");
+        WriteFile(base + "/cpus", stagedCpuRange + "\n");
         WriteFile(base + "/mems", "0\n");
     }
 
@@ -2294,6 +2449,21 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     if (!devModelSnap.empty()) {
         deviceProps += "ro.product.model=" + devModelSnap + "\n";
     }
+    const std::string hostHw = ReadHostHardwareName();
+    std::string socManuf = "ARM";
+    std::string socModel = hostHw;
+    {
+        size_t sp = hostHw.find(' ');
+        if (sp != std::string::npos && sp > 0 && sp + 1 < hostHw.size()) {
+            socManuf = hostHw.substr(0, sp);
+            socModel = hostHw.substr(sp + 1);
+        }
+    }
+    deviceProps += "ro.soc.manufacturer=" + socManuf + "\n";
+    deviceProps += "ro.soc.model=" + socModel + "\n";
+    deviceProps += "ro.hardware.chipname=" + hostHw + "\n";
+    deviceProps += "ro.board.platform=" + socModel + "\n";
+    deviceProps += "ro.product.board=" + socModel + "\n";
     const std::string overrideProp = runBase_ + "/override.prop";
     std::string gpuProps;
     if (useGfx) {
