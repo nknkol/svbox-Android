@@ -980,6 +980,21 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   3. **真机实测（`HAD-W32`）**：重编 `svbox`、`svbox-netd` 并重新打入 `svbox.hnp` 安装验证：《王者荣耀》**`+4.81s` 完成 `Fully drawn`**，顺利通过 `StartUnity`、`Sgame UnityReady1` 与 Maleoon 916 GLES 3.2 渲染初始化，进入「下载推荐 / 资源更新（3258MB）」3D 动态主界面，稳定 `30 FPS`（`avg=33.33ms`），**`SIGILL` / `ANR` / `CreatePath failed!` 全部清零**。
   4. **附带观测（独立于无响应问题）**：进入游戏更新界面持续运行约 15–25s 后，游戏自身安全模块线程（`libtersafe.so`）会主动向自身进程发送 `kill(getpid(), SIGKILL)` 退出（已通过 `svbox` 系统调用实测确认发送方为 `sgame` 自身线程，非容器崩溃或 ANR）。
 
+### 11.10 纯 Seccomp 模式（`--no-inline-patch` + BPF `fast_io`）底层语义修复与容器拦截模式切换（2026-11-25）
+
+- **背景与目标**：
+  - 为兼顾应用代码段零改写与热路径 I/O 性能，在 Layer 1 `svbox` 完善全局 `--no-inline-patch`（跳过 `prog`/`linker64` 及所有映射 `.so` 的 `svc #0` 内联补丁）+ BPF 热路径直通，并在 Layer 2 `svbox-Android` 容器运行时开放实例级「系统调用拦截模式」（`自适应 / 纯净模式 / 混合模式`，默认 `自适应`）。
+- **Layer 1 `svbox` 通用 Linux 修复（零 Android/游戏硬编码）**：
+  1. **BPF 热路径扩展（[`backstop.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/backstop.c) & [`main.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/main.c)）**：非 `--isolate` / 非 `--lazy-layer` 模式下，在 BPF 中直接 `ALLOW` `lseek/read/write/readv/writev/pread64/pwrite64`，并对 `rseq (293)` / `clone3 (435)` 直接返回 `SECCOMP_RET_ERRNO(ENOSYS)`，消除 ~98% 渲染与资产读写热路径的 `SIGSYS` 陷入开销。
+  2. **`rt_sigaction` `sa_mask` 去除 `SIGSYS`（[`integrity.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/integrity.c)）**：对所有 `rt_sigaction`（含同步故障信号 `SIGSEGV`/`SIGABRT`/`SIGILL` 等）剥离 `sa_mask` 中的 `SIGSYS` 位，避免使用 `sigfillset()` 的信号处理器在运行期屏蔽 `SIGSYS` 触发内核直接 `SIGSYS` 终止。
+  3. **`rt_sigprocmask` 同步回写 `ucontext->uc_sigmask`（[`backstop.c`](file:///storage/Users/currentUser/Workspace/svbox/src/loader/backstop.c)）**：在 `SIGSYS` 处理器内执行 `rt_sigprocmask` 后，必须将新的内核信号掩码写回 `uc->uc_sigmask`（保持 `SIGSYS` 放开），否则返回时的 `rt_sigreturn` 会用旧 `uc_sigmask` 覆盖掉刚刚生效的信号屏蔽（此前导致依赖 `SIGRTMIN` 屏蔽的 Bionic POSIX timer 如 `com.android.bluetooth` 被 `signal 32` 杀掉）。
+  4. **破坏性 `madvise` 避开当前活跃栈帧（[`syscall_disp.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/syscall_disp.c)）**：部分运行时（如 ART `Thread::InstallImplicitProtection()`）会对当前栈下方执行 `madvise(MADV_DONTNEED)` 仅保留 1 页（4 KiB）裕量；在纯 seccomp 模式下，AArch64 内核 `SIGSYS` 压入的 `rt_sigframe` + `pt_regs` 约 5 KiB，会落入该区间被清零，导致返回 `entry.S` 时从全 0 帧弹出 `x0..x30=0, pc=0` 触发 `SIGSEGV`。现对破坏性 `madvise` 自动拆分区间，跳过 `[page_down(regs), page_up(regs + 12 KiB))`，其余栈页正常回收。
+  5. **`/proc/self/maps` 虚拟化补全（[`hook_runtime.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/hook_runtime.c)、[`net_stack.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/net_stack.c)、[`vdev.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vdev.c)、[`vfs_procfs.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_procfs.c)）**：内部 `sv_net_state` memfd 通过 `hook_note_internal` 隐藏；`vdev` 映射（如 `/dev/binder`）通过 `vma_track_add_guest` 在 `/proc/self/maps` 中还原为真实客体设备路径而非 `/memfd:svbox-binder (deleted)`。
+- **Layer 2 `svbox-Android` 运行时设置与实测（`HAD-W32`）**：
+  - 在 `InstanceModel.ets`、`DeviceSettingsDialog.ets`、`napi_init.cpp`、`android_runtime.{h,cpp}` 接入实例级 `syscallMode`（默认 `adaptive`：守护进程保内联补丁、`zygote64` 及全部应用纯 seccomp；另支持 `pure_seccomp` 全局纯 seccomp 与 `hybrid` 仅 `/data` 纯 seccomp），持久化并展示在「设备设置 -> 性能」与「诊断」页。
+  - **真机实测**：`adaptive` 模式下 Android 14 冷启动至桌面约 **7s**，《王者荣耀》**`Displayed +2.89s`、`Fully drawn +4.85s`**（与混合模式 `+4.81s` 仅差 40ms），稳态渲染 **`avg=33.38–33.44ms`（稳态 30 FPS，零帧率损耗）**；另确认《王者荣耀》在零代码段改写下仍会于 15–25s 后因综合非真机环境特征（如 `userdebug/test-keys`、硬件/属性差异、seccomp 状态等）由自身安全线程发 `SIGKILL` 退出。
+
+
 
 
 

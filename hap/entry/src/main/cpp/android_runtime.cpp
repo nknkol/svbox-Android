@@ -930,6 +930,18 @@ std::string AndroidRuntime::GpuMode() const {
     return running_.load() ? activeGpuMode_ : gpuMode_;
 }
 
+void AndroidRuntime::SetSyscallMode(const std::string& syscallMode) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (syscallMode == "adaptive" || syscallMode == "pure_seccomp" || syscallMode == "hybrid") {
+        syscallMode_ = syscallMode;
+    }
+}
+
+std::string AndroidRuntime::SyscallMode() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return running_.load() ? activeSyscallMode_ : syscallMode_;
+}
+
 bool AndroidRuntime::UseGfxstream() const {
     std::lock_guard<std::mutex> lk(mu_);
     const std::string& m = running_.load() ? activeGpuMode_ : gpuMode_;
@@ -1237,11 +1249,13 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
     std::string cpuset;
     int32_t niceVal = 0x7fffffff;
     std::string schedPol;
+    std::string syscallMode;
     {
         std::lock_guard<std::mutex> lk(mu_);
         cpuset = activeCpuset_;
         niceVal = activeNice_;
         schedPol = activeSched_;
+        syscallMode = activeSyscallMode_;
     }
     uint32_t memMb = memLimitMb_.load();
     uint32_t diskMb = diskLimitMb_.load();
@@ -1255,8 +1269,16 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--cap-add", "ALL",
         "--seccomp-backstop",
         "--trap-sigsys",
-        "--no-inline-patch-prefix", "/data",
-        "--no-inline-patch-prefix", "/data_mirror",
+    };
+    if (syscallMode == "pure_seccomp") {
+        args.push_back("--no-inline-patch");
+    } else {
+        args.push_back("--no-inline-patch-prefix");
+        args.push_back("/data");
+        args.push_back("--no-inline-patch-prefix");
+        args.push_back("/data_mirror");
+    }
+    args.insert(args.end(), {
         "--deny-memfd-prefix", "jit-",
         "--kernel-sysname", "Linux",
         "--kernel-release", "5.15.0-android14",
@@ -1265,7 +1287,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--emulate-bpf",
         "--mount-scratch", runBase_ + "/tmpfs",
         "--owner-db", dataBase_ + "/owner.db",
-    };
+    });
     if (!cpuset.empty()) {
         args.push_back("--cpuset");
         args.push_back(cpuset);
@@ -1619,12 +1641,13 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     displayW_.store(width);
     displayH_.store(height);
 
-    // Resolve active cpuset/nice/sched and GPU mode
+    // Resolve active cpuset/nice/sched, GPU mode, and syscall interception mode
     std::string chosenGpu;
     {
         std::lock_guard<std::mutex> lk(mu_);
         activeCpuset_ = SchedQos::ResolveCpuset(profile_, customCpuset_, &activeNice_, &activeSched_);
         activeGpuMode_ = gpuMode_;
+        activeSyscallMode_ = syscallMode_;
         chosenGpu = activeGpuMode_;
     }
 
@@ -2417,11 +2440,13 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     WriteFile(runBase_ + "/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
 
     std::string gpuModeSnap;
+    std::string syscallModeSnap;
     OHNativeWindow* winSnap = nullptr;
     int32_t winWSnap = 0, winHSnap = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         gpuModeSnap = activeGpuMode_;
+        syscallModeSnap = activeSyscallMode_;
         winSnap = surfaceWindow_;
         winWSnap = surfaceW_;
         winHSnap = surfaceH_;
@@ -2562,7 +2587,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         OH_LOG_INFO(LOG_APP, "%{public}s", s.c_str());
     };
     logLine("BootWorker start: runBase=" + runBase_ + " dataBase=" + dataBase_ +
-            " mode=" + mode + " gpu=" + gpuModeSnap +
+            " mode=" + mode + " gpu=" + gpuModeSnap + " syscall=" + syscallModeSnap +
             " svbox=" + svboxPath_ + " binderd=" + binderd + " rootfs=" + rootfs_ +
             " gpuGuest=" + gpuGuestDir_ + " shareHost=" + shareHostDir_);
     const std::string rootfsTar = androidDir_ + "/rootfs14.tar";
@@ -2781,6 +2806,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 break;
             }
             if (guestCmd[i] == "-e" && i + 1 < guestCmd.size()) {
+                args.push_back(guestCmd[i]);
+                args.push_back(guestCmd[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (guestCmd[i] == "--no-inline-patch") {
+                args.push_back(guestCmd[i]);
+                i += 1;
+                continue;
+            }
+            if (guestCmd[i] == "--no-inline-patch-prefix" && i + 1 < guestCmd.size()) {
                 args.push_back(guestCmd[i]);
                 args.push_back(guestCmd[i + 1]);
                 i += 2;
@@ -3029,13 +3065,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         ForgetOwnerDbTree(dataBase_ + "/owner.db", { sockDir, propDir });
 
-        std::vector<std::string> zygCmd = {
+        std::vector<std::string> zygCmd;
+        if (syscallModeSnap == "adaptive") {
+            zygCmd.push_back("--no-inline-patch");
+        }
+        zygCmd.insert(zygCmd.end(), {
             "-e", "ANDROID_SOCKET_zygote=" + std::to_string(zfd),
             "-e", "ANDROID_SOCKET_usap_pool_primary=" + std::to_string(ufd),
             "system/bin/app_process64",
             "-Xzygote", "/system/bin",
             "--zygote", "--start-system-server", "--socket-name=zygote"
-        };
+        });
         runSvbox("zygote64", zygCmd, true, { zfd, ufd });
         SetStatus("Booting Full Android 14 (" + std::to_string(width) + "x" + std::to_string(height) +
                   "@" + std::to_string(targetHz) + "Hz · Zygote64 -> system_server -> Launcher3)...");

@@ -22,6 +22,8 @@ import {
   DeviceModelPreset,
   formatDiskSize,
   formatGpuModeLabel,
+  formatSyscallModeLabel,
+  normalizeSyscallMode,
   profileToCpuCores
 } from '../model/InstanceModel';
 
@@ -64,6 +66,7 @@ export struct DeviceSettingsSheet {
   @State private draftCpuCores: number = 4;
   @State private draftMemMb: number = 4096;
   @State private draftGpuMode: string = 'vulkan';
+  @State private draftSyscallMode: string = 'adaptive';
   @State private draftRefreshRate: number = 120;
   @State private draftRunMode: string = 'emulator';
   @State private draftDeviceType: string = 'phone';
@@ -103,6 +106,7 @@ export struct DeviceSettingsSheet {
       this.draftCpuCores = this.instance.cpuCores;
       this.draftMemMb = this.instance.memLimitMb;
       this.draftGpuMode = this.instance.gpuMode;
+      this.draftSyscallMode = normalizeSyscallMode(this.instance.syscallMode);
       this.draftRefreshRate = this.instance.refreshRate;
       this.draftRunMode = this.instance.runMode;
       this.draftDeviceType = this.instance.deviceType;
@@ -173,6 +177,7 @@ export struct DeviceSettingsSheet {
       this.draftCpuCores = 4;
       this.draftMemMb = 4096;
       this.draftGpuMode = 'vulkan';
+      this.draftSyscallMode = 'adaptive';
       this.draftRefreshRate = 120;
       this.draftRunMode = 'emulator';
       this.draftDeviceType = 'phone';
@@ -202,6 +207,7 @@ export struct DeviceSettingsSheet {
     next.cpuCores = this.draftCpuCores;
     next.memLimitMb = this.draftMemMb;
     next.gpuMode = this.draftGpuMode;
+    next.syscallMode = normalizeSyscallMode(this.draftSyscallMode);
     next.refreshRate = this.draftRefreshRate;
     next.runMode = this.draftRunMode;
     next.deviceType = this.draftDeviceType;
@@ -424,6 +430,45 @@ export struct DeviceSettingsSheet {
         .alignItems(VerticalAlign.Center)
 
         Text('Vulkan 模式采用宿主 Maleoon 硬件直通与异步提交管线，可流畅运行 120Hz 高帧率应用')
+          .fontSize(FontSize.MICRO)
+          .fontColor($r('sys.color.font_tertiary'))
+      }
+      .width('100%')
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+      .alignItems(HorizontalAlign.Start)
+
+      Column({ space: Spacing.MD }) {
+        Text('系统调用拦截模式')
+          .fontSize(FontSize.BODY_MD)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_secondary'))
+
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
+          this.optionPill('自适应（推荐）', this.draftSyscallMode === 'adaptive', () => {
+            this.draftSyscallMode = 'adaptive';
+          })
+          this.optionPill('纯净模式', this.draftSyscallMode === 'pure_seccomp', () => {
+            this.draftSyscallMode = 'pure_seccomp';
+          })
+          this.optionPill('混合模式', this.draftSyscallMode === 'hybrid', () => {
+            this.draftSyscallMode = 'hybrid';
+          })
+        }
+        .width('100%')
+
+        Text(
+          this.draftSyscallMode === 'pure_seccomp'
+            ? '纯净模式：所有容器进程均采用纯 seccomp 拦截 + BPF 热路径直通，完全不修改任何可执行代码段（重启后生效）'
+            : (this.draftSyscallMode === 'hybrid'
+              ? '混合模式：系统库使用内联补丁加速，仅第三方应用库（/data）走纯 seccomp（重启后生效）'
+              : '自适应：系统守护进程保留内联补丁，Zygote 与全部 Android 应用采用纯 seccomp + BPF 直通，兼顾代码段纯净度与帧率（重启后生效）')
+        )
           .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
@@ -957,6 +1002,7 @@ export struct DeviceSettingsSheet {
         this.diagRow('容器状态', this.diagStatus && this.diagStatus.running ? `运行中 (${this.diagStatus.statusText})` : '未开机')
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
         this.diagRow('渲染后端', this.diagStatus ? `${formatGpuModeLabel(this.diagStatus.gpuMode)} · ${this.diagStatus.gpuRenderer}` : 'Maleoon Vulkan')
+        this.diagRow('系统调用模式', this.diagStatus ? `${formatSyscallModeLabel(this.diagStatus.syscallMode)} (${this.diagStatus.syscallMode})` : '自适应')
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
         this.diagRow('显示画布', this.diagStatus ? `${this.diagStatus.width}×${this.diagStatus.height} @ ${this.diagStatus.fps}/${this.diagStatus.refreshRate}Hz` : '-')
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)

@@ -300,6 +300,17 @@ napi_value SetGpuModeNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value SetSyscallModeNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string syscallMode = argc > 0 ? GetStringArg(env, args[0]) : "adaptive";
+    AndroidRuntime::Instance().SetSyscallMode(syscallMode);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
 napi_value SetRefreshRateNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {};
@@ -1106,6 +1117,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setI32("activeProcs", static_cast<int32_t>(tel.activeProcs));
     setStr("profile", rt.Profile());
     setStr("gpuMode", rt.GpuMode());
+    setStr("syscallMode", rt.SyscallMode());
     setStr("gpuRenderer", useGfx ? gfx.RendererName() : "SwiftShader (CPU)");
     setStr("cpuset", rt.ActiveCpuset());
     setStr("topology", topo.summary);
@@ -1136,6 +1148,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "listBackupFiles", nullptr, ListBackupFilesNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "ensureDir", nullptr, EnsureDirNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setGpuMode", nullptr, SetGpuModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSyscallMode", nullptr, SetSyscallModeNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRefreshRate", nullptr, SetRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setDisplayRefreshRate", nullptr, SetDisplayRefreshRateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setDisplayVisible", nullptr, SetDisplayVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

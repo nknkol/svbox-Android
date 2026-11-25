@@ -37,6 +37,7 @@ export interface DeviceInstance {
   dpi: number;
   refreshRate: number;     // 60 | 90 | 120
   gpuMode: string;         // 'vulkan' | 'gles' | 'swiftshader'
+  syscallMode: string;     // 'adaptive' | 'pure_seccomp' | 'hybrid'
   profile: string;         // 'Performance' | 'Balanced' | 'Eco'
   cpuCores: number;        // 2 | 4 | 6 | 8
   memLimitMb: number;      // 2048 | 4096 | 6144 | 8192
@@ -108,6 +109,7 @@ export function cloneInstanceRecord(src: DeviceInstance): DeviceInstance {
     dpi: src.dpi,
     refreshRate: src.refreshRate,
     gpuMode: src.gpuMode,
+    syscallMode: normalizeSyscallMode(src.syscallMode),
     profile: src.profile,
     cpuCores: src.cpuCores,
     memLimitMb: src.memLimitMb,
@@ -144,6 +146,19 @@ export function formatGpuModeLabel(gpuMode: string): string {
   return 'CPU 软渲';
 }
 
+export function normalizeSyscallMode(mode: string | undefined): string {
+  if (mode === 'pure_seccomp' || mode === 'hybrid' || mode === 'adaptive') {
+    return mode;
+  }
+  return 'adaptive';
+}
+
+export function formatSyscallModeLabel(mode: string): string {
+  if (mode === 'pure_seccomp') return '纯净模式';
+  if (mode === 'hybrid') return '混合模式';
+  return '自适应';
+}
+
 export function formatDiskSize(mb: number): string {
   if (mb <= 0.05) return '未初始化';
   if (mb >= 1024) {
@@ -178,6 +193,7 @@ class InstanceManagerStore {
       dpi: computeDpiForSize(preset.w, preset.h),
       refreshRate: legacy.refreshRate === 120 ? 120 : (legacy.refreshRate === 90 ? 90 : 60),
       gpuMode: legacy.gpuMode,
+      syscallMode: 'adaptive',
       profile: legacy.profile,
       cpuCores: profileToCpuCores(legacy.profile),
       memLimitMb: 4096,
@@ -211,7 +227,7 @@ class InstanceManagerStore {
           fileIo.closeSync(f);
           const parsed: PersistedStateV2 = JSON.parse(buffer.from(ab).toString('utf-8')) as PersistedStateV2;
           if (parsed && Array.isArray(parsed.instances) && parsed.instances.length > 0) {
-            this.instances = parsed.instances;
+            this.instances = parsed.instances.map((item: DeviceInstance): DeviceInstance => cloneInstanceRecord(item));
             this.nextIndex = parsed.nextIndex > 0 ? parsed.nextIndex : parsed.instances.length;
             if (parsed.globalSettings) {
               const def: GlobalSettings = defaultGlobalSettings();
@@ -332,6 +348,7 @@ class InstanceManagerStore {
         dpi: dpi,
         refreshRate: opts.refreshRate,
         gpuMode: opts.gpuMode,
+        syscallMode: 'adaptive',
         profile: profile,
         cpuCores: cpuCores,
         memLimitMb: memMb,

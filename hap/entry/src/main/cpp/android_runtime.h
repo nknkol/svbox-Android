@@ -43,6 +43,8 @@ public:
     std::string ShareHostDir() const;
     void SetGpuMode(const std::string& gpuMode);
     std::string GpuMode() const;
+    void SetSyscallMode(const std::string& syscallMode);
+    std::string SyscallMode() const;
     bool UseGfxstream() const;
     void SetRefreshRate(int32_t hz);
     int32_t RefreshRate() const { return refreshRate_.load(); }
@@ -100,6 +102,8 @@ private:
     std::string profile_ = "perf";
     std::string gpuMode_ = "vulkan";
     std::string activeGpuMode_ = "vulkan";
+    std::string syscallMode_ = "adaptive";
+    std::string activeSyscallMode_ = "adaptive";
     std::string activeInstanceId_ = "inst_0";
     std::string dataSubdir_ = "userdata14";
     std::string deviceBrand_;

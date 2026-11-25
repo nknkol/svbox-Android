@@ -17,6 +17,7 @@ export interface RuntimeStatus {
   activeProcs: number;
   profile: string;
   gpuMode: string;
+  syscallMode: string;
   gpuRenderer: string;
   cpuset: string;
   topology: string;
@@ -80,6 +81,7 @@ export const restoreInstanceAsync: (
 export const listBackupFiles: (backupDir: string) => string[];
 export const ensureDir: (path: string) => boolean;
 export const setGpuMode: (gpuMode: string) => boolean;
+export const setSyscallMode: (syscallMode: string) => boolean;
 export const setRefreshRate: (hz: number) => boolean;
 export const setDisplayRefreshRate: (slot: number, hz: number) => boolean;
 export const setPaused: (paused: boolean) => string;

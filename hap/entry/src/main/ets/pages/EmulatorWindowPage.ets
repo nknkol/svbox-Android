@@ -104,6 +104,7 @@ struct EmulatorWindowPage {
         );
         native.setResourceConfig(inst.profile, '', inst.memLimitMb);
         native.setGpuMode(inst.gpuMode);
+        native.setSyscallMode(inst.syscallMode || 'adaptive');
         native.setRefreshRate(inst.refreshRate);
         this.statusText = native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', inst.width, inst.height);
       } catch (_e) {

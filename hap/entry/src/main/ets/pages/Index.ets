@@ -481,6 +481,7 @@ struct Index {
       );
       native.setResourceConfig(inst.profile, '', inst.memLimitMb);
       native.setGpuMode(inst.gpuMode);
+      native.setSyscallMode(inst.syscallMode || 'adaptive');
       native.setRefreshRate(inst.refreshRate);
       this.statusText = native.startContainer(
         this.getSandboxTempDir(),
