@@ -2583,7 +2583,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "ro.hardware.hwcomposer=ranchu\n"
             "ro.hardware.vulkan=" + std::string(useVk ? "ranchu" : "pastel") + "\n"
             "ro.opengles.version=196609\n"
-            "debug.hwui.renderer=" + std::string(useVk ? "skiavk" : "skiagl") + "\n"
+            // Keep Android 2D HWUI on skiagl (matching SurfaceFlinger renderengine=gles)
+            // even in Vulkan GPU mode: 3D apps/games still use ro.hardware.vulkan=ranchu,
+            // while WebViewFunctor::drawGl avoids the GLES<->Vulkan AHardwareBuffer
+            // drawVk deadlock on gfxstream without /dev/goldfish_sync.
+            "debug.hwui.renderer=skiagl\n"
             "debug.renderengine.backend=gles\n"
             "ro.boot.qemu.gltransport=pipe\n";
     } else {
@@ -3146,9 +3150,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             launchPaced("mediaserver", { "system/bin/mediaserver" });
         }
         {
+            // Remove legacy --jitless override now that svbox isolates guest seccomp
+            // from PR_HM_JIT and Chromium WebView V8 JIT CodeRange works natively.
             const std::string wvFlags = dataBase_ + "/data/local/tmp/webview-command-line";
-            WriteFile(wvFlags, "_ --js-flags=--jitless\n");
-            chmod(wvFlags.c_str(), 0644);
+            unlink(wvFlags.c_str());
         }
         // Native Android 14 64-bit adbd on TCP 127.0.0.1:5555
         if (FileExists(rootfs_ + "/system/apex/com.android.adbd/bin/adbd")) {

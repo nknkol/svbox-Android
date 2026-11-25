@@ -1018,6 +1018,20 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - `svbox` 全部 VFS/FS Policy/OCI 回归套件通过；容器内 `ln -s` / `ls -l`（`lrwxrwxrwx`）/ `readlink` / 跟随读取 / `rm` 全部符合 POSIX。
   - 正式构建安装后在 `enableRoot=false` 下启动《王者荣耀》（PID 51231），**连续稳定运行 98 秒以上无任何 `SIGKILL` 或闪退**，`mResumed=true`，稳态 30 FPS 流畅渲染（`avg=33.34ms`）。
 
+### 11.12 根治 Android 14 Chromium WebView 125 三重故障（`webview_zygote` ANR、V8 JIT `CodeRange` OOM 与 `drawVk` 白屏死锁）
+- **背景与现象**：在《王者荣耀》点击「与QQ好友玩」拉起 `OpenWebView` 或直接启动 `org.chromium.webview_shell` 时，依次暴露出 3 个叠加的底层问题：
+  1. **`webview_zygote` 启动即 `SIGABRT` → 20.4s `ActivityManager` 锁阻塞 ANR**：`com_android_internal_os_Zygote.cpp:1187` 遍历 `/data/user` 检查 `d_type` 时报 `Unexpected type: 8 /data/user/0`，因为 `OWNER_SYMLINK` 虚拟符号链接在 `getdents64` 中仍返回宿主普通文件的 `DT_REG (8)` 而非 `DT_LNK (10)`。
+  2. **`sandboxed_process0` V8 JIT `CodeRange` OOM 崩溃（`SIGTRAP`）**：在 `ro.build.type=user` 下（Chromium 忽略 `/data/local/tmp/webview-command-line`），`sandboxed_process0` 通过 `seccomp(2)`/`prctl(PR_SET_SECCOMP)` 在 `svbox` 的 `--seccomp-backstop` 之上叠加安装了宿主内核 Seccomp-BPF 过滤器，把 `svbox` 内部 `platform_mprotect_exec` 的 `prctl(PR_HM_JIT)` 及 VFS 调用拦截为 `-EPERM`，导致 V8 预留 256 MiB `CodeRange`（`mprotect(..., RWX|BTI)`）失败返回 `-EINVAL`。
+  3. **`skiavk` 下 `WebViewFunctor::drawVk` 白屏死锁 ANR**：`debug.hwui.renderer=skiavk` 时，无 `/dev/goldfish_sync` 条件下 HWUI `RenderThread` 在 `drawVk` 中等待 `Chrome_InProcGpuThread`，而后者阻塞于 `gfxstream.sock`（`af_unix_recvfrom`），导致 HTTPS 多帧网页白屏并 5s 输入超时 ANR。
+- **Layer 1 `svbox` 通用 Linux 修复**：
+  1. **`getdents64` 虚拟符号链接 `d_type` 修正（[`container_state.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/include/container_state.h)、[`container_state.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/container_state.c)、[`syscall_disp.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/syscall_disp.c)）**：新增 `owners_fix_getdents()`，仅在 `owners_has_symlinks()` 为真时做一次 `fstat(dirfd)` + `owner.db` O(1) mmap 查表，将 `OWNER_SYMLINK` 条目的 `d_type` 从 `DT_REG`/`DT_UNKNOWN` 改写为 `DT_LNK (10)`。
+  2. **`--seccomp-backstop`/`--trap-sigsys` 下隔离 guest Seccomp-BPF（[`slow_syscalls.inc`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/arch/aarch64/slow_syscalls.inc)、[`dispatch.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c)）**：路由 `__NR_seccomp` 至 `dispatch_syscall`，在 `svbox` 接管 seccomp/`SIGSYS` 时对 `prctl(PR_SET_SECCOMP)` 返回 `-EINVAL`、对 `seccomp(2)` 返回 `-ENOSYS`（与内核 `CONFIG_SECCOMP_FILTER=n` 语义一致），防止 guest 过滤器拦截 `svbox` 自身载荷系统调用，彻底解锁 Chromium WebView **完整 V8 JIT**。
+- **Layer 2 `svbox-Android` 修复（[`android_runtime.cpp`](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)）**：
+  - 将 `debug.hwui.renderer` 固定为 `skiagl`（与 `debug.renderengine.backend=gles` 对齐，规避 `drawVk` 互操作死锁，同时保持 `ro.hardware.vulkan=ranchu` 使 3D 游戏继续享受原生 Vulkan 硬件加速），并移除旧版 `/data/local/tmp/webview-command-line`（`--jitless`）临时绕过。
+- **真机验证（`HAD-W32`，`enableRoot=false`，`ro.build.type=user`，无 `--jitless`）**：
+  - `svbox` 全量 `make check-oci` + VFS/FS Policy 回归全通过。
+  - 冷启动后 `webview_zygote`、`com.android.webview:sandboxed_process0`、`media.extractor`、`media.swcodec` 全部零报错常驻；`org.chromium.webview_shell` 加载 `data:text/html`（V8 JIT JS 执行 `6*7=42`）与真实 HTTPS 网页（`https://www.qq.com/`、`https://m.baidu.com/`）完整渲染无白屏；《王者荣耀》内点击「与QQ好友玩」2 秒内正常弹出清晰「QQ 授权登录」WebView 页面，零 ANR、零崩溃。
+
 
 
 
