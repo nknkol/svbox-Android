@@ -2544,7 +2544,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "ro.sys.sdcardfs=false\n"
         "ro.secure=" + std::string(allowRoot ? "0" : "1") + "\n"
         "ro.adb.secure=0\n"
-        "ro.debuggable=1\n"
+        "ro.debuggable=" + std::string(allowRoot ? "1" : "0") + "\n"
+        "ro.build.type=" + std::string(allowRoot ? "userdebug" : "user") + "\n"
+        "ro.build.tags=" + std::string(allowRoot ? "test-keys" : "release-keys") + "\n"
         "service.adb.root=" + std::string(allowRoot ? "1" : "0") + "\n"
         "service.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n"
         "persist.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n");
@@ -2744,9 +2746,14 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 ++gpuCopied;
             }
         }
+        if (!allowRoot) {
+            MkdirP(injectLayer_ + "/system/xbin");
+            WriteFile(injectLayer_ + "/system/xbin/.wh.su", "");
+        }
         logLine("Staged injectLayer=" + injectLayer_ + " (gpuLibs=" + std::to_string(gpuCopied) +
                 ", audioHal=" + std::to_string(!audioHalPath_.empty()) +
-                ", cameraStub=" + std::to_string(!cameraSvcPath_.empty()) + ")");
+                ", cameraStub=" + std::to_string(!cameraSvcPath_.empty()) +
+                ", root=" + std::to_string(allowRoot) + ")");
     }
 
     // Start Layer 2 ohos_bridge services (display, evdev touch/kbd/gamepad, OHAudio, USB/serial)

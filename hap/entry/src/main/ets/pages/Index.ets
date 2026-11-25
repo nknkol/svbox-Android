@@ -227,6 +227,12 @@ struct Index {
         primary.runMode = reqUi;
         dirty = true;
       }
+      const reqRoot: string | undefined = AppStorage.get<string>('requestedEnableRoot');
+      if (reqRoot === 'true' || reqRoot === 'false') {
+        primary.enableRoot = (reqRoot === 'true');
+        AppStorage.setOrCreate<string>('requestedEnableRoot', '');
+        dirty = true;
+      }
       if (dirty) {
         instanceManager.updateInstance(filesDir, primary);
         this.reloadInstances(false);

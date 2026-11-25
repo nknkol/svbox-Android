@@ -419,13 +419,15 @@ int main(int argc, char **argv)
     if (!g_serial_area || !g_default_area || write_property_info_file(path) != 0)
         return 1;
 
-    /* Default GPU driver before loading override.prop */
+    /* Defaults before loading partition props and override.prop */
     set_property("ro.hardware.egl", "swiftshader");
+    set_property("ro.debuggable", "1");
+    set_property("ro.secure", "0");
 
     for (int i = 0; i < nfiles; i++)
         load_prop_file(prop_files[i]);
 
-    /* Essential container overrides for Android 11 on svbox */
+    /* Essential container overrides for Android on svbox */
     set_property("ro.property_service.version", "2");
     set_property("ro.zygote", "zygote64");
     set_property("ro.product.cpu.abi", "arm64-v8a");
@@ -436,8 +438,6 @@ int main(int argc, char **argv)
     set_property("ro.crypto.state", "unsupported");
     set_property("ro.boot.hardware", "redroid");
     set_property("ro.hardware", "redroid");
-    set_property("ro.debuggable", "1");
-    set_property("ro.secure", "0");
     set_property("sys.boot_completed", "0");
 
     if (!sock_path)

@@ -23,6 +23,7 @@ export default class EntryAbility extends UIAbility {
     const rawCmdOut: Object | undefined = want.parameters ? want.parameters['guestCmdOut'] : undefined;
     const rawDump: Object | undefined = want.parameters ? want.parameters['dumpProcs'] : undefined;
     const rawTap: Object | undefined = want.parameters ? want.parameters['injectTap'] : undefined;
+    const rawRoot: Object | undefined = want.parameters ? want.parameters['enableRoot'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const uiModeStr: string = typeof rawUiMode === 'string' ? rawUiMode : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
@@ -34,6 +35,7 @@ export default class EntryAbility extends UIAbility {
     const cmdOutStr: string = typeof rawCmdOut === 'string' ? rawCmdOut : '';
     const dumpStr: string = typeof rawDump === 'string' ? rawDump : '';
     const tapStr: string = typeof rawTap === 'string' ? rawTap : '';
+    const rootStr: string = typeof rawRoot === 'string' ? rawRoot : (typeof rawRoot === 'boolean' ? String(rawRoot) : '');
 
     if (setHzStr.length > 0 && autoStr.length === 0) {
       const hz: number = Number(setHzStr);
@@ -76,6 +78,9 @@ export default class EntryAbility extends UIAbility {
     }
     if (gpuStr.length > 0) {
       AppStorage.setOrCreate<string>('gpuMode', gpuStr);
+    }
+    if (rootStr === 'true' || rootStr === 'false') {
+      AppStorage.setOrCreate<string>('requestedEnableRoot', rootStr);
     }
     if (resStr.length > 0) {
       AppStorage.setOrCreate<string>('resolution', resStr);
