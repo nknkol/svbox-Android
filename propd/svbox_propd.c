@@ -184,7 +184,7 @@ static int set_property(const char *name, const char *value)
         pi->serial = PROP_LONG_FLAG | (((old_serial & 0xffffu) + 2u) & 0xffffu);
     } else {
         memcpy(pi->value, value, valuelen + 1);
-        uint32_t cnt = ((old_serial & 0x00ffffffu) + 2u) & 0x00ffffffu;
+        uint32_t cnt = ((old_serial & 0xffffu) + 2u) & 0xffffu;
         pi->serial = (valuelen << 24) | cnt;
     }
 

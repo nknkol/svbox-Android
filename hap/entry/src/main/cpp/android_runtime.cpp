@@ -2466,13 +2466,46 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         devBrandSnap = deviceBrand_;
         devModelSnap = deviceModel_;
     }
-    std::string deviceProps;
-    if (!devBrandSnap.empty()) {
-        deviceProps += "ro.product.brand=" + devBrandSnap + "\n";
-        deviceProps += "ro.product.manufacturer=" + devBrandSnap + "\n";
+    const std::string buildType = allowRoot ? "userdebug" : "user";
+    const std::string buildTags = allowRoot ? "test-keys" : "release-keys";
+    const std::string effBrand = devBrandSnap.empty() ? "Android" : devBrandSnap;
+    const std::string effModel = devModelSnap.empty() ? "SVBox14" : devModelSnap;
+    std::string effDevice;
+    for (char c : effModel) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            effDevice.push_back(c);
+        } else if (c >= 'A' && c <= 'Z') {
+            effDevice.push_back(static_cast<char>(c - 'A' + 'a'));
+        }
     }
-    if (!devModelSnap.empty()) {
-        deviceProps += "ro.product.model=" + devModelSnap + "\n";
+    if (effDevice.empty()) effDevice = "svbox14";
+    const std::string buildFp = effBrand + "/" + effDevice + "/" + effDevice +
+                                ":14/UD2A.240505.001.W1/20240527:" + buildType + "/" + buildTags;
+    const std::string buildDesc = effDevice + "-" + buildType + " 14 UD2A.240505.001.W1 20240527 " + buildTags;
+
+    std::string deviceProps;
+    deviceProps += "ro.product.brand=" + effBrand + "\n";
+    deviceProps += "ro.product.manufacturer=" + effBrand + "\n";
+    deviceProps += "ro.product.model=" + effModel + "\n";
+    deviceProps += "ro.product.device=" + effDevice + "\n";
+    deviceProps += "ro.product.name=" + effDevice + "\n";
+    deviceProps += "ro.build.product=" + effDevice + "\n";
+    deviceProps += "ro.build.type=" + buildType + "\n";
+    deviceProps += "ro.build.tags=" + buildTags + "\n";
+    deviceProps += "ro.build.flavor=" + effDevice + "-" + buildType + "\n";
+    deviceProps += "ro.build.description=" + buildDesc + "\n";
+    deviceProps += "ro.build.display.id=" + buildDesc + "\n";
+    deviceProps += "ro.build.fingerprint=" + buildFp + "\n";
+    for (const char* part : { "system", "system_ext", "product", "vendor", "odm" }) {
+        const std::string p(part);
+        deviceProps += "ro.product." + p + ".brand=" + effBrand + "\n";
+        deviceProps += "ro.product." + p + ".manufacturer=" + effBrand + "\n";
+        deviceProps += "ro.product." + p + ".model=" + effModel + "\n";
+        deviceProps += "ro.product." + p + ".device=" + effDevice + "\n";
+        deviceProps += "ro.product." + p + ".name=" + effDevice + "\n";
+        deviceProps += "ro." + p + ".build.type=" + buildType + "\n";
+        deviceProps += "ro." + p + ".build.tags=" + buildTags + "\n";
+        deviceProps += "ro." + p + ".build.fingerprint=" + buildFp + "\n";
     }
     const std::string hostHw = ReadHostHardwareName();
     std::string socManuf = "ARM";
@@ -2545,8 +2578,6 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "ro.secure=" + std::string(allowRoot ? "0" : "1") + "\n"
         "ro.adb.secure=0\n"
         "ro.debuggable=" + std::string(allowRoot ? "1" : "0") + "\n"
-        "ro.build.type=" + std::string(allowRoot ? "userdebug" : "user") + "\n"
-        "ro.build.tags=" + std::string(allowRoot ? "test-keys" : "release-keys") + "\n"
         "service.adb.root=" + std::string(allowRoot ? "1" : "0") + "\n"
         "service.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n"
         "persist.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n");
