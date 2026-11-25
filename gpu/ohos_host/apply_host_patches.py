@@ -1356,8 +1356,8 @@ def main() -> None:
         "    if (mUseVulkanNativeImage) {\n"
         "#ifdef __OHOS__\n"
         "        // Without kernel sync_fd (/dev/goldfish_sync), *pNativeFenceFd == -1 tells\n"
-        "        // SurfaceFlinger the buffer is already ready; wait on qsriFence here so GLES\n"
-        "        // RenderEngine never samples an incomplete OH_NativeBuffer.\n"
+        "        // SurfaceFlinger the buffer is already ready; wait on qsriFence here (after\n"
+        "        // fb->unlock()) so GLES RenderEngine never samples an incomplete OH_NativeBuffer.\n"
         "        waitForQsriFenceTask();\n"
         "        mQsriTimeline->signalNextPresentAndPoll();\n"
         "#else\n"
@@ -1469,6 +1469,484 @@ def main() -> None:
         "        bufferImageCopies[0].imageOffset.y = static_cast<int32_t>(y);\n"
         "    }\n",
         "VkEmulation::readColorBufferToBytesLocked single-plane subrect support",
+    )
+
+    # 16. SwapChainStateVk.cpp: prefer MAILBOX / IMMEDIATE present mode over FIFO on __OHOS__
+    #     so Vulkan presentation does not throttle RenderWindow/PostWorker below 120Hz (matching
+    #     EglOsApi_egl.cpp eglSwapInterval(0)).
+    sc_cpp = os.path.join(gfx, "host/vulkan/SwapChainStateVk.cpp")
+    patch_file(
+        sc_cpp,
+        "    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;\n"
+        "    if (!presentModes.count(VK_PRESENT_MODE_FIFO_KHR)) {\n"
+        "        ERR(\"Failed to create swapchain: FIFO present mode not supported.\");\n"
+        "        return std::nullopt;\n"
+        "    }",
+        "    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;\n"
+        "#ifdef __OHOS__\n"
+        "    if (presentModes.count(VK_PRESENT_MODE_MAILBOX_KHR)) {\n"
+        "        presentMode = VK_PRESENT_MODE_MAILBOX_KHR;\n"
+        "    } else if (presentModes.count(VK_PRESENT_MODE_IMMEDIATE_KHR)) {\n"
+        "        presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;\n"
+        "    } else if (!presentModes.count(VK_PRESENT_MODE_FIFO_KHR)) {\n"
+        "        ERR(\"Failed to create swapchain: no supported present mode.\");\n"
+        "        return std::nullopt;\n"
+        "    }\n"
+        "    INFO(\"SwapChainStateVk: selected presentMode=%d (available=%zu)\",\n"
+        "         static_cast<int>(presentMode), presentModes.size());\n"
+        "#else\n"
+        "    if (!presentModes.count(VK_PRESENT_MODE_FIFO_KHR)) {\n"
+        "        ERR(\"Failed to create swapchain: FIFO present mode not supported.\");\n"
+        "        return std::nullopt;\n"
+        "    }\n"
+        "#endif",
+        "SwapChainStateVk OHOS prefer MAILBOX/IMMEDIATE present mode",
+    )
+
+    # 17. VkDecoder.cpp: make OP_vkFlushMappedMemoryRanges async (fire-and-forget) on __OHOS__
+    #     paired with guest VkEncoder.cpp to eliminate full IPC round-trip stalls on every
+    #     vkQueueSubmit / vkUnmapMemory coherent shadow flush.
+    vkdec = os.path.join(gfx, "host/vulkan/VkDecoder.cpp")
+    patch_file(
+        vkdec,
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkFlushMappedMemoryRanges_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "                vkStream->unsetHandleMapping();\n"
+        "#ifndef __OHOS__\n"
+        "                vkStream->write(&vkFlushMappedMemoryRanges_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#endif\n",
+        "VkDecoder OHOS async fire-and-forget OP_vkFlushMappedMemoryRanges",
+    )
+
+    # 18. RenderThread.cpp & RenderWindow.cpp: boost host GPU worker threads to
+    #     OHOS QOS_USER_INTERACTIVE (5) so HarmonyOS schedules them on BIG cores at max clock.
+    rt_cpp = os.path.join(gfx, "host/RenderThread.cpp")
+    patch_file(
+        rt_cpp,
+        "#include <unordered_map>\n",
+        "#include <unordered_map>\n#ifdef __OHOS__\n#include <dlfcn.h>\n#endif\n",
+        "RenderThread OHOS include dlfcn",
+    )
+    patch_file(
+        rt_cpp,
+        "intptr_t RenderThread::main() {\n"
+        "    if (mFinished.load(std::memory_order_relaxed)) {\n",
+        "intptr_t RenderThread::main() {\n"
+        "#ifdef __OHOS__\n"
+        "    {\n"
+        "        using SetQoSFn = int (*)(int);\n"
+        "        static SetQoSFn sSetQoS = []() -> SetQoSFn {\n"
+        "            void* h = dlopen(\"libqos.so\", RTLD_NOW | RTLD_LOCAL);\n"
+        "            return h ? reinterpret_cast<SetQoSFn>(dlsym(h, \"OH_QoS_SetThreadQoS\")) : nullptr;\n"
+        "        }();\n"
+        "        if (sSetQoS) sSetQoS(5 /* QOS_USER_INTERACTIVE */);\n"
+        "    }\n"
+        "#endif\n"
+        "    if (mFinished.load(std::memory_order_relaxed)) {\n",
+        "RenderThread OHOS QOS_USER_INTERACTIVE boost",
+    )
+    rw_cpp = os.path.join(gfx, "host/RenderWindow.cpp")
+    patch_file(
+        rw_cpp,
+        "#include <stdio.h>\n",
+        "#include <stdio.h>\n#ifdef __OHOS__\n#include <dlfcn.h>\n#endif\n",
+        "RenderWindow OHOS include dlfcn",
+    )
+    patch_file(
+        rw_cpp,
+        "    virtual intptr_t main() {\n"
+        "        D(\"Entering render window thread thread\\n\");\n",
+        "    virtual intptr_t main() {\n"
+        "        D(\"Entering render window thread thread\\n\");\n"
+        "#ifdef __OHOS__\n"
+        "        {\n"
+        "            using SetQoSFn = int (*)(int);\n"
+        "            static SetQoSFn sSetQoS = []() -> SetQoSFn {\n"
+        "                void* h = dlopen(\"libqos.so\", RTLD_NOW | RTLD_LOCAL);\n"
+        "                return h ? reinterpret_cast<SetQoSFn>(dlsym(h, \"OH_QoS_SetThreadQoS\")) : nullptr;\n"
+        "            }();\n"
+        "            if (sSetQoS) sSetQoS(5 /* QOS_USER_INTERACTIVE */);\n"
+        "        }\n"
+        "#endif\n",
+        "RenderWindowThread OHOS QOS_USER_INTERACTIVE boost",
+    )
+
+
+    # 19. RenderChannel direct write fast-path: let RenderThread send replies directly
+    #     to the guest AF_UNIX socket without bouncing through eventfd + gfx-epoll.
+    rc_h = os.path.join(gfx, "include/render-utils/RenderChannel.h")
+    rci_h = os.path.join(gfx, "host/RenderChannelImpl.h")
+    rci_cpp = os.path.join(gfx, "host/RenderChannelImpl.cpp")
+    patch_file(
+        rc_h,
+        "    using EventCallback = std::function<void(State)>;\n",
+        "    using EventCallback = std::function<void(State)>;\n"
+        "    using DirectWriteCallback = std::function<size_t(const char* data, size_t size)>;\n",
+        "RenderChannel.h DirectWriteCallback typedef",
+    )
+    patch_file(
+        rc_h,
+        "    virtual void setEventCallback(EventCallback&& callback) = 0;\n",
+        "    virtual void setEventCallback(EventCallback&& callback) = 0;\n"
+        "    virtual void setDirectWriteCallback(DirectWriteCallback&&) {}\n",
+        "RenderChannel.h setDirectWriteCallback decl",
+    )
+    patch_file(
+        rci_h,
+        "    virtual void setEventCallback(EventCallback&& callback) override final;\n",
+        "    virtual void setEventCallback(EventCallback&& callback) override final;\n"
+        "    virtual void setDirectWriteCallback(DirectWriteCallback&& callback) override final;\n",
+        "RenderChannelImpl.h setDirectWriteCallback decl",
+    )
+    patch_file(
+        rci_h,
+        "    EventCallback mEventCallback;\n",
+        "    EventCallback mEventCallback;\n"
+        "    DirectWriteCallback mDirectWriteCallback;\n",
+        "RenderChannelImpl.h mDirectWriteCallback member",
+    )
+    patch_file(
+        rci_cpp,
+        "void RenderChannelImpl::stop() {\n"
+        "    D(\"enter\");\n"
+        "    AutoLock lock(mLock);\n"
+        "    mFromGuest.closeLocked();\n"
+        "    mToGuest.closeLocked();\n"
+        "    mEventCallback = [](State state) {};\n"
+        "}\n\n"
+        "bool RenderChannelImpl::writeToGuest(Buffer&& buffer) {\n"
+        "    D(\"buffer size=%d\", (int)buffer.size());\n"
+        "    AutoLock lock(mLock);\n"
+        "    IoResult result = mToGuest.pushLocked(std::move(buffer));\n"
+        "    updateStateLocked();\n"
+        "    D(\"mToGuest.pushLocked() returned %d, state %d\", (int)result, (int)mState);\n"
+        "    notifyStateChangeLocked();\n"
+        "    return result == IoResult::Ok;\n"
+        "}",
+        "void RenderChannelImpl::setDirectWriteCallback(DirectWriteCallback&& callback) {\n"
+        "    AutoLock lock(mLock);\n"
+        "    mDirectWriteCallback = std::move(callback);\n"
+        "}\n\n"
+        "void RenderChannelImpl::stop() {\n"
+        "    D(\"enter\");\n"
+        "    AutoLock lock(mLock);\n"
+        "    mFromGuest.closeLocked();\n"
+        "    mToGuest.closeLocked();\n"
+        "    mEventCallback = [](State state) {};\n"
+        "    mDirectWriteCallback = nullptr;\n"
+        "}\n\n"
+        "bool RenderChannelImpl::writeToGuest(Buffer&& buffer) {\n"
+        "    D(\"buffer size=%d\", (int)buffer.size());\n"
+        "    DirectWriteCallback directCb;\n"
+        "    {\n"
+        "        AutoLock lock(mLock);\n"
+        "        if (mDirectWriteCallback && !mToGuest.canPopLocked() && !mToGuest.isClosedLocked()) {\n"
+        "            directCb = mDirectWriteCallback;\n"
+        "        }\n"
+        "    }\n"
+        "    if (directCb && !buffer.empty()) {\n"
+        "        size_t sent = directCb(buffer.data(), buffer.size());\n"
+        "        if (sent == buffer.size()) {\n"
+        "            return true;\n"
+        "        }\n"
+        "        if (sent > 0) {\n"
+        "            Buffer rem;\n"
+        "            rem.resize_noinit(buffer.size() - sent);\n"
+        "            memcpy(rem.data(), buffer.data() + sent, buffer.size() - sent);\n"
+        "            buffer = std::move(rem);\n"
+        "        }\n"
+        "    }\n"
+        "    AutoLock lock(mLock);\n"
+        "    IoResult result = mToGuest.pushLocked(std::move(buffer));\n"
+        "    updateStateLocked();\n"
+        "    D(\"mToGuest.pushLocked() returned %d, state %d\", (int)result, (int)mState);\n"
+        "    notifyStateChangeLocked();\n"
+        "    return result == IoResult::Ok;\n"
+        "}",
+        "RenderChannelImpl direct writeToGuest fast-path",
+    )
+    patch_file(
+        rci_cpp,
+        "    notifyStateChangeLocked();\n"
+        "    mEventCallback = [](State state) {};\n"
+        "}",
+        "    notifyStateChangeLocked();\n"
+        "    mEventCallback = [](State state) {};\n"
+        "    mDirectWriteCallback = nullptr;\n"
+        "}",
+        "RenderChannelImpl clear mDirectWriteCallback on stopFromHost",
+    )
+
+    # 20. VkDecoder.cpp: make OP_vkBindBufferMemory, OP_vkBindImageMemory, OP_vkResetFences,
+    #     and OP_vkResetCommandPool async fire-and-forget on __OHOS__ (paired with guest
+    #     VkEncoder.cpp) to eliminate >1,200 sync IPC round-trips per 2 seconds.
+    patch_file(
+        vkdec,
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkBindBufferMemory_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifndef __OHOS__\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkBindBufferMemory_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#endif\n",
+        "VkDecoder OHOS async fire-and-forget OP_vkBindBufferMemory",
+    )
+    patch_file(
+        vkdec,
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkBindImageMemory_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifndef __OHOS__\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkBindImageMemory_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#endif\n",
+        "VkDecoder OHOS async fire-and-forget OP_vkBindImageMemory",
+    )
+    patch_file(
+        vkdec,
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkResetFences_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifndef __OHOS__\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkResetFences_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#endif\n",
+        "VkDecoder OHOS async fire-and-forget OP_vkResetFences",
+    )
+    patch_file(
+        vkdec,
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkResetCommandPool_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifndef __OHOS__\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                vkStream->write(&vkResetCommandPool_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#endif\n",
+        "VkDecoder OHOS async fire-and-forget OP_vkResetCommandPool",
+    )
+
+
+    # 21. Client-allocated boxed handle aliases (bit 63 sentinel) so guest
+    #     vkCreateBufferWithRequirementsGOOGLE & vkCreateSemaphore can fire-and-forget
+    #     asynchronously (eliminating ~1,850 sync round-trips / 2s in Android 14 SkiaVK).
+    vbh_h = os.path.join(gfx, "host/vulkan/VulkanBoxedHandles.h")
+    vbh_cpp = os.path.join(gfx, "host/vulkan/VulkanBoxedHandles.cpp")
+    patch_file(
+        vbh_h,
+        "    void clear();\n\n   private:\n",
+        "    void clear();\n"
+        "#ifdef __OHOS__\n"
+        "    void registerClientAlias(BoxedHandle clientHandle, BoxedHandle realHandle);\n"
+        "    BoxedHandle resolveClientAlias(BoxedHandle h);\n"
+        "    BoxedHandle popClientAlias(BoxedHandle h);\n"
+        "#endif\n\n   private:\n",
+        "VulkanBoxedHandles.h client alias methods",
+    )
+    patch_file(
+        vbh_h,
+        "    std::mutex mMutex;\n    std::unordered_map<UnboxedHandle, BoxedHandle> mReverseMap GUARDED_BY(mMutex);\n",
+        "    std::mutex mMutex;\n    std::unordered_map<UnboxedHandle, BoxedHandle> mReverseMap GUARDED_BY(mMutex);\n"
+        "#ifdef __OHOS__\n"
+        "    std::mutex mAliasMutex;\n"
+        "    std::unordered_map<BoxedHandle, BoxedHandle> mClientAliases;\n"
+        "#endif\n",
+        "VulkanBoxedHandles.h client alias map",
+    )
+    patch_file(
+        vbh_cpp,
+        "void BoxedHandleManager::clear() {\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    mReverseMap.clear();\n"
+        "    mStore.clear();\n"
+        "}",
+        "#ifdef __OHOS__\n"
+        "void BoxedHandleManager::registerClientAlias(BoxedHandle clientHandle, BoxedHandle realHandle) {\n"
+        "    std::lock_guard<std::mutex> lock(mAliasMutex);\n"
+        "    mClientAliases[clientHandle] = realHandle;\n"
+        "}\n\n"
+        "BoxedHandle BoxedHandleManager::resolveClientAlias(BoxedHandle h) {\n"
+        "    if ((h & (1ULL << 63)) == 0) return h;\n"
+        "    std::lock_guard<std::mutex> lock(mAliasMutex);\n"
+        "    auto it = mClientAliases.find(h);\n"
+        "    return (it != mClientAliases.end()) ? it->second : 0;\n"
+        "}\n\n"
+        "BoxedHandle BoxedHandleManager::popClientAlias(BoxedHandle h) {\n"
+        "    if ((h & (1ULL << 63)) == 0) return h;\n"
+        "    std::lock_guard<std::mutex> lock(mAliasMutex);\n"
+        "    auto it = mClientAliases.find(h);\n"
+        "    if (it == mClientAliases.end()) return 0;\n"
+        "    BoxedHandle real = it->second;\n"
+        "    mClientAliases.erase(it);\n"
+        "    return real;\n"
+        "}\n"
+        "#endif\n\n"
+        "void BoxedHandleManager::clear() {\n"
+        "#ifdef __OHOS__\n"
+        "    {\n"
+        "        std::lock_guard<std::mutex> alock(mAliasMutex);\n"
+        "        mClientAliases.clear();\n"
+        "    }\n"
+        "#endif\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    mReverseMap.clear();\n"
+        "    mStore.clear();\n"
+        "}",
+        "VulkanBoxedHandles.cpp client alias impl",
+    )
+    patch_file(
+        vbh_cpp,
+        "void BoxedHandleManager::update(BoxedHandle handle, const BoxedHandleInfo& item,\n"
+        "                                BoxedHandleTypeTag tag) {\n"
+        "    auto storedItem = mStore.get(handle);",
+        "void BoxedHandleManager::update(BoxedHandle handle, const BoxedHandleInfo& item,\n"
+        "                                BoxedHandleTypeTag tag) {\n"
+        "#ifdef __OHOS__\n"
+        "    handle = resolveClientAlias(handle);\n"
+        "    if (!handle) return;\n"
+        "#endif\n"
+        "    auto storedItem = mStore.get(handle);",
+        "VulkanBoxedHandles.cpp update resolve alias",
+    )
+    patch_file(
+        vbh_cpp,
+        "void BoxedHandleManager::remove(BoxedHandle h) {\n"
+        "    auto item = get(h);",
+        "void BoxedHandleManager::remove(BoxedHandle h) {\n"
+        "#ifdef __OHOS__\n"
+        "    h = popClientAlias(h);\n"
+        "    if (!h) return;\n"
+        "#endif\n"
+        "    auto item = get(h);",
+        "VulkanBoxedHandles.cpp remove pop alias",
+    )
+    patch_file(
+        vbh_cpp,
+        "void BoxedHandleManager::removeDelayed(uint64_t h, VkDevice device,\n"
+        "                                       std::function<void()> callback) {\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    mDelayedRemoves[device].push_back({h, callback});\n"
+        "}",
+        "void BoxedHandleManager::removeDelayed(uint64_t h, VkDevice device,\n"
+        "                                       std::function<void()> callback) {\n"
+        "#ifdef __OHOS__\n"
+        "    h = popClientAlias(h);\n"
+        "    if (!h) {\n"
+        "        if (callback) callback();\n"
+        "        return;\n"
+        "    }\n"
+        "#endif\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    mDelayedRemoves[device].push_back({h, callback});\n"
+        "}",
+        "VulkanBoxedHandles.cpp removeDelayed pop alias",
+    )
+    patch_file(
+        vbh_cpp,
+        "BoxedHandleInfo* BoxedHandleManager::get(BoxedHandle handle) {\n"
+        "    return (BoxedHandleInfo*)mStore.get_const(handle);\n"
+        "}",
+        "BoxedHandleInfo* BoxedHandleManager::get(BoxedHandle handle) {\n"
+        "#ifdef __OHOS__\n"
+        "    handle = resolveClientAlias(handle);\n"
+        "    if (!handle) return nullptr;\n"
+        "#endif\n"
+        "    return (BoxedHandleInfo*)mStore.get_const(handle);\n"
+        "}",
+        "VulkanBoxedHandles.cpp get resolve alias",
+    )
+    patch_file(
+        vkdec,
+        "                // Begin manual non dispatchable handle create for pBuffer;\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                uint64_t cgen_var_3;\n"
+        "                static_assert(8 == sizeof(VkBuffer),\n"
+        "                              \"handle map overwrite requires VkBuffer to be 8 bytes long\");\n"
+        "                vkStream->handleMapping()->mapHandles_VkBuffer((VkBuffer*)pBuffer, 1);\n"
+        "                vkStream->write((VkBuffer*)pBuffer, 8 * 1);\n"
+        "                // Begin manual non dispatchable handle create for pBuffer;\n"
+        "                vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                if (pMemoryRequirements) {\n"
+        "                    transform_fromhost_VkMemoryRequirements(\n"
+        "                        m_state, (VkMemoryRequirements*)(pMemoryRequirements));\n"
+        "                }\n"
+        "                marshal_VkMemoryRequirements(vkStream, VK_STRUCTURE_TYPE_MAX_ENUM,\n"
+        "                                             (VkMemoryRequirements*)(pMemoryRequirements));\n"
+        "                vkStream->write(&vkCreateBufferWithRequirementsGOOGLE_VkResult_return,\n"
+        "                                sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifdef __OHOS__\n"
+        "                if ((cgen_var_2 & (1ULL << 63)) != 0) {\n"
+        "                    vkStream->unsetHandleMapping();\n"
+        "                    vkStream->handleMapping()->mapHandles_VkBuffer((VkBuffer*)pBuffer, 1);\n"
+        "                    sBoxedHandleManager.registerClientAlias(cgen_var_2, (uint64_t)(*pBuffer));\n"
+        "                    vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                } else {\n"
+        "#endif\n"
+        "                // Begin manual non dispatchable handle create for pBuffer;\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                uint64_t cgen_var_3;\n"
+        "                static_assert(8 == sizeof(VkBuffer),\n"
+        "                              \"handle map overwrite requires VkBuffer to be 8 bytes long\");\n"
+        "                vkStream->handleMapping()->mapHandles_VkBuffer((VkBuffer*)pBuffer, 1);\n"
+        "                vkStream->write((VkBuffer*)pBuffer, 8 * 1);\n"
+        "                // Begin manual non dispatchable handle create for pBuffer;\n"
+        "                vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                if (pMemoryRequirements) {\n"
+        "                    transform_fromhost_VkMemoryRequirements(\n"
+        "                        m_state, (VkMemoryRequirements*)(pMemoryRequirements));\n"
+        "                }\n"
+        "                marshal_VkMemoryRequirements(vkStream, VK_STRUCTURE_TYPE_MAX_ENUM,\n"
+        "                                             (VkMemoryRequirements*)(pMemoryRequirements));\n"
+        "                vkStream->write(&vkCreateBufferWithRequirementsGOOGLE_VkResult_return,\n"
+        "                                sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#ifdef __OHOS__\n"
+        "                }\n"
+        "#endif\n",
+        "VkDecoder OHOS async client-alias OP_vkCreateBufferWithRequirementsGOOGLE",
+    )
+    patch_file(
+        vkdec,
+        "                // Begin manual non dispatchable handle create for pSemaphore;\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                uint64_t cgen_var_3;\n"
+        "                static_assert(8 == sizeof(VkSemaphore),\n"
+        "                              \"handle map overwrite requires VkSemaphore to be 8 bytes long\");\n"
+        "                vkStream->handleMapping()->mapHandles_VkSemaphore((VkSemaphore*)pSemaphore, 1);\n"
+        "                vkStream->write((VkSemaphore*)pSemaphore, 8 * 1);\n"
+        "                // Begin manual non dispatchable handle create for pSemaphore;\n"
+        "                vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                vkStream->write(&vkCreateSemaphore_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n",
+        "#ifdef __OHOS__\n"
+        "                if ((cgen_var_2 & (1ULL << 63)) != 0) {\n"
+        "                    vkStream->unsetHandleMapping();\n"
+        "                    vkStream->handleMapping()->mapHandles_VkSemaphore((VkSemaphore*)pSemaphore, 1);\n"
+        "                    sBoxedHandleManager.registerClientAlias(cgen_var_2, (uint64_t)(*pSemaphore));\n"
+        "                    vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                } else {\n"
+        "#endif\n"
+        "                // Begin manual non dispatchable handle create for pSemaphore;\n"
+        "                vkStream->unsetHandleMapping();\n"
+        "                uint64_t cgen_var_3;\n"
+        "                static_assert(8 == sizeof(VkSemaphore),\n"
+        "                              \"handle map overwrite requires VkSemaphore to be 8 bytes long\");\n"
+        "                vkStream->handleMapping()->mapHandles_VkSemaphore((VkSemaphore*)pSemaphore, 1);\n"
+        "                vkStream->write((VkSemaphore*)pSemaphore, 8 * 1);\n"
+        "                // Begin manual non dispatchable handle create for pSemaphore;\n"
+        "                vkStream->setHandleMapping(&m_boxedHandleUnwrapMapping);\n"
+        "                vkStream->write(&vkCreateSemaphore_VkResult_return, sizeof(VkResult));\n"
+        "                vkStream->commitWrite();\n"
+        "#ifdef __OHOS__\n"
+        "                }\n"
+        "#endif\n",
+        "VkDecoder OHOS async client-alias OP_vkCreateSemaphore",
     )
 
 

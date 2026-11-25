@@ -63,6 +63,12 @@ def main() -> None:
         bool virtualHostVisibleBacking = false;
         bool directMapped = false;""",
         """    struct VkDeviceMemory_Info {
+        struct BoundRange {
+            VkDeviceSize offset = 0;
+            VkDeviceSize size = 0;
+            uint32_t usage = 0;
+            bool isBuffer = true;
+        };
         VkDevice ownerDevice = VK_NULL_HANDLE;
         VkDeviceSize allocationSize = 0;
         VkDeviceSize mappedSize = 0;
@@ -75,7 +81,8 @@ def main() -> None:
         VkDeviceSize mapSize = 0;
         uint8_t* flushShadowPtr = nullptr;
         VkDeviceSize flushShadowSize = 0;
-        std::vector<uint8_t> flushPageSynced;""",
+        std::vector<uint8_t> flushPageSynced;
+        std::unordered_map<uint64_t, BoundRange> boundObjects;""",
     )
 
     patch_file(
@@ -320,14 +327,43 @@ def main() -> None:
         AEMU_SCOPED_TRACE("on_vkQueueSubmit");
 
         if (!usingDirectMapping() && context) {
+            std::vector<VkCommandBuffer> submittedCbs;
+            for (uint32_t i = 0; i < submitCount; ++i) {
+                for (uint32_t j = 0; j < pSubmits[i].commandBufferCount; ++j) {
+                    submittedCbs.push_back(pSubmits[i].pCommandBuffers[j]);
+                }
+            }
             VkDevice qDev = VK_NULL_HANDLE;
             std::vector<VkMappedMemoryRange> coherentRanges;
-            {
+            if (!submittedCbs.empty()) {
+                std::vector<CmdBufRef> cmdBufRefs;
+                collectCmdBufRefsBottomUp(submittedCbs, cmdBufRefs);
+
                 AutoLock<RecursiveLock> lock(mLock);
                 auto qIt = info_VkQueue.find(queue);
                 if (qIt != info_VkQueue.end()) {
                     qDev = qIt->second.device;
                     const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
+                    std::unordered_map<VkDeviceMemory, std::vector<std::pair<VkDeviceSize, VkDeviceSize>>> memIntervals;
+                    for (const auto& ref : cmdBufRefs) {
+                        auto bIt = info_VkBuffer.find(ref.buffer);
+                        if (bIt == info_VkBuffer.end()) continue;
+                        const auto& bInfo = bIt->second;
+                        if (bInfo.currentBacking == VK_NULL_HANDLE || bInfo.currentBackingSize == 0) continue;
+                        VkDeviceSize subOff = (ref.offset < bInfo.currentBackingSize) ? ref.offset : bInfo.currentBackingSize;
+                        VkDeviceSize avail = bInfo.currentBackingSize - subOff;
+                        VkDeviceSize subLen = (ref.size == VK_WHOLE_SIZE || ref.size > avail) ? avail : ref.size;
+                        if (subLen == 0) continue;
+                        VkDeviceSize s = bInfo.currentBackingOffset + subOff;
+                        VkDeviceSize e = s + subLen;
+                        memIntervals[bInfo.currentBacking].emplace_back(s, e);
+                    }
+                    constexpr uint32_t kCmdOnlyMask =
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                    constexpr VkDeviceSize kPage = 4096;
                     for (auto& kv : info_VkDeviceMemory) {
                         auto& info = kv.second;
                         if (info.ownerDevice == qDev && info.isMapped && info.directMapped &&
@@ -335,8 +371,46 @@ def main() -> None:
                             info.memoryTypeIndex < props.memoryTypeCount &&
                             (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                            auto& ivs = memIntervals[kv.first];
+                            for (const auto& bkv : info.boundObjects) {
+                                const auto& br = bkv.second;
+                                if (!br.isBuffer || (br.usage & ~kCmdOnlyMask) != 0) {
+                                    if (br.size > 0) {
+                                        ivs.emplace_back(br.offset, br.offset + br.size);
+                                    }
+                                }
+                            }
+                            if (ivs.empty()) continue;
+                            VkDeviceSize mapLo = info.mapOffset;
+                            VkDeviceSize mapHi = info.mapOffset + info.mapSize;
+                            if (mapHi > info.mappedSize) mapHi = info.mappedSize;
+                            std::vector<std::pair<VkDeviceSize, VkDeviceSize>> clipped;
+                            clipped.reserve(ivs.size());
+                            for (const auto& iv : ivs) {
+                                VkDeviceSize s = iv.first < mapLo ? mapLo : iv.first;
+                                VkDeviceSize e = iv.second > mapHi ? mapHi : iv.second;
+                                if (e <= s) continue;
+                                s = s & ~(kPage - 1);
+                                e = (e + kPage - 1) & ~(kPage - 1);
+                                if (e > info.mappedSize) e = info.mappedSize;
+                                clipped.emplace_back(s, e);
+                            }
+                            if (clipped.empty()) continue;
+                            std::sort(clipped.begin(), clipped.end());
+                            VkDeviceSize curS = clipped[0].first;
+                            VkDeviceSize curE = clipped[0].second;
+                            for (size_t idx = 1; idx < clipped.size(); ++idx) {
+                                if (clipped[idx].first <= curE) {
+                                    if (clipped[idx].second > curE) curE = clipped[idx].second;
+                                } else {
+                                    collectCoherentDirtyRangesLocked(
+                                        kv.first, info, curS, curE - curS, coherentRanges);
+                                    curS = clipped[idx].first;
+                                    curE = clipped[idx].second;
+                                }
+                            }
                             collectCoherentDirtyRangesLocked(
-                                kv.first, info, info.mapOffset, info.mapSize, coherentRanges);
+                                kv.first, info, curS, curE - curS, coherentRanges);
                         }
                     }
                 }
@@ -350,6 +424,403 @@ def main() -> None:
         }
 
         flushStagingStreams(context, queue, submitCount, pSubmits);""",
+        )
+
+    # Track live VkBuffer / VkImage memory bindings on VkDeviceMemory_Info and
+    # command-buffer referenced VkBuffer sub-ranges so on_vkQueueSubmit only scans
+    # active ranges instead of unallocated/untouched regions of large VMA blocks.
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.h",
+        """    VkResult on_vkResetCommandBuffer(
+        void* context, VkResult input_result,
+        VkCommandBuffer commandBuffer,
+        VkCommandBufferResetFlags flags);
+
+    VkResult on_vkCreateImageView(""",
+        """    VkResult on_vkResetCommandBuffer(
+        void* context, VkResult input_result,
+        VkCommandBuffer commandBuffer,
+        VkCommandBufferResetFlags flags);
+
+    void recordCommandBufferBufferRef(
+        VkCommandBuffer commandBuffer,
+        VkBuffer buffer,
+        VkDeviceSize offset,
+        VkDeviceSize size);
+
+    VkResult on_vkCreateImageView(""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    struct CommandBufferPendingDescriptorSets {
+        std::unordered_set<VkDescriptorSet> sets;
+    };""",
+        """    struct CmdBufRef {
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+    };
+
+    struct CommandBufferPendingDescriptorSets {
+        std::unordered_set<VkDescriptorSet> sets;
+        std::vector<CmdBufRef> bufRefs;
+    };
+
+    void recordCommandBufferBufferRef(
+        VkCommandBuffer commandBuffer,
+        VkBuffer buffer,
+        VkDeviceSize offset,
+        VkDeviceSize size) {
+        if (!commandBuffer || buffer == VK_NULL_HANDLE) return;
+        struct goldfish_VkCommandBuffer* cb = as_goldfish_VkCommandBuffer(commandBuffer);
+        if (!cb) return;
+        if (!cb->userPtr) {
+            cb->userPtr = new CommandBufferPendingDescriptorSets;
+        }
+        auto* pending = (CommandBufferPendingDescriptorSets*)cb->userPtr;
+        pending->bufRefs.push_back({buffer, offset, size});
+    }
+
+    void collectCmdBufRefsBottomUp(
+        const std::vector<VkCommandBuffer>& workingSet,
+        std::vector<CmdBufRef>& outRefs) {
+        if (workingSet.empty()) return;
+        std::vector<VkCommandBuffer> nextLevel;
+        for (auto commandBuffer : workingSet) {
+            struct goldfish_VkCommandBuffer* cb = as_goldfish_VkCommandBuffer(commandBuffer);
+            if (!cb) continue;
+            forAllObjects(cb->subObjects, [&nextLevel](void* secondary) {
+                nextLevel.push_back((VkCommandBuffer)secondary);
+            });
+        }
+        collectCmdBufRefsBottomUp(nextLevel, outRefs);
+        for (auto cmdbuf : workingSet) {
+            struct goldfish_VkCommandBuffer* cb = as_goldfish_VkCommandBuffer(cmdbuf);
+            if (!cb || !cb->userPtr) continue;
+            auto* pending = (CommandBufferPendingDescriptorSets*)cb->userPtr;
+            if (!pending->bufRefs.empty()) {
+                outRefs.insert(outRefs.end(), pending->bufRefs.begin(), pending->bufRefs.end());
+            }
+        }
+    }""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        if (alsoClearPendingDescriptorSets && cb->userPtr) {
+            CommandBufferPendingDescriptorSets* pendingSets = (CommandBufferPendingDescriptorSets*)cb->userPtr;
+            pendingSets->sets.clear();
+        }""",
+        """        if (alsoClearPendingDescriptorSets && cb->userPtr) {
+            CommandBufferPendingDescriptorSets* pendingSets = (CommandBufferPendingDescriptorSets*)cb->userPtr;
+            pendingSets->sets.clear();
+            pendingSets->bufRefs.clear();
+        }""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    void on_vkDestroyBuffer(
+        void* context,
+        VkDevice device, VkBuffer buffer, const VkAllocationCallbacks *pAllocator) {
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkDestroyBuffer(device, buffer, pAllocator, true /* do lock */);
+    }""",
+        """    void trackBindBufferMemoryLocked(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+        auto bIt = info_VkBuffer.find(buffer);
+        auto mIt = info_VkDeviceMemory.find(memory);
+        if (bIt == info_VkBuffer.end() || mIt == info_VkDeviceMemory.end()) return;
+        auto& bInfo = bIt->second;
+        if (bInfo.currentBacking != VK_NULL_HANDLE) {
+            auto oldIt = info_VkDeviceMemory.find(bInfo.currentBacking);
+            if (oldIt != info_VkDeviceMemory.end()) {
+                oldIt->second.boundObjects.erase(reinterpret_cast<uint64_t>(buffer));
+            }
+        }
+        VkDeviceSize bSize = bInfo.createInfo.size;
+        bInfo.currentBacking = memory;
+        bInfo.currentBackingOffset = memoryOffset;
+        bInfo.currentBackingSize = bSize;
+        mIt->second.boundObjects[reinterpret_cast<uint64_t>(buffer)] = {
+            memoryOffset, bSize, bInfo.createInfo.usage, true};
+    }
+
+    void trackBindImageMemoryLocked(VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+        auto iIt = info_VkImage.find(image);
+        auto mIt = info_VkDeviceMemory.find(memory);
+        if (iIt == info_VkImage.end() || mIt == info_VkDeviceMemory.end()) return;
+        auto& iInfo = iIt->second;
+        if (iInfo.currentBacking != VK_NULL_HANDLE) {
+            auto oldIt = info_VkDeviceMemory.find(iInfo.currentBacking);
+            if (oldIt != info_VkDeviceMemory.end()) {
+                oldIt->second.boundObjects.erase(reinterpret_cast<uint64_t>(image));
+            }
+        }
+        VkDeviceSize iSize = iInfo.baseRequirementsKnown
+                                 ? iInfo.baseRequirements.size
+                                 : ((mIt->second.allocationSize > memoryOffset)
+                                        ? (mIt->second.allocationSize - memoryOffset)
+                                        : 0);
+        iInfo.currentBacking = memory;
+        iInfo.currentBackingOffset = memoryOffset;
+        iInfo.currentBackingSize = iSize;
+        mIt->second.boundObjects[reinterpret_cast<uint64_t>(image)] = {
+            memoryOffset, iSize, 0xFFFFFFFFu, false};
+    }
+
+    void on_vkDestroyBuffer(
+        void* context,
+        VkDevice device, VkBuffer buffer, const VkAllocationCallbacks *pAllocator) {
+        {
+            AutoLock<RecursiveLock> lock(mLock);
+            auto bIt = info_VkBuffer.find(buffer);
+            if (bIt != info_VkBuffer.end() && bIt->second.currentBacking != VK_NULL_HANDLE) {
+                auto mIt = info_VkDeviceMemory.find(bIt->second.currentBacking);
+                if (mIt != info_VkDeviceMemory.end()) {
+                    mIt->second.boundObjects.erase(reinterpret_cast<uint64_t>(buffer));
+                }
+                bIt->second.currentBacking = VK_NULL_HANDLE;
+            }
+        }
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkDestroyBuffer(device, buffer, pAllocator, true /* do lock */);
+    }""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    VkResult on_vkBindBufferMemory(
+        void *context, VkResult,
+        VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+        VkEncoder *enc = (VkEncoder *)context;
+        return enc->vkBindBufferMemory(
+            device, buffer, memory, memoryOffset, true /* do lock */);
+    }
+
+    VkResult on_vkBindBufferMemory2(
+        void *context, VkResult,
+        VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos) {
+        VkEncoder *enc = (VkEncoder *)context;
+        return enc->vkBindBufferMemory2(
+            device, bindInfoCount, pBindInfos, true /* do lock */);
+    }
+
+    VkResult on_vkBindBufferMemory2KHR(
+        void *context, VkResult,
+        VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos) {
+        VkEncoder *enc = (VkEncoder *)context;
+        return enc->vkBindBufferMemory2KHR(
+            device, bindInfoCount, pBindInfos, true /* do lock */);
+    }""",
+        """    VkResult on_vkBindBufferMemory(
+        void *context, VkResult,
+        VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+        VkEncoder *enc = (VkEncoder *)context;
+        VkResult res = enc->vkBindBufferMemory(
+            device, buffer, memory, memoryOffset, true /* do lock */);
+        if (res == VK_SUCCESS) {
+            AutoLock<RecursiveLock> lock(mLock);
+            trackBindBufferMemoryLocked(buffer, memory, memoryOffset);
+        }
+        return res;
+    }
+
+    VkResult on_vkBindBufferMemory2(
+        void *context, VkResult,
+        VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos) {
+        VkEncoder *enc = (VkEncoder *)context;
+        VkResult res = enc->vkBindBufferMemory2(
+            device, bindInfoCount, pBindInfos, true /* do lock */);
+        if (res == VK_SUCCESS && pBindInfos) {
+            AutoLock<RecursiveLock> lock(mLock);
+            for (uint32_t i = 0; i < bindInfoCount; ++i) {
+                trackBindBufferMemoryLocked(
+                    pBindInfos[i].buffer, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+            }
+        }
+        return res;
+    }
+
+    VkResult on_vkBindBufferMemory2KHR(
+        void *context, VkResult,
+        VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos) {
+        VkEncoder *enc = (VkEncoder *)context;
+        VkResult res = enc->vkBindBufferMemory2KHR(
+            device, bindInfoCount, pBindInfos, true /* do lock */);
+        if (res == VK_SUCCESS && pBindInfos) {
+            AutoLock<RecursiveLock> lock(mLock);
+            for (uint32_t i = 0; i < bindInfoCount; ++i) {
+                trackBindBufferMemoryLocked(
+                    pBindInfos[i].buffer, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+            }
+        }
+        return res;
+    }""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """            imageInfo.pendingQsriSyncFds.clear();
+        }
+#endif
+
+        VkEncoder* enc = (VkEncoder*)context;""",
+        """            imageInfo.pendingQsriSyncFds.clear();
+            if (imageInfo.currentBacking != VK_NULL_HANDLE) {
+                auto mIt = info_VkDeviceMemory.find(imageInfo.currentBacking);
+                if (mIt != info_VkDeviceMemory.end()) {
+                    mIt->second.boundObjects.erase(reinterpret_cast<uint64_t>(image));
+                }
+                imageInfo.currentBacking = VK_NULL_HANDLE;
+            }
+        }
+#endif
+
+        VkEncoder* enc = (VkEncoder*)context;""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        return enc->vkBindImageMemory(device, image, memory, memoryOffset, true /* do lock */);
+    }
+
+    VkResult on_vkBindImageMemory2(
+        void* context, VkResult,
+        VkDevice device, uint32_t bindingCount, const VkBindImageMemoryInfo* pBindInfos) {
+        VkEncoder* enc = (VkEncoder*)context;
+        // Do not forward calls with invalid handles to host.
+        if (!pBindInfos ||
+            info_VkDeviceMemory.find(pBindInfos->memory) ==
+                info_VkDeviceMemory.end() ||
+            info_VkImage.find(pBindInfos->image) == info_VkImage.end()) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        return enc->vkBindImageMemory2(device, bindingCount, pBindInfos, true /* do lock */);
+    }
+
+    VkResult on_vkBindImageMemory2KHR(
+        void* context, VkResult,
+        VkDevice device, uint32_t bindingCount, const VkBindImageMemoryInfo* pBindInfos) {
+        VkEncoder* enc = (VkEncoder*)context;
+        // Do not forward calls with invalid handles to host.
+        if (!pBindInfos ||
+            info_VkDeviceMemory.find(pBindInfos->memory) ==
+                info_VkDeviceMemory.end() ||
+            info_VkImage.find(pBindInfos->image) == info_VkImage.end()) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        return enc->vkBindImageMemory2KHR(device, bindingCount, pBindInfos, true /* do lock */);
+    }""",
+        """        VkResult res = enc->vkBindImageMemory(device, image, memory, memoryOffset, true /* do lock */);
+        if (res == VK_SUCCESS) {
+            AutoLock<RecursiveLock> lock(mLock);
+            trackBindImageMemoryLocked(image, memory, memoryOffset);
+        }
+        return res;
+    }
+
+    VkResult on_vkBindImageMemory2(
+        void* context, VkResult,
+        VkDevice device, uint32_t bindingCount, const VkBindImageMemoryInfo* pBindInfos) {
+        VkEncoder* enc = (VkEncoder*)context;
+        // Do not forward calls with invalid handles to host.
+        if (!pBindInfos ||
+            info_VkDeviceMemory.find(pBindInfos->memory) ==
+                info_VkDeviceMemory.end() ||
+            info_VkImage.find(pBindInfos->image) == info_VkImage.end()) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        VkResult res = enc->vkBindImageMemory2(device, bindingCount, pBindInfos, true /* do lock */);
+        if (res == VK_SUCCESS) {
+            AutoLock<RecursiveLock> lock(mLock);
+            for (uint32_t i = 0; i < bindingCount; ++i) {
+                trackBindImageMemoryLocked(
+                    pBindInfos[i].image, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+            }
+        }
+        return res;
+    }
+
+    VkResult on_vkBindImageMemory2KHR(
+        void* context, VkResult,
+        VkDevice device, uint32_t bindingCount, const VkBindImageMemoryInfo* pBindInfos) {
+        VkEncoder* enc = (VkEncoder*)context;
+        // Do not forward calls with invalid handles to host.
+        if (!pBindInfos ||
+            info_VkDeviceMemory.find(pBindInfos->memory) ==
+                info_VkDeviceMemory.end() ||
+            info_VkImage.find(pBindInfos->image) == info_VkImage.end()) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        VkResult res = enc->vkBindImageMemory2KHR(device, bindingCount, pBindInfos, true /* do lock */);
+        if (res == VK_SUCCESS) {
+            AutoLock<RecursiveLock> lock(mLock);
+            for (uint32_t i = 0; i < bindingCount; ++i) {
+                trackBindImageMemoryLocked(
+                    pBindInfos[i].image, pBindInfos[i].memory, pBindInfos[i].memoryOffset);
+            }
+        }
+        return res;
+    }""",
+    )
+
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """void ResourceTracker::deviceMemoryTransform_tohost(""",
+        """void ResourceTracker::recordCommandBufferBufferRef(
+    VkCommandBuffer commandBuffer,
+    VkBuffer buffer,
+    VkDeviceSize offset,
+    VkDeviceSize size) {
+    mImpl->recordCommandBufferBufferRef(commandBuffer, buffer, offset, size);
+}
+
+void ResourceTracker::deviceMemoryTransform_tohost(""",
+    )
+
+    # Record command-buffer buffer references in VkEncoder.cpp for coherent range tracking
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    ENCODER_DEBUG_LOG("vkCmdBindIndexBuffer(commandBuffer:%p, buffer:%p, offset:%ld)", commandBuffer, buffer, offset);""",
+        """    ENCODER_DEBUG_LOG("vkCmdBindIndexBuffer(commandBuffer:%p, buffer:%p, offset:%ld)", commandBuffer, buffer, offset);
+    if (sResourceTracker) sResourceTracker->recordCommandBufferBufferRef(commandBuffer, buffer, offset, VK_WHOLE_SIZE);""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    ENCODER_DEBUG_LOG("vkCmdBindVertexBuffers(commandBuffer:%p, firstBinding:%d, bindingCount:%d, pBuffers:%p, pOffsets:%p)", commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets);""",
+        """    ENCODER_DEBUG_LOG("vkCmdBindVertexBuffers(commandBuffer:%p, firstBinding:%d, bindingCount:%d, pBuffers:%p, pOffsets:%p)", commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets);
+    if (sResourceTracker && pBuffers) {
+        for (uint32_t _bi = 0; _bi < bindingCount; ++_bi) {
+            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, pBuffers[_bi], pOffsets ? pOffsets[_bi] : 0, VK_WHOLE_SIZE);
+        }
+    }""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    ENCODER_DEBUG_LOG("vkCmdCopyBuffer(commandBuffer:%p, srcBuffer:%p, dstBuffer:%p, regionCount:%d, pRegions:%p)", commandBuffer, srcBuffer, dstBuffer, regionCount, pRegions);""",
+        """    ENCODER_DEBUG_LOG("vkCmdCopyBuffer(commandBuffer:%p, srcBuffer:%p, dstBuffer:%p, regionCount:%d, pRegions:%p)", commandBuffer, srcBuffer, dstBuffer, regionCount, pRegions);
+    if (sResourceTracker && pRegions) {
+        for (uint32_t _ri = 0; _ri < regionCount; ++_ri) {
+            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].srcOffset, pRegions[_ri].size);
+        }
+    }""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    ENCODER_DEBUG_LOG("vkCmdCopyBufferToImage(commandBuffer:%p, srcBuffer:%p, dstImage:%p, dstImageLayout:%d, regionCount:%d, pRegions:%p)", commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);""",
+        """    ENCODER_DEBUG_LOG("vkCmdCopyBufferToImage(commandBuffer:%p, srcBuffer:%p, dstImage:%p, dstImageLayout:%d, regionCount:%d, pRegions:%p)", commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
+    if (sResourceTracker && pRegions) {
+        for (uint32_t _ri = 0; _ri < regionCount; ++_ri) {
+            VkDeviceSize _rowT = pRegions[_ri].bufferRowLength ? pRegions[_ri].bufferRowLength : pRegions[_ri].imageExtent.width;
+            VkDeviceSize _imgH = pRegions[_ri].bufferImageHeight ? pRegions[_ri].bufferImageHeight : pRegions[_ri].imageExtent.height;
+            VkDeviceSize _dep = pRegions[_ri].imageExtent.depth ? pRegions[_ri].imageExtent.depth : 1;
+            VkDeviceSize _lay = pRegions[_ri].imageSubresource.layerCount ? pRegions[_ri].imageSubresource.layerCount : 1;
+            VkDeviceSize _maxB = _rowT * _imgH * _dep * _lay * 16ULL;
+            if (_maxB < 4096ULL) _maxB = 4096ULL;
+            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].bufferOffset, _maxB);
+        }
+    }""",
     )
 
     patch_file(
@@ -372,6 +843,16 @@ def main() -> None:
         "            auto actualSize = size == VK_WHOLE_SIZE ? sResourceTracker->getMappedSize(memory) : size;",
         "            auto actualSize = size == VK_WHOLE_SIZE ? (sResourceTracker->getMappedSize(memory) - offset) : size;",
         replace_all=True,
+    )
+
+    # Make OP_vkFlushMappedMemoryRanges async fire-and-forget (paired with host VkDecoder.cpp
+    # on __OHOS__) to eliminate full IPC round-trip stalls before every vkQueueSubmit/vkUnmapMemory.
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    VkResult vkFlushMappedMemoryRanges_VkResult_return = (VkResult)0;
+    stream->read(&vkFlushMappedMemoryRanges_VkResult_return, sizeof(VkResult));""",
+        """    VkResult vkFlushMappedMemoryRanges_VkResult_return = VK_SUCCESS;
+    stream->flush();""",
     )
 
     # 5. Also record ownerDevice in setDeviceMemoryInfo, cache /dev/goldfish_sync open failure,
@@ -436,8 +917,10 @@ def main() -> None:
             if (syncFd >= 0) {
                 *pFd = dup(syncFd);
             } else {
+                // Flush ordered command stream so host submits the signaled work to Maleoon 916
+                // immediately without stalling RenderThread on a full vkDeviceWaitIdle pipeline drain.
                 if (enc) {
-                    enc->vkDeviceWaitIdle(device, true /* do lock */);
+                    enc->flush();
                 }
                 *pFd = -1;
             }
@@ -495,6 +978,575 @@ def main() -> None:
             !importVmoInfoPtr;""",
     )
 
+    # 7. GLES eglSwapBuffers: avoid blocking RenderThread on synchronous glFinish (eglWaitClient)
+    #    when native sync fd is absent; flushing the ordered command stream is sufficient because
+    #    rcFlushWindowColorBufferAsync executes under host FrameBuffer lock before SurfaceFlinger
+    #    composites the queued buffer on the next VSync.
+    patch_file(
+        "system/egl/egl.cpp",
+        """    } else {
+        // equivalent to glFinish if no native sync
+        eglWaitClient();
+    }""",
+        """    } else {
+        // Flush ordered GL stream without blocking RenderThread on synchronous glFinish round-trip.
+        hostCon->flush();
+    }""",
+    )
+
+    # 8. Make OP_vkBindBufferMemory, OP_vkResetFences, and OP_vkResetCommandPool
+    #    async fire-and-forget (paired with host VkDecoder.cpp on __OHOS__) to avoid
+    #    >1,100 unnecessary synchronous IPC round-trips every 2 seconds.
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    VkResult vkBindBufferMemory_VkResult_return = (VkResult)0;
+    stream->read(&vkBindBufferMemory_VkResult_return, sizeof(VkResult));""",
+        """    VkResult vkBindBufferMemory_VkResult_return = VK_SUCCESS;""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    VkResult vkBindImageMemory_VkResult_return = (VkResult)0;
+    stream->read(&vkBindImageMemory_VkResult_return, sizeof(VkResult));""",
+        """    VkResult vkBindImageMemory_VkResult_return = VK_SUCCESS;""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    VkResult vkResetFences_VkResult_return = (VkResult)0;
+    stream->read(&vkResetFences_VkResult_return, sizeof(VkResult));""",
+        """    VkResult vkResetFences_VkResult_return = VK_SUCCESS;""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    VkResult vkResetCommandPool_VkResult_return = (VkResult)0;
+    stream->read(&vkResetCommandPool_VkResult_return, sizeof(VkResult));""",
+        """    VkResult vkResetCommandPool_VkResult_return = VK_SUCCESS;""",
+    )
+
+    # 9. Cache on_vkGetBufferMemoryRequirements2 / KHR from vkCreateBufferWithRequirementsGOOGLE
+    #    (goldfish-opengl-r cached v1 but missed v2, causing ~900 redundant sync IPCs / 2s in Android 14 SkiaVK).
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    void on_vkGetBufferMemoryRequirements2(
+        void* context, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+        VkMemoryRequirements2* pMemoryRequirements) {
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkGetBufferMemoryRequirements2(device, pInfo, pMemoryRequirements, true /* do lock */);
+        transformBufferMemoryRequirements2ForGuest(
+            pInfo->buffer, pMemoryRequirements);
+    }
+
+    void on_vkGetBufferMemoryRequirements2KHR(
+        void* context, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+        VkMemoryRequirements2* pMemoryRequirements) {
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkGetBufferMemoryRequirements2KHR(device, pInfo, pMemoryRequirements, true /* do lock */);
+        transformBufferMemoryRequirements2ForGuest(
+            pInfo->buffer, pMemoryRequirements);
+    }""",
+        """    bool tryGetCachedBufferMemoryRequirements2(
+        VkBuffer buffer, VkMemoryRequirements2* pMemoryRequirements) {
+        AutoLock<RecursiveLock> lock(mLock);
+        auto it = info_VkBuffer.find(buffer);
+        if (it == info_VkBuffer.end() || !it->second.baseRequirementsKnown || it->second.external) {
+            return false;
+        }
+        for (VkBaseOutStructure* ext = reinterpret_cast<VkBaseOutStructure*>(pMemoryRequirements->pNext);
+             ext != nullptr; ext = ext->pNext) {
+            if (ext->sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+                return false;
+            }
+        }
+        pMemoryRequirements->memoryRequirements = it->second.baseRequirements;
+        for (VkBaseOutStructure* ext = reinterpret_cast<VkBaseOutStructure*>(pMemoryRequirements->pNext);
+             ext != nullptr; ext = ext->pNext) {
+            auto* ded = reinterpret_cast<VkMemoryDedicatedRequirements*>(ext);
+            ded->prefersDedicatedAllocation = VK_FALSE;
+            ded->requiresDedicatedAllocation = VK_FALSE;
+        }
+        return true;
+    }
+
+    void on_vkGetBufferMemoryRequirements2(
+        void* context, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+        VkMemoryRequirements2* pMemoryRequirements) {
+        if (pInfo && pMemoryRequirements &&
+            tryGetCachedBufferMemoryRequirements2(pInfo->buffer, pMemoryRequirements)) {
+            return;
+        }
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkGetBufferMemoryRequirements2(device, pInfo, pMemoryRequirements, true /* do lock */);
+        transformBufferMemoryRequirements2ForGuest(
+            pInfo->buffer, pMemoryRequirements);
+    }
+
+    void on_vkGetBufferMemoryRequirements2KHR(
+        void* context, VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo,
+        VkMemoryRequirements2* pMemoryRequirements) {
+        if (pInfo && pMemoryRequirements &&
+            tryGetCachedBufferMemoryRequirements2(pInfo->buffer, pMemoryRequirements)) {
+            return;
+        }
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkGetBufferMemoryRequirements2KHR(device, pInfo, pMemoryRequirements, true /* do lock */);
+        transformBufferMemoryRequirements2ForGuest(
+            pInfo->buffer, pMemoryRequirements);
+    }""",
+    )
+
+    # 10. Smart vkGetFenceStatus cache + post-submit poll throttle so SkiaVK's non-blocking
+    #     fence polls don't drain the ordered host RenderThread stream immediately after submit.
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.h",
+        """    VkResult on_vkResetFences(
+        void* context,
+        VkResult input_result,
+        VkDevice device,
+        uint32_t fenceCount,
+        const VkFence* pFences);""",
+        """    VkResult on_vkResetFences(
+        void* context,
+        VkResult input_result,
+        VkDevice device,
+        uint32_t fenceCount,
+        const VkFence* pFences);
+    VkResult on_vkGetFenceStatus(
+        void* context, VkResult input_result,
+        VkDevice device, VkFence fence);""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    struct VkFence_Info {
+        VkDevice device;
+        bool external = false;
+        VkExportFenceCreateInfo exportFenceCreateInfo;
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        int syncFd = -1;
+#endif
+    };""",
+        """    struct VkFence_Info {
+        VkDevice device;
+        bool external = false;
+        VkExportFenceCreateInfo exportFenceCreateInfo;
+        bool signaledCached = false;
+        uint64_t lastSubmitNs = 0;
+        VkQueue lastSubmitQueue = VK_NULL_HANDLE;
+        uint32_t fastNotReadyCount = 0;
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        int syncFd = -1;
+#endif
+    };""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        if (input_result != VK_SUCCESS) return input_result;
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        if (exportSyncFd) {""",
+        """        if (input_result != VK_SUCCESS) return input_result;
+
+        if (pCreateInfo && (pCreateInfo->flags & VK_FENCE_CREATE_SIGNALED_BIT)) {
+            AutoLock<RecursiveLock> lock(mLock);
+            auto it = info_VkFence.find(*pFence);
+            if (it != info_VkFence.end()) {
+                it->second.signaledCached = true;
+            }
+        }
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        if (exportSyncFd) {""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        for (uint32_t i = 0; i < fenceCount; ++i) {
+            VkFence fence = pFences[i];
+            auto it = info_VkFence.find(fence);
+            auto& info = it->second;
+            if (!info.external) continue;""",
+        """        for (uint32_t i = 0; i < fenceCount; ++i) {
+            VkFence fence = pFences[i];
+            auto it = info_VkFence.find(fence);
+            if (it == info_VkFence.end()) continue;
+            auto& info = it->second;
+            info.signaledCached = false;
+            info.lastSubmitNs = 0;
+            info.lastSubmitQueue = VK_NULL_HANDLE;
+            info.fastNotReadyCount = 0;
+            if (!info.external) continue;""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        if (fencesExternal.empty()) {
+            // No need for work pool, just wait with host driver.
+            return enc->vkWaitForFences(
+                device, fenceCount, pFences, waitAll, timeout, true /* do lock */);
+        } else {""",
+        """        if (fencesExternal.empty()) {
+            bool allSignaled = (fenceCount > 0);
+            {
+                AutoLock<RecursiveLock> cLock(mLock);
+                for (uint32_t i = 0; i < fenceCount; ++i) {
+                    auto it = info_VkFence.find(pFences[i]);
+                    if (it == info_VkFence.end() || !it->second.signaledCached) {
+                        allSignaled = false;
+                        break;
+                    }
+                }
+            }
+            if (allSignaled) return VK_SUCCESS;
+            VkResult wRes = enc->vkWaitForFences(
+                device, fenceCount, pFences, waitAll, timeout, true /* do lock */);
+            if (wRes == VK_SUCCESS && (waitAll || fenceCount == 1)) {
+                AutoLock<RecursiveLock> cLock(mLock);
+                for (uint32_t i = 0; i < fenceCount; ++i) {
+                    auto it = info_VkFence.find(pFences[i]);
+                    if (it != info_VkFence.end()) it->second.signaledCached = true;
+                }
+            }
+            return wRes;
+        } else {""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """    VkResult on_vkCreateDescriptorPool(""",
+        """    std::unordered_map<VkDevice, uint64_t> mDeviceLastSubmitNs;
+    std::unordered_map<VkDevice, uint64_t> mDeviceNotReadySubmitNs;
+    std::unordered_map<VkDevice, uint64_t> mDeviceNotReadyQueryNs;
+    std::unordered_map<VkDevice, uint64_t> mDeviceLastFencePollNs;
+
+    struct BufferReqCacheKey {
+        VkDevice device;
+        VkBufferCreateFlags flags;
+        VkBufferUsageFlags usage;
+        VkSharingMode sharingMode;
+        bool operator==(const BufferReqCacheKey& o) const {
+            return device == o.device && flags == o.flags &&
+                   usage == o.usage && sharingMode == o.sharingMode;
+        }
+    };
+    struct BufferReqCacheKeyHash {
+        size_t operator()(const BufferReqCacheKey& k) const {
+            size_t h = std::hash<uint64_t>{}(reinterpret_cast<uint64_t>(k.device));
+            h ^= (static_cast<size_t>(k.flags) * 0x9e3779b97f4a7c15ULL);
+            h ^= (static_cast<size_t>(k.usage) * 0xbf58476d1ce4e5b9ULL);
+            h ^= (static_cast<size_t>(k.sharingMode) * 0x94d049bb133111ebULL);
+            return h;
+        }
+    };
+    struct CachedBufferReq {
+        VkDeviceSize alignment = 256;
+        uint32_t memoryTypeBits = 0;
+    };
+    std::unordered_map<BufferReqCacheKey, CachedBufferReq, BufferReqCacheKeyHash> mBufferReqCache;
+
+    static uint64_t allocClientHandle() {
+        static std::atomic<uint64_t> sSeq{1};
+        uint64_t pidPart = (static_cast<uint64_t>(getpid()) & 0xFFFFFFULL) << 39;
+        uint64_t seqPart = sSeq.fetch_add(1, std::memory_order_relaxed) & 0x7FFFFFFFFFULL;
+        return (1ULL << 63) | pidPart | seqPart;
+    }
+
+    VkResult on_vkGetFenceStatus(
+        void* context, VkResult,
+        VkDevice device, VkFence fence) {
+        struct timespec nowTs{};
+        clock_gettime(CLOCK_MONOTONIC, &nowTs);
+        uint64_t nowNs = (uint64_t)nowTs.tv_sec * 1000000000ULL + (uint64_t)nowTs.tv_nsec;
+        uint64_t queriedFenceSubmitNs = 0;
+        VkQueue queriedFenceQueue = VK_NULL_HANDLE;
+        {
+            AutoLock<RecursiveLock> lock(mLock);
+            auto it = info_VkFence.find(fence);
+            if (it != info_VkFence.end()) {
+                auto& info = it->second;
+                queriedFenceSubmitNs = info.lastSubmitNs;
+                queriedFenceQueue = info.lastSubmitQueue;
+                if (info.signaledCached) {
+                    return VK_SUCCESS;
+                }
+                if (!info.external && info.lastSubmitNs > 0) {
+                    uint64_t fenceAgeNs = (nowNs >= info.lastSubmitNs) ? (nowNs - info.lastSubmitNs) : 0;
+                    // Safety cap: always poll host once a fence is >= 24ms old so no spin-wait
+                    // or command-buffer recycling can ever stall.
+                    if (fenceAgeNs < 24000000ULL) {
+                        auto dIt = mDeviceLastSubmitNs.find(device);
+                        bool recentDeviceSubmit =
+                            (dIt != mDeviceLastSubmitNs.end() && nowNs >= dIt->second &&
+                             (nowNs - dIt->second) < 3500000ULL);
+                        bool recentFenceSubmit = (fenceAgeNs < 12000000ULL);
+                        auto lpIt = mDeviceLastFencePollNs.find(device);
+                        bool recentPoll =
+                            (lpIt != mDeviceLastFencePollNs.end() && nowNs >= lpIt->second &&
+                             (nowNs - lpIt->second) < 8000000ULL);
+                        auto nrIt = mDeviceNotReadySubmitNs.find(device);
+                        auto nqIt = mDeviceNotReadyQueryNs.find(device);
+                        bool fifoBlocked =
+                            (nrIt != mDeviceNotReadySubmitNs.end() && nqIt != mDeviceNotReadyQueryNs.end() &&
+                             nrIt->second > 0 && info.lastSubmitNs >= nrIt->second &&
+                             nowNs >= nqIt->second && (nowNs - nqIt->second) < 8000000ULL);
+                        if (recentDeviceSubmit || recentFenceSubmit || recentPoll || fifoBlocked) {
+                            return VK_NOT_READY;
+                        }
+                    }
+                }
+            }
+        }
+        VkEncoder* enc = (VkEncoder*)context;
+        VkResult res = enc->vkGetFenceStatus(device, fence, true /* do lock */);
+        {
+            struct timespec t1{};
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t t1Ns = (uint64_t)t1.tv_sec * 1000000000ULL + (uint64_t)t1.tv_nsec;
+            AutoLock<RecursiveLock> lock(mLock);
+            mDeviceLastFencePollNs[device] = t1Ns;
+            auto it = info_VkFence.find(fence);
+            if (it != info_VkFence.end()) {
+                if (res == VK_SUCCESS) {
+                    it->second.signaledCached = true;
+                    // FIFO queue guarantee: all older fences submitted to the same queue are also signaled.
+                    if (queriedFenceQueue != VK_NULL_HANDLE && queriedFenceSubmitNs > 0) {
+                        for (auto& kv : info_VkFence) {
+                            if (!kv.second.external && !kv.second.signaledCached &&
+                                kv.second.lastSubmitQueue == queriedFenceQueue &&
+                                kv.second.lastSubmitNs > 0 &&
+                                kv.second.lastSubmitNs <= queriedFenceSubmitNs) {
+                                kv.second.signaledCached = true;
+                            }
+                        }
+                    }
+                } else if (res == VK_NOT_READY) {
+                    mDeviceNotReadyQueryNs[device] = t1Ns;
+                    if (queriedFenceSubmitNs > 0) {
+                        mDeviceNotReadySubmitNs[device] = queriedFenceSubmitNs;
+                    }
+                }
+            }
+        }
+        return res;
+    }
+
+    VkResult on_vkCreateDescriptorPool(""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        if (fence != VK_NULL_HANDLE) {
+            auto it = info_VkFence.find(fence);
+            if (it != info_VkFence.end()) {
+                const auto& info = it->second;
+                if (info.syncFd >= 0) {
+                    externalFenceFdToSignal = info.syncFd;
+                }
+            }
+        }
+#endif""",
+        """#if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
+        {
+            struct timespec subTs{};
+            clock_gettime(CLOCK_MONOTONIC, &subTs);
+            uint64_t subNs = (uint64_t)subTs.tv_sec * 1000000000ULL + (uint64_t)subTs.tv_nsec;
+            auto qIt = info_VkQueue.find(queue);
+            if (qIt != info_VkQueue.end()) {
+                mDeviceLastSubmitNs[qIt->second.device] = subNs;
+            }
+            if (fence != VK_NULL_HANDLE) {
+                auto it = info_VkFence.find(fence);
+                if (it != info_VkFence.end()) {
+                    auto& info = it->second;
+                    info.signaledCached = false;
+                    info.lastSubmitNs = subNs;
+                    info.lastSubmitQueue = queue;
+                    info.fastNotReadyCount = 0;
+                    if (info.syncFd >= 0) {
+                        externalFenceFdToSignal = info.syncFd;
+                    }
+                }
+            }
+        }
+#endif""",
+    )
+
+    # 11. Async client-alias creation for vkCreateBufferWithRequirementsGOOGLE & vkCreateSemaphore
+    #     (paired with host BoxedHandleManager client aliases & VkDecoder.cpp).
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        if (supportsCreateResourcesWithRequirements()) {
+            res = enc->vkCreateBufferWithRequirementsGOOGLE(
+                device, &localCreateInfo, pAllocator, pBuffer, &memReqs,
+                true /* do lock */);
+        } else {
+            res = enc->vkCreateBuffer(device, &localCreateInfo, pAllocator,
+                                      pBuffer, true /* do lock */);
+        }""",
+        """        if (supportsCreateResourcesWithRequirements()) {
+            bool canAsyncBuf = !extBufCiPtr && localCreateInfo.pNext == nullptr &&
+                               pCreateInfo->queueFamilyIndexCount == 0 && pAllocator == nullptr;
+            bool cachedHit = false;
+            BufferReqCacheKey reqKey{device, localCreateInfo.flags, localCreateInfo.usage, localCreateInfo.sharingMode};
+            if (canAsyncBuf) {
+                AutoLock<RecursiveLock> cLock(mLock);
+                auto cIt = mBufferReqCache.find(reqKey);
+                if (cIt != mBufferReqCache.end()) {
+                    VkDeviceSize align = cIt->second.alignment ? cIt->second.alignment : 1;
+                    memReqs.alignment = cIt->second.alignment;
+                    memReqs.memoryTypeBits = cIt->second.memoryTypeBits;
+                    memReqs.size = (localCreateInfo.size + align - 1) & ~(align - 1);
+                    cachedHit = true;
+                }
+            }
+            if (cachedHit) {
+                *pBuffer = reinterpret_cast<VkBuffer>(allocClientHandle());
+                res = enc->vkCreateBufferWithRequirementsGOOGLE(
+                    device, &localCreateInfo, pAllocator, pBuffer, &memReqs,
+                    true /* do lock */);
+            } else {
+                *pBuffer = VK_NULL_HANDLE;
+                res = enc->vkCreateBufferWithRequirementsGOOGLE(
+                    device, &localCreateInfo, pAllocator, pBuffer, &memReqs,
+                    true /* do lock */);
+                if (res == VK_SUCCESS && canAsyncBuf && memReqs.memoryTypeBits != 0) {
+                    AutoLock<RecursiveLock> cLock(mLock);
+                    mBufferReqCache[reqKey] = {memReqs.alignment, memReqs.memoryTypeBits};
+                }
+            }
+        } else {
+            *pBuffer = VK_NULL_HANDLE;
+            res = enc->vkCreateBuffer(device, &localCreateInfo, pAllocator,
+                                      pBuffer, true /* do lock */);
+        }""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    /* is handle, possibly out */;
+    reservedmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkMemoryRequirements*)(pMemoryRequirements), streamPtrPtr);
+    stream->setHandleMapping(sResourceTracker->createMapping());
+    uint64_t cgen_var_3;
+    stream->read((uint64_t*)&cgen_var_3, 8);
+    stream->handleMapping()->mapHandles_u64_VkBuffer(&cgen_var_3, (VkBuffer*)pBuffer, 1);
+    stream->unsetHandleMapping();
+    unmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkMemoryRequirements*)(pMemoryRequirements));
+    if (pMemoryRequirements)
+    {
+        transform_fromhost_VkMemoryRequirements(sResourceTracker, (VkMemoryRequirements*)(pMemoryRequirements));
+    }
+    VkResult vkCreateBufferWithRequirementsGOOGLE_VkResult_return = (VkResult)0;
+    stream->read(&vkCreateBufferWithRequirementsGOOGLE_VkResult_return, sizeof(VkResult));""",
+        """    /* is handle, possibly out */;
+    reservedmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkMemoryRequirements*)(pMemoryRequirements), streamPtrPtr);
+    VkResult vkCreateBufferWithRequirementsGOOGLE_VkResult_return = VK_SUCCESS;
+    if ((cgen_var_2 & (1ULL << 63)) != 0)
+    {
+        stream->setHandleMapping(sResourceTracker->createMapping());
+        uint64_t cgen_var_3 = cgen_var_2;
+        stream->handleMapping()->mapHandles_u64_VkBuffer(&cgen_var_3, (VkBuffer*)pBuffer, 1);
+        stream->unsetHandleMapping();
+    }
+    else
+    {
+        stream->setHandleMapping(sResourceTracker->createMapping());
+        uint64_t cgen_var_3;
+        stream->read((uint64_t*)&cgen_var_3, 8);
+        stream->handleMapping()->mapHandles_u64_VkBuffer(&cgen_var_3, (VkBuffer*)pBuffer, 1);
+        stream->unsetHandleMapping();
+        unmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkMemoryRequirements*)(pMemoryRequirements));
+        if (pMemoryRequirements)
+        {
+            transform_fromhost_VkMemoryRequirements(sResourceTracker, (VkMemoryRequirements*)(pMemoryRequirements));
+        }
+        vkCreateBufferWithRequirementsGOOGLE_VkResult_return = (VkResult)0;
+        stream->read(&vkCreateBufferWithRequirementsGOOGLE_VkResult_return, sizeof(VkResult));
+    }""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        input_result = enc->vkCreateSemaphore(
+            device, &finalCreateInfo, pAllocator, pSemaphore, true /* do lock */);""",
+        """        if (finalCreateInfo.pNext == nullptr && pAllocator == nullptr) {
+            *pSemaphore = reinterpret_cast<VkSemaphore>(allocClientHandle());
+        } else {
+            *pSemaphore = VK_NULL_HANDLE;
+        }
+        input_result = enc->vkCreateSemaphore(
+            device, &finalCreateInfo, pAllocator, pSemaphore, true /* do lock */);""",
+    )
+    patch_file(
+        "system/vulkan_enc/VkEncoder.cpp",
+        """    /* is handle, possibly out */;
+    stream->setHandleMapping(sResourceTracker->createMapping());
+    uint64_t cgen_var_3;
+    stream->read((uint64_t*)&cgen_var_3, 8);
+    stream->handleMapping()->mapHandles_u64_VkSemaphore(&cgen_var_3, (VkSemaphore*)pSemaphore, 1);
+    stream->unsetHandleMapping();
+    VkResult vkCreateSemaphore_VkResult_return = (VkResult)0;
+    stream->read(&vkCreateSemaphore_VkResult_return, sizeof(VkResult));""",
+        """    /* is handle, possibly out */;
+    VkResult vkCreateSemaphore_VkResult_return = VK_SUCCESS;
+    if ((cgen_var_2 & (1ULL << 63)) != 0)
+    {
+        stream->setHandleMapping(sResourceTracker->createMapping());
+        uint64_t cgen_var_3 = cgen_var_2;
+        stream->handleMapping()->mapHandles_u64_VkSemaphore(&cgen_var_3, (VkSemaphore*)pSemaphore, 1);
+        stream->unsetHandleMapping();
+    }
+    else
+    {
+        stream->setHandleMapping(sResourceTracker->createMapping());
+        uint64_t cgen_var_3;
+        stream->read((uint64_t*)&cgen_var_3, 8);
+        stream->handleMapping()->mapHandles_u64_VkSemaphore(&cgen_var_3, (VkSemaphore*)pSemaphore, 1);
+        stream->unsetHandleMapping();
+        vkCreateSemaphore_VkResult_return = (VkResult)0;
+        stream->read(&vkCreateSemaphore_VkResult_return, sizeof(VkResult));
+    }""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """VkResult ResourceTracker::on_vkResetFences(
+    void* context,
+    VkResult input_result,
+    VkDevice device,
+    uint32_t fenceCount,
+    const VkFence* pFences) {
+    return mImpl->on_vkResetFences(
+        context, input_result, device, fenceCount, pFences);
+}""",
+        """VkResult ResourceTracker::on_vkResetFences(
+    void* context,
+    VkResult input_result,
+    VkDevice device,
+    uint32_t fenceCount,
+    const VkFence* pFences) {
+    return mImpl->on_vkResetFences(
+        context, input_result, device, fenceCount, pFences);
+}
+VkResult ResourceTracker::on_vkGetFenceStatus(
+    void* context, VkResult input_result,
+    VkDevice device, VkFence fence) {
+    return mImpl->on_vkGetFenceStatus(
+        context, input_result, device, fence);
+}""",
+    )
+    patch_file(
+        "system/vulkan_enc/func_table.cpp",
+        """static VkResult entry_vkGetFenceStatus(
+    VkDevice device,
+    VkFence fence)
+{
+    AEMU_SCOPED_TRACE("vkGetFenceStatus");
+    auto vkEnc = ResourceTracker::getThreadLocalEncoder();
+    VkResult vkGetFenceStatus_VkResult_return = (VkResult)0;
+    vkGetFenceStatus_VkResult_return = vkEnc->vkGetFenceStatus(device, fence, true /* do lock */);
+    return vkGetFenceStatus_VkResult_return;
+}""",
+        """static VkResult entry_vkGetFenceStatus(
+    VkDevice device,
+    VkFence fence)
+{
+    AEMU_SCOPED_TRACE("vkGetFenceStatus");
+    auto vkEnc = ResourceTracker::getThreadLocalEncoder();
+    auto resources = ResourceTracker::get();
+    return resources->on_vkGetFenceStatus(vkEnc, VK_SUCCESS, device, fence);
+}""",
+    )
 
 if __name__ == "__main__":
     main()

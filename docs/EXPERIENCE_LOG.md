@@ -859,6 +859,38 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   * **GLES（`skiagl`）同场景对比**：**`704 帧`**（~70–100+ fps）· Janky **`13.78%`** · P50 **`14 ms`**（大量帧 `6–11 ms`）· P90 `27 ms` · `IssueDraw->Swap` **`5.4–7.5 ms`**
   * 剩余差距原因：Vulkan 模式当前无 `GlDirectMem`（跨进程 `memfd`/`ashmem` 零拷贝）且 `vkFlushMappedMemoryRanges` 每次需同步等回复，外加无 `/dev/goldfish_sync` 时 `qsriFence`/`vkDeviceWaitIdle` 串行等待；后续通过 `SCM_RIGHTS` 共享 `memfd` 开启 `GlDirectMem` + 异步虚拟 sync FD 可将 Vulkan 也推至 90–120 fps。
 
+---
+
+### 22. GLES + Vulkan 双模式 120 FPS 满帧冲刺（酷安实测 P50 9–11 ms，100–120 FPS）
+
+在 4 KiB 脏页 Diff 将 Vulkan P50 压到 `36 ms` 后，通过全链路 Host/Guest IPC 与 Vulkan 协议级热点剖析（`VK_PROF` + `VK_READ_PROF`），逐一消灭了剩余所有阻塞，最终在 `HAD-W32`（Maleoon 916 · `720×1280 @ 120Hz`）上把 **GLES 与 Vulkan 双模式均推至 100–120 FPS 满帧区间**：
+
+#### A. Host 端优化（[svbox_gfxstream_capi.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/svbox_gfxstream_capi.cpp)、[apply_host_patches.py](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/ohos_host/apply_host_patches.py)）
+1. **Direct `send()` 回包直发快速路径（`RenderChannel::setDirectWriteCallback`）**：Host `RenderThread` 产生回复时直接在 `writeToGuest()` 内经 `MSG_DONTWAIT` 写入 Guest `AF_UNIX` socket（仅在 `EAGAIN` 时回落 `gfx-epoll`），彻底消除了每笔同步 RPC 的 `eventfd -> epoll_wait -> tryRead -> send` 两次线程跳转。
+2. **`O(1)` ready-FD 批处理 + 大缓冲区 + `QOS_USER_INTERACTIVE (5)`**：`ServerLoop` 消除 300 连接 `O(N)` 扫描、`rxBuf` 扩至 `512 KiB`、`SO_SNDBUF/SO_RCVBUF` 扩至 `2 MiB`；`gfx-epoll` / `gfx-present` / `RenderThread` / `RenderWindowThread` 全部调用 `OH_QoS_SetThreadQoS(5)` 调度至大核满频；`SwapChainStateVk` 优先选用 `VK_PRESENT_MODE_MAILBOX_KHR`。
+3. **异步 Fire-and-Forget 协议扩展（`VkDecoder.cpp`）**：`OP_vkFlushMappedMemoryRanges`、`OP_vkBindBufferMemory`、`OP_vkBindImageMemory`、`OP_vkResetFences`、`OP_vkResetCommandPool` 改为异步单向执行（省去 >1,200 次/2s 同步等待）。
+4. **客户端高位别名句柄表（`VulkanBoxedHandles` + `VkDecoder.cpp`）**：以 bit-63 为哨兵标记的客户端预分配句柄别名（`registerClientAlias` / `resolveClientAlias` / `popClientAlias`），支撑 Guest 异步创建 `VkBuffer` 与 `VkSemaphore`（每 2 秒消灭 **1,840 次**同步句柄往返，且在 `remove`/`removeDelayed` 中自动回收零泄漏）。
+
+#### B. Guest 端优化（[apply_guest_patches.py](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/android_guest/apply_guest_patches.py)）
+1. **GLES `eglSwapBuffers` 去同步 `glFinish`**：[egl.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/gpu/third_party/goldfish-opengl-r/system/egl/egl.cpp) 无 native sync fd 时以有序 `hostCon->flush()` 替代阻塞 `eglWaitClient()`，`SwapBuffers -> FrameCompleted` 从 `2.5–10.2 ms` 降至 **`0.33–0.63 ms`**。
+2. **Vulkan Live-Bound + CommandBuffer 精确脏区间追踪**：拦截 `vkBindBufferMemory*`/`vkDestroyBuffer`/`vkBindImageMemory*`/`vkDestroyImage` 及 `vkCmdBindVertexBuffers`/`vkCmdBindIndexBuffer`/`vkCmdCopyBuffer`/`vkCmdCopyBufferToImage`，`on_vkQueueSubmit` 仅扫描本帧命令缓冲实际引用的子区间（跳过 VMA 8 MB 块内 95% 空洞与未引用缓冲），单次扫描从 **`8,192–32,358 KB` (`0.94–1.93 ms`)** 暴降至 **`53–436 KB` (`0.04–0.15 ms`)**。
+3. **`on_vkGetBufferMemoryRequirements2` 缓存**：复用 `vkCreateBufferWithRequirementsGOOGLE` 已缓存的 `baseRequirements`（含 `VkMemoryDedicatedRequirements`），消灭 900 次/2s 冗余同步 IPC（`-165 ms/2s`）。
+4. **Client-Alias 异步 `vkCreateBufferWithRequirementsGOOGLE` + `vkCreateSemaphore`**：按 `(device, flags, usage, sharingMode)` 缓存原始对齐/内存类型位，命中后以 bit-63 客户端句柄异步创建，消灭 **1,840 次/2s 同步 IPC（`-498 ms/2s`）**。
+5. **`on_vkGetSemaphoreFdKHR` 去全管线停顿**：Android 14 `SkiaVulkanPipeline` 每帧 `swapBuffers` 均调用 `vkGetSemaphoreFdKHR`，改用有序 `enc->flush()` 替代全 GPU 排空 `vkDeviceWaitIdle`（`-167 ms/2s`，`SwapBuffers` 降至 **`0.22–0.40 ms`**）。
+6. **`on_vkGetFenceStatus` 时间窗防队头阻塞 + FIFO 批量缓存**：在 `vkQueueSubmit` 后 `3.5 ms` 内及 `8 ms` 轮询窗内不打断 Host `RenderThread` 流水线（24 ms 安全上限保底不卡死），任一 fence 返回 `VK_SUCCESS` 时按 Vulkan FIFO 队列语义批量标记同队列更早 fence 为已触发。
+
+#### C. 酷安主信息流真机同口径实测对比（`HAD-W32` · `720×1280 @ 120Hz` · 大核 `12-19` · 10 轮连续快速滑动）
+| 指标 | Vulkan 优化前 | Vulkan 4KiB Diff | **Vulkan 最终版 (`skiavk`)** | **GLES 最终版 (`skiagl`)** |
+| --- | --- | --- | --- | --- |
+| **10s 渲染总帧数** | `232 帧` | `248 帧` | **`891–944 帧`**（**3.8×–4.1×**） | **`696–753 帧`** |
+| **P50 帧耗时** | `97 ms` | `36 ms` | **`11 ms`**（**快 8.8×**） | **`9–10 ms`** |
+| **P90 帧耗时** | `250 ms` | `69 ms` | **`23 ms`**（**快 10.9×**） | **`17–25 ms`** |
+| **P99 帧耗时** | `700 ms` | `150 ms` | **`42–69 ms`**（**快 10×–16.7×**） | **`113 ms`** |
+| **卡顿率（Janky）** | `93.97%` | `66.53%` | **`9.01%–9.09%`**（**↓10.4×**） | **`4.25%–7.33%`** |
+| **滑动连续帧间隔** | `35–95 ms` | `13–19 ms` | **`6.9–8.33 ms`（锁 120 FPS）** | **`6.7–7.7 ms`（锁 120 FPS）** |
+| **稳定性 & 画面** | 9–12s 闪退 | 0 崩溃 | **0 崩溃 · 100% 像素无撕裂** | **0 崩溃 · 100% 像素无撕裂** |
+
+
 
 
 

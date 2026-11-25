@@ -97,12 +97,22 @@ struct ClientConn {
     size_t txOffset = 0;
     std::deque<RenderChannel::Buffer> pendingToHost;
     bool epollOut = false;
+    std::shared_ptr<std::atomic<bool>> wakeQueued = std::make_shared<std::atomic<bool>>(false);
 
     // GLProcessPipe state
     uint64_t puid = 0;
     uint8_t confirmBuf[4] = {};
     size_t confirmGot = 0;
     bool puidSent = false;
+
+    // Direct-write fast-path state shared between gfx-epoll and RenderThread
+    struct DirectTxState {
+        std::mutex mu;
+        int fd = -1;
+        bool closed = false;
+        bool hasPendingTx = false;
+    };
+    std::shared_ptr<DirectTxState> directTx = std::make_shared<DirectTxState>();
 
     // Refcount pipe state
     uint8_t refBuf[4] = {};
@@ -163,6 +173,8 @@ struct HostState {
     std::string sockPath;
     int listenFd = -1;
     int wakeFd = -1;
+    std::mutex readyMu;
+    std::vector<int> readyFds;
     std::thread serverThread;
 
     std::string presentSockPath;
@@ -197,10 +209,37 @@ void SetNonBlocking(int fd) {
     }
 }
 
+void BoostGfxThreadQoS(const char* label) {
+    using SetQoSFn = int (*)(int);
+    static SetQoSFn fn = []() -> SetQoSFn {
+        void* h = dlopen("libqos.so", RTLD_NOW | RTLD_LOCAL);
+        return h ? reinterpret_cast<SetQoSFn>(dlsym(h, "OH_QoS_SetThreadQoS")) : nullptr;
+    }();
+    if (fn) {
+        int rc = fn(5 /* QOS_USER_INTERACTIVE */);
+        GFX_LOGI("BoostGfxThreadQoS(%s) -> %d", label, rc);
+    }
+}
+
 void WakeEpoll(HostState& st) {
     if (st.wakeFd >= 0) {
         uint64_t one = 1;
         (void)write(st.wakeFd, &one, sizeof(one));
+    }
+}
+
+void QueueReadyFd(HostState& st, const std::shared_ptr<std::atomic<bool>>& wakeQueued, int fd) {
+    if (!wakeQueued || wakeQueued->exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    bool needWake = false;
+    {
+        std::lock_guard<std::mutex> lk(st.readyMu);
+        needWake = st.readyFds.empty();
+        st.readyFds.push_back(fd);
+    }
+    if (needWake) {
+        WakeEpoll(st);
     }
 }
 
@@ -215,6 +254,7 @@ void UpdateEpollEvents(int epfd, ClientConn& c, bool wantOut) {
 }
 
 bool FlushTx(int epfd, ClientConn& c) {
+    std::unique_lock<std::mutex> lk(c.directTx->mu);
     while (!c.txQueue.empty()) {
         auto& front = c.txQueue.front();
         const char* p = front.data() + c.txOffset;
@@ -229,11 +269,15 @@ bool FlushTx(int epfd, ClientConn& c) {
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            c.directTx->hasPendingTx = true;
+            lk.unlock();
             UpdateEpollEvents(epfd, c, true);
             return true;
         }
         return false;
     }
+    c.directTx->hasPendingTx = false;
+    lk.unlock();
     UpdateEpollEvents(epfd, c, false);
     return true;
 }
@@ -280,6 +324,7 @@ void DrainPendingToHost(ClientConn& c) {
 }
 
 void ServerLoop() {
+    BoostGfxThreadQoS("gfx-epoll");
     HostState& st = State();
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
@@ -298,7 +343,7 @@ void ServerLoop() {
     addFd(st.wakeFd, EPOLLIN);
 
     std::unordered_map<int, std::unique_ptr<ClientConn>> conns;
-    std::vector<char> rxBuf(65536);
+    std::vector<char> rxBuf(512 * 1024);
 
     auto closeConn = [&](int fd) {
         auto it = conns.find(fd);
@@ -306,7 +351,13 @@ void ServerLoop() {
         auto& c = *it->second;
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
         if (c.kind == ConnKind::OpenGles) {
+            {
+                std::lock_guard<std::mutex> dlk(c.directTx->mu);
+                c.directTx->closed = true;
+                c.directTx->fd = -1;
+            }
             if (c.channel) {
+                c.channel->setDirectWriteCallback(nullptr);
                 c.channel->setEventCallback([](RenderChannel::State) {});
                 c.channel->stop();
                 c.channel.reset();
@@ -350,6 +401,9 @@ void ServerLoop() {
                 for (;;) {
                     int cfd = accept4(st.listenFd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
                     if (cfd < 0) break;
+                    const int bufBytes = 2 * 1024 * 1024;
+                    (void)setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufBytes, sizeof(bufBytes));
+                    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &bufBytes, sizeof(bufBytes));
                     auto cc = std::make_unique<ClientConn>();
                     cc->fd = cfd;
                     cc->kind = ConnKind::Handshake;
@@ -427,8 +481,37 @@ void ServerLoop() {
                                 break;
                             }
                             st.activeChannels.fetch_add(1);
-                            c.channel->setEventCallback([&st](RenderChannel::State) {
-                                WakeEpoll(st);
+                            auto wakeFlag = c.wakeQueued;
+                            int connFd = fd;
+                            {
+                                std::lock_guard<std::mutex> dlk(c.directTx->mu);
+                                c.directTx->fd = connFd;
+                                c.directTx->closed = false;
+                                c.directTx->hasPendingTx = !c.txQueue.empty();
+                            }
+                            auto dtx = c.directTx;
+                            c.channel->setDirectWriteCallback(
+                                [dtx](const char* buf, size_t sz) -> size_t {
+                                    std::lock_guard<std::mutex> dlk(dtx->mu);
+                                    if (dtx->closed || dtx->hasPendingTx || dtx->fd < 0) {
+                                        return 0;
+                                    }
+                                    size_t sent = 0;
+                                    while (sent < sz) {
+                                        ssize_t w = send(dtx->fd, buf + sent, sz - sent,
+                                                         MSG_NOSIGNAL | MSG_DONTWAIT);
+                                        if (w > 0) {
+                                            sent += static_cast<size_t>(w);
+                                            continue;
+                                        }
+                                        if (w < 0 && errno == EINTR) continue;
+                                        dtx->hasPendingTx = true;
+                                        break;
+                                    }
+                                    return sent;
+                                });
+                            c.channel->setEventCallback([&st, wakeFlag, connFd](RenderChannel::State) {
+                                QueueReadyFd(st, wakeFlag, connFd);
                             });
                             c.channel->setWantedEvents(RenderChannel::State::CanRead);
                             data = rest;
@@ -496,16 +579,24 @@ void ServerLoop() {
         }
 
         if (woken) {
+            std::vector<int> batch;
+            {
+                std::lock_guard<std::mutex> lk(st.readyMu);
+                batch.swap(st.readyFds);
+            }
             std::vector<int> deadFds;
-            for (auto& kv : conns) {
-                ClientConn& c = *kv.second;
+            for (int rfd : batch) {
+                auto it = conns.find(rfd);
+                if (it == conns.end()) continue;
+                ClientConn& c = *it->second;
+                c.wakeQueued->store(false, std::memory_order_release);
                 if (c.kind != ConnKind::OpenGles || !c.channel) continue;
                 DrainPendingToHost(c);
                 DrainChannelToGuest(epfd, c);
                 auto s = c.channel->state();
                 if ((static_cast<int>(s) & static_cast<int>(RenderChannel::State::Stopped)) &&
                     c.txQueue.empty()) {
-                    deadFds.push_back(kv.first);
+                    deadFds.push_back(rfd);
                 }
             }
             for (int dfd : deadFds) {
@@ -618,6 +709,7 @@ bool RecvExactFd(int fd, void* dst, size_t n) {
 }
 
 void HandlePresentClient(int cfd) {
+    BoostGfxThreadQoS("gfx-present-cli");
     struct timeval tv = { 5, 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     HostState& st = State();
@@ -638,6 +730,7 @@ void HandlePresentClient(int cfd) {
 }
 
 void PresentServerLoop() {
+    BoostGfxThreadQoS("gfx-present");
     HostState& st = State();
     while (!st.stop.load()) {
         struct sockaddr_un peer = {};
