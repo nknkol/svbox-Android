@@ -15,6 +15,14 @@ import {
   removeAndroidAppShortcut,
   ShortcutOpResult
 } from '../common/DesktopShortcut';
+import {
+  ControlSize,
+  FontSize,
+  IconSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
 import { arrangeOpenWindows } from '../common/WindowHelper';
 import {
   CreateInstanceOptions,
@@ -24,13 +32,15 @@ import {
   GlobalSettings,
   instanceManager
 } from '../model/InstanceModel';
-import { CreateInstanceDialog } from '../components/CreateInstanceDialog';
-import { DeviceSettingsDialog } from '../components/DeviceSettingsDialog';
+import { CreateInstanceSheet } from '../components/CreateInstanceDialog';
+import { DeviceSettingsSheet } from '../components/DeviceSettingsDialog';
 import { RenameDialog } from '../components/RenameDialog';
-import { BackupRestoreDialog } from '../components/BackupRestoreDialog';
-import { GlobalSettingsDialog } from '../components/GlobalSettingsDialog';
+import { BackupRestoreSheet } from '../components/BackupRestoreDialog';
+import { GlobalSettingsSheet } from '../components/GlobalSettingsDialog';
 
 const TAG: string = 'SvboxMain';
+const NAV_RAIL_ITEM_H: number = 58;
+const NAV_RAIL_ITEM_GAP: number = 8;
 
 interface ListAppsReply {
   ok?: boolean;
@@ -50,9 +60,18 @@ struct Index {
   @State private sortBy: string = 'index';      // 'index' | 'time' | 'name'
   @State private viewMode: string = 'card';     // 'card' | 'compact'
 
-  // Batch Mode
+  // Hover & Batch State
+  @State private hoveredInstId: string = '';
+  @State private hoveredAppPkg: string = '';
   @State private batchMode: boolean = false;
   @State private selectedIds: string[] = [];
+
+  // Half-Modal Sheet Visibility & Context
+  @State private showCreateSheet: boolean = false;
+  @State private showDeviceSettingsSheet: boolean = false;
+  @State private showBackupSheet: boolean = false;
+  @State private showGlobalSettingsSheet: boolean = false;
+  @State private editingInstance: DeviceInstance | undefined = undefined;
 
   // Live Runtime State
   @State private running: boolean = false;
@@ -77,18 +96,22 @@ struct Index {
   @State private pinnedIds: string[] = [];
   @State private prefEpoch: number = 0;
 
-  // Dialog Controllers (owned by @Component struct)
-  private createDialogCtrl: CustomDialogController | null = null;
-  private settingsDialogCtrl: CustomDialogController | null = null;
+  // Lightweight Rename Dialog Controller
   private renameDialogCtrl: CustomDialogController | null = null;
-  private backupDialogCtrl: CustomDialogController | null = null;
-  private globalDialogCtrl: CustomDialogController | null = null;
 
   private pollTimer: number = -1;
   private lastLaunchSeq: number = 0;
   private appsFetchedOnce: boolean = false;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
   private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
+
+  private runAnimated(curve: ICurve, duration: number, fn: () => void): void {
+    try {
+      this.getUIContext().animateTo({ duration: duration, curve: curve }, fn);
+    } catch (_e) {
+      fn();
+    }
+  }
 
   private showToast(msg: string): void {
     try {
@@ -107,9 +130,16 @@ struct Index {
     return dir && dir.length > 0 ? dir : '/data/storage/el2/base/haps/entry/files';
   }
 
-  private reloadInstances(): void {
+  private reloadInstances(animated: boolean = false): void {
     const filesDir: string = this.getSandboxFilesDir();
-    this.instances = instanceManager.getSorted(filesDir, this.sortBy);
+    const nextList: DeviceInstance[] = instanceManager.getSorted(filesDir, this.sortBy);
+    if (animated) {
+      this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_MEDIUM, () => {
+        this.instances = nextList;
+      });
+    } else {
+      this.instances = nextList;
+    }
   }
 
   private getInstanceById(id: string): DeviceInstance | undefined {
@@ -160,13 +190,12 @@ struct Index {
     this.globalSettings = gs;
     this.sortBy = gs.sortBy;
     this.viewMode = gs.viewMode;
-    this.reloadInstances();
+    this.reloadInstances(false);
 
     this.iconsDir = native.getIconsDir();
     this.lastLaunchSeq = AppStorage.get<number>('launchSeq') ?? 0;
     this.refreshPinnedShortcuts();
 
-    // Apply CLI / Want launch overrides onto primary instance #0 if provided
     const primary: DeviceInstance | undefined = this.getInstanceById('inst_0') ?? this.instances[0];
     if (primary) {
       let dirty: boolean = false;
@@ -195,7 +224,7 @@ struct Index {
       }
       if (dirty) {
         instanceManager.updateInstance(filesDir, primary);
-        this.reloadInstances();
+        this.reloadInstances(false);
       }
       AppStorage.setOrCreate<number>('refreshRate', primary.refreshRate);
 
@@ -261,7 +290,7 @@ struct Index {
             AppStorage.setOrCreate<number>('requestedRefreshRate', 0);
           }
           instanceManager.updateInstance(this.getSandboxFilesDir(), target);
-          this.reloadInstances();
+          this.reloadInstances(false);
 
           const mode: string | undefined = AppStorage.get<string>('autoStart');
           if (mode === 'bootanim' || mode === 'full') {
@@ -277,9 +306,18 @@ struct Index {
       }
 
       const st: RuntimeStatus = native.getStatus();
-      this.running = st.running;
-      this.paused = st.paused;
-      this.wmAgentReady = st.wmAgentReady;
+      const runningChanged: boolean = st.running !== this.running;
+      if (runningChanged) {
+        this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_SHORT, () => {
+          this.running = st.running;
+          this.paused = st.paused;
+          this.wmAgentReady = st.wmAgentReady;
+        });
+      } else {
+        this.running = st.running;
+        this.paused = st.paused;
+        this.wmAgentReady = st.wmAgentReady;
+      }
       this.fps = st.fps;
       if (st.running && st.activeInstanceId && st.activeInstanceId.length > 0) {
         this.activeInstanceId = st.activeInstanceId;
@@ -396,17 +434,13 @@ struct Index {
   }
 
   private startDeviceInstance(inst: DeviceInstance, bootMode: string): void {
-    // If another instance is currently running, ask user before switching
     if (this.running && this.activeInstanceId !== inst.id) {
       const runningInst: DeviceInstance | undefined = this.getInstanceById(this.activeInstanceId);
       const curName: string = runningInst ? runningInst.name : '当前设备';
       this.getUIContext().showAlertDialog({
         title: '切换运行设备',
         message: `「${curName}」正在运行中。停止当前设备并启动「${inst.name}」吗？`,
-        primaryButton: {
-          value: '取消',
-          action: () => {}
-        },
+        primaryButton: { value: '取消', action: () => {} },
         secondaryButton: {
           value: '切换并启动',
           action: () => {
@@ -470,9 +504,11 @@ struct Index {
   private stopActiveInstance(): void {
     try {
       this.statusText = native.stopContainer();
-      this.running = false;
-      this.paused = false;
-      this.wmAgentReady = false;
+      this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_SHORT, () => {
+        this.running = false;
+        this.paused = false;
+        this.wmAgentReady = false;
+      });
       this.appsFetchedOnce = false;
       this.appList = [];
       AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', []);
@@ -482,49 +518,23 @@ struct Index {
     }
   }
 
-  // --- Dialog Openers ---
-  private openCreateDialog(): void {
-    this.createDialogCtrl = new CustomDialogController({
-      builder: CreateInstanceDialog({
-        onConfirm: (opts: CreateInstanceOptions) => {
-          const created: DeviceInstance[] = instanceManager.createInstances(this.getSandboxFilesDir(), opts);
-          this.reloadInstances();
-          this.showToast(`已成功创建 ${created.length} 台新设备`);
-        }
-      }),
-      alignment: DialogAlignment.Center,
-      autoCancel: true,
-      customStyle: true
-    });
-    this.createDialogCtrl.open();
+  // --- Half-Modal Sheet Openers ---
+  private openCreateSheet(): void {
+    this.showCreateSheet = true;
   }
 
-  private openDeviceSettingsDialog(inst: DeviceInstance): void {
-    this.settingsDialogCtrl = new CustomDialogController({
-      builder: DeviceSettingsDialog({
-        instance: inst,
-        filesDir: this.getSandboxFilesDir(),
-        isInstanceRunning: this.isInstanceRunning(inst),
-        onSave: (updated: DeviceInstance) => {
-          instanceManager.updateInstance(this.getSandboxFilesDir(), updated);
-          this.reloadInstances();
-          if (this.isInstanceRunning(updated)) {
-            try {
-              native.setRefreshRate(updated.refreshRate);
-            } catch (_e) {
-            }
-          }
-          this.showToast(`已保存「${updated.name}」设置`);
-        },
-        onToast: (msg: string) => {
-          this.showToast(msg);
-        }
-      }),
-      alignment: DialogAlignment.Center,
-      autoCancel: true,
-      customStyle: true
-    });
-    this.settingsDialogCtrl.open();
+  private openDeviceSettingsSheet(inst: DeviceInstance): void {
+    this.editingInstance = inst;
+    this.showDeviceSettingsSheet = true;
+  }
+
+  private openBackupSheet(inst: DeviceInstance): void {
+    this.editingInstance = inst;
+    this.showBackupSheet = true;
+  }
+
+  private openGlobalSettingsSheet(): void {
+    this.showGlobalSettingsSheet = true;
   }
 
   private openRenameDialog(inst: DeviceInstance): void {
@@ -533,7 +543,7 @@ struct Index {
         initialName: inst.name,
         onConfirm: (newName: string) => {
           instanceManager.renameInstance(this.getSandboxFilesDir(), inst.id, newName);
-          this.reloadInstances();
+          this.reloadInstances(true);
           this.showToast(`已重命名为「${newName}」`);
         }
       }),
@@ -544,41 +554,6 @@ struct Index {
     this.renameDialogCtrl.open();
   }
 
-  private openBackupDialog(inst: DeviceInstance): void {
-    this.backupDialogCtrl = new CustomDialogController({
-      builder: BackupRestoreDialog({
-        instance: inst,
-        filesDir: this.getSandboxFilesDir(),
-        backupDir: this.globalSettings.backupDir,
-        isInstanceRunning: this.isInstanceRunning(inst),
-        onFinished: (msg: string) => {
-          this.showToast(msg);
-        }
-      }),
-      alignment: DialogAlignment.Center,
-      autoCancel: false,
-      customStyle: true
-    });
-    this.backupDialogCtrl.open();
-  }
-
-  private openGlobalSettingsDialog(): void {
-    this.globalDialogCtrl = new CustomDialogController({
-      builder: GlobalSettingsDialog({
-        initialSettings: this.globalSettings,
-        onSave: (next: GlobalSettings) => {
-          this.globalSettings = next;
-          instanceManager.saveGlobalSettings(this.getSandboxFilesDir(), next);
-          this.showToast('全局设置已保存');
-        }
-      }),
-      alignment: DialogAlignment.Center,
-      autoCancel: true,
-      customStyle: true
-    });
-    this.globalDialogCtrl.open();
-  }
-
   private async cloneDeviceInstance(inst: DeviceInstance): Promise<void> {
     if (this.cloningBusy) return;
     this.cloningBusy = true;
@@ -587,10 +562,10 @@ struct Index {
     const copy: DeviceInstance = instanceManager.addClonedInstance(filesDir, inst);
     try {
       const ok: boolean = await native.cloneInstanceAsync(filesDir, inst.dataSubdir, copy.dataSubdir);
-      this.reloadInstances();
+      this.reloadInstances(true);
       this.showToast(ok ? `已复制生成「${copy.name}」` : `已创建「${copy.name}」（空数据）`);
     } catch (e) {
-      this.reloadInstances();
+      this.reloadInstances(true);
       this.showToast(`复制完成但有警告：${String(e)}`);
     } finally {
       this.cloningBusy = false;
@@ -618,17 +593,14 @@ struct Index {
     this.getUIContext().showAlertDialog({
       title: '删除设备确认',
       message: `确定要删除「${inst.name}」及其独立数据目录吗？此操作不可恢复。`,
-      primaryButton: {
-        value: '取消',
-        action: () => {}
-      },
+      primaryButton: { value: '取消', action: () => {} },
       secondaryButton: {
         value: '确认删除',
         action: () => {
           const filesDir: string = this.getSandboxFilesDir();
           native.deleteInstanceData(filesDir, inst.dataSubdir);
           instanceManager.deleteInstance(filesDir, inst.id);
-          this.reloadInstances();
+          this.reloadInstances(true);
           this.showToast(`已删除「${inst.name}」`);
         }
       }
@@ -645,16 +617,39 @@ struct Index {
   }
 
   private updateSort(nextSort: string): void {
+    if (this.sortBy === nextSort) return;
     this.sortBy = nextSort;
     this.globalSettings.sortBy = nextSort;
     instanceManager.saveGlobalSettings(this.getSandboxFilesDir(), this.globalSettings);
-    this.reloadInstances();
+    this.reloadInstances(true);
   }
 
   private updateViewMode(nextMode: string): void {
-    this.viewMode = nextMode;
+    if (this.viewMode === nextMode) return;
+    this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_SHORT, () => {
+      this.viewMode = nextMode;
+    });
     this.globalSettings.viewMode = nextMode;
     instanceManager.saveGlobalSettings(this.getSandboxFilesDir(), this.globalSettings);
+  }
+
+  private setBatchModeAnimated(enabled: boolean): void {
+    this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => {
+      this.batchMode = enabled;
+      if (!enabled) {
+        this.selectedIds = [];
+      }
+    });
+  }
+
+  private switchNavAnimated(nextNav: string): void {
+    if (this.activeNav === nextNav) return;
+    this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_MEDIUM, () => {
+      this.activeNav = nextNav;
+    });
+    if (nextNav === 'apps' && this.wmAgentReady && this.appList.length === 0) {
+      this.refreshApps(false);
+    }
   }
 
   // --- Batch Actions ---
@@ -702,9 +697,8 @@ struct Index {
             native.deleteInstanceData(filesDir, deletable[i].dataSubdir);
             instanceManager.deleteInstance(filesDir, deletable[i].id);
           }
-          this.selectedIds = [];
-          this.batchMode = false;
-          this.reloadInstances();
+          this.setBatchModeAnimated(false);
+          this.reloadInstances(true);
           this.showToast(`已删除 ${deletable.length} 台设备`);
         }
       }
@@ -788,7 +782,82 @@ struct Index {
     this.refreshPinnedShortcuts();
   }
 
-  // --- Builders ---
+  // --- Half-Modal Sheet Builders ---
+  @Builder
+  private createSheetBuilder() {
+    CreateInstanceSheet({
+      onConfirm: (opts: CreateInstanceOptions) => {
+        this.showCreateSheet = false;
+        const created: DeviceInstance[] = instanceManager.createInstances(this.getSandboxFilesDir(), opts);
+        this.reloadInstances(true);
+        this.showToast(`已成功创建 ${created.length} 台新设备`);
+      },
+      onCancel: () => {
+        this.showCreateSheet = false;
+      }
+    })
+  }
+
+  @Builder
+  private deviceSettingsSheetBuilder() {
+    DeviceSettingsSheet({
+      instance: this.editingInstance,
+      filesDir: this.getSandboxFilesDir(),
+      isInstanceRunning: this.editingInstance ? this.isInstanceRunning(this.editingInstance) : false,
+      onSave: (updated: DeviceInstance) => {
+        this.showDeviceSettingsSheet = false;
+        instanceManager.updateInstance(this.getSandboxFilesDir(), updated);
+        this.reloadInstances(true);
+        if (this.isInstanceRunning(updated)) {
+          try {
+            native.setRefreshRate(updated.refreshRate);
+          } catch (_e) {
+          }
+        }
+        this.showToast(`已保存「${updated.name}」设置`);
+      },
+      onCancel: () => {
+        this.showDeviceSettingsSheet = false;
+      },
+      onToast: (msg: string) => {
+        this.showToast(msg);
+      }
+    })
+  }
+
+  @Builder
+  private backupSheetBuilder() {
+    BackupRestoreSheet({
+      instance: this.editingInstance,
+      filesDir: this.getSandboxFilesDir(),
+      backupDir: this.globalSettings.backupDir,
+      isInstanceRunning: this.editingInstance ? this.isInstanceRunning(this.editingInstance) : false,
+      onFinished: (msg: string) => {
+        this.showToast(msg);
+      },
+      onClose: () => {
+        this.showBackupSheet = false;
+      }
+    })
+  }
+
+  @Builder
+  private globalSettingsSheetBuilder() {
+    GlobalSettingsSheet({
+      initialSettings: this.globalSettings,
+      onSave: (next: GlobalSettings) => {
+        this.showGlobalSettingsSheet = false;
+        this.globalSettings = next;
+        instanceManager.saveGlobalSettings(this.getSandboxFilesDir(), next);
+        this.showToast('全局设置已保存');
+      },
+      onCancel: () => {
+        this.showGlobalSettingsSheet = false;
+      }
+    })
+  }
+
+  // --- Menus ---
   @Builder
   private sortMenuBuilder() {
     Menu() {
@@ -818,7 +887,7 @@ struct Index {
   private deviceMoreMenuBuilder(inst: DeviceInstance) {
     Menu() {
       MenuItem({ content: '设备设置' })
-        .onClick(() => { this.openDeviceSettingsDialog(inst); })
+        .onClick(() => { this.openDeviceSettingsSheet(inst); })
       MenuItem({ content: '打开模拟器窗口' })
         .onClick(() => {
           if (!this.isInstanceRunning(inst)) {
@@ -834,50 +903,45 @@ struct Index {
       MenuItem({ content: '复制设备' })
         .onClick(() => { this.cloneDeviceInstance(inst); })
       MenuItem({ content: '备份与还原' })
-        .onClick(() => { this.openBackupDialog(inst); })
+        .onClick(() => { this.openBackupSheet(inst); })
       MenuItem({ content: '删除设备' })
         .enabled(inst.id !== 'inst_0' && !this.isInstanceRunning(inst))
         .onClick(() => { this.confirmDeleteDevice(inst); })
     }
   }
 
+  // --- Left Navigation Rail Item ---
   @Builder
   private navRailItem(key: string, label: string, iconRes: Resource, badgeCount: number) {
-    Column({ space: 4 }) {
+    Column({ space: Spacing.XS }) {
       Stack({ alignContent: Alignment.TopEnd }) {
         Stack({ alignContent: Alignment.Center }) {
-          Column()
-            .width(44)
-            .height(36)
-            .borderRadius(12)
-            .backgroundColor(
-              this.activeNav === key
-                ? $r('sys.color.comp_emphasize_tertiary')
-                : Color.Transparent
-            )
           SymbolGlyph(iconRes)
-            .fontSize(20)
+            .fontSize(IconSize.MD)
             .fontColor([
               this.activeNav === key
                 ? $r('sys.color.icon_emphasize')
                 : $r('sys.color.icon_secondary')
             ])
         }
+        .width(44)
+        .height(32)
 
         if (badgeCount > 0) {
           Text(`${badgeCount}`)
-            .fontSize(9)
+            .fontSize(FontSize.BADGE)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_on_primary'))
-            .padding({ left: 5, right: 5, top: 1, bottom: 1 })
-            .borderRadius(8)
+            .padding({ left: Spacing.XS + 1, right: Spacing.XS + 1, top: 1, bottom: 1 })
+            .borderRadius(Radius.SM)
             .backgroundColor($r('sys.color.brand'))
             .offset({ x: 4, y: -2 })
+            .transition(Motion.pillPopTransition())
         }
       }
 
       Text(label)
-        .fontSize(11)
+        .fontSize(FontSize.MICRO)
         .fontWeight(this.activeNav === key ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(
           this.activeNav === key
@@ -886,48 +950,47 @@ struct Index {
         )
     }
     .width('100%')
-    .padding({ top: 6, bottom: 6 })
-    .borderRadius(12)
-    .stateStyles({
-      pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
-    })
+    .height(NAV_RAIL_ITEM_H)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .borderRadius(Radius.MD)
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
     .onClick(() => {
-      this.activeNav = key;
-      if (key === 'apps' && this.wmAgentReady && this.appList.length === 0) {
-        this.refreshApps(false);
-      }
+      this.switchNavAnimated(key);
     })
   }
 
   @Builder
   private specChip(label: string) {
     Text(label)
-      .fontSize(11)
+      .fontSize(FontSize.MICRO)
       .fontColor($r('sys.color.font_secondary'))
-      .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-      .borderRadius(6)
+      .padding({ left: Spacing.SM, right: Spacing.SM, top: Spacing.XS, bottom: Spacing.XS })
+      .borderRadius(Radius.BADGE)
       .backgroundColor($r('sys.color.background_secondary'))
   }
 
   @Builder
   private deviceCardRow(inst: DeviceInstance) {
-    Row({ space: 16 }) {
+    Row({ space: Spacing.LG }) {
       if (this.batchMode) {
         Checkbox()
           .select(this.isSelected(inst.id))
           .selectedColor($r('sys.color.brand'))
           .width(20)
           .height(20)
+          .transition(Motion.checkboxSlideTransition())
           .onChange(() => {
             this.toggleSelection(inst.id);
           })
       }
 
-      // MuMu-Style Live/Idle Preview Thumbnail (124 x 74 vp)
+      // Preview Thumbnail (128 x 76 vp)
       Stack({ alignContent: Alignment.TopStart }) {
-        Column({ space: 2 }) {
+        Column() {
           SymbolGlyph(inst.deviceType === 'tablet' ? $r('sys.symbol.pad_fill') : $r('sys.symbol.phone_1'))
-            .fontSize(24)
+            .fontSize(IconSize.LG)
             .fontColor([
               this.isInstanceRunning(inst) ? '#FFFFFF' : '#CBD5E1'
             ])
@@ -936,7 +999,7 @@ struct Index {
         .height('100%')
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Center)
-        .borderRadius(12)
+        .borderRadius(Radius.MD)
         .linearGradient({
           angle: 135,
           colors: this.isInstanceRunning(inst)
@@ -944,18 +1007,16 @@ struct Index {
             : [['#2B3242', 0.0], ['#1B202C', 1.0]]
         })
 
-        // Top-left #Index pill
         Text(`# ${inst.index}`)
-          .fontSize(10)
+          .fontSize(FontSize.BADGE)
           .fontWeight(FontWeight.Medium)
           .fontColor('#FFFFFF')
-          .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-          .borderRadius(6)
+          .padding({ left: Spacing.SM - 2, right: Spacing.SM - 2, top: 2, bottom: 2 })
+          .borderRadius(Radius.BADGE)
           .backgroundColor('#66000000')
-          .margin({ left: 6, top: 6 })
+          .margin({ left: Spacing.SM - 2, top: Spacing.SM - 2 })
 
-        // Bottom-left status pill
-        Row({ space: 4 }) {
+        Row({ space: Spacing.XS }) {
           Circle({ width: 6, height: 6 })
             .fill(
               this.isInstanceRunning(inst)
@@ -967,28 +1028,29 @@ struct Index {
               ? (this.paused ? '已暂停' : (this.wmAgentReady ? '运行中' : '启动中'))
               : '未开机'
           )
-            .fontSize(10)
+            .fontSize(FontSize.BADGE)
             .fontColor('#FFFFFF')
         }
-        .padding({ left: 6, right: 7, top: 2, bottom: 2 })
-        .borderRadius(6)
+        .padding({ left: Spacing.SM - 2, right: Spacing.SM, top: 2, bottom: 2 })
+        .borderRadius(Radius.BADGE)
         .backgroundColor('#7A000000')
-        .position({ x: 6, y: 50 })
+        .position({ x: 6, y: 52 })
       }
-      .width(124)
-      .height(74)
+      .width(128)
+      .height(76)
       .flexShrink(0)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
       .onClick(() => {
         if (this.isInstanceRunning(inst)) {
           this.openEmulatorWindow(inst);
         }
       })
 
-      // Middle: Instance Title + Specs + Metadata
-      Column({ space: 7 }) {
-        Row({ space: 8 }) {
+      // Middle: Title + Spec Chips + Telemetry
+      Column({ space: Spacing.SM }) {
+        Row({ space: Spacing.SM }) {
           Text(inst.name)
-            .fontSize(15)
+            .fontSize(FontSize.TITLE_SM)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
@@ -996,31 +1058,31 @@ struct Index {
             .constraintSize({ maxWidth: 260 })
 
           if (this.isInstanceRunning(inst)) {
-            Row({ space: 5 }) {
+            Row({ space: Spacing.XS }) {
               Circle({ width: 6, height: 6 })
                 .fill(this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
               Text(this.paused ? '已暂停' : (this.wmAgentReady ? '运行中' : '启动中'))
-                .fontSize(11)
+                .fontSize(FontSize.MICRO)
                 .fontWeight(FontWeight.Medium)
                 .fontColor(this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
             }
-            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-            .borderRadius(10)
+            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+            .borderRadius(Radius.MD)
             .backgroundColor(this.paused ? '#1FED6F21' : '#1F64BB5C')
+            .transition(Motion.pillPopTransition())
           }
 
           Text(inst.runMode === 'emulator' ? '传统模拟器' : '自由多窗')
-            .fontSize(10)
+            .fontSize(FontSize.BADGE)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_emphasize'))
-            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-            .borderRadius(6)
+            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+            .borderRadius(Radius.BADGE)
             .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
         }
         .alignItems(VerticalAlign.Center)
 
-        // Spec Chips Row
-        Row({ space: 6 }) {
+        Row({ space: Spacing.SM }) {
           this.specChip(inst.androidVersion)
           this.specChip(`${inst.cpuCores} 核`)
           this.specChip(`${Math.round(inst.memLimitMb / 1024)} GB`)
@@ -1028,14 +1090,13 @@ struct Index {
           this.specChip(`${inst.refreshRate}Hz`)
         }
 
-        // Subtitle Line
         Text(
           `${inst.width}×${inst.height} · ${inst.dpi} DPI` +
           (this.isInstanceRunning(inst)
             ? ` · ${this.fps} FPS · ${this.activeProcs} 进程 · 内存 ${this.memMb} MB`
             : ` · 分区 ${inst.dataSubdir}`)
         )
-          .fontSize(12)
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_tertiary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1043,117 +1104,134 @@ struct Index {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
-      // Right: MuMu-Style Circular Action Group + HarmonyOS Polish
-      Row({ space: 8 }) {
+      // Right: Unified Circular Actions (ControlSize.BTN_MD = 36 / BTN_LG = 40, IconSize.SM = 16 / MD = 20)
+      Row({ space: Spacing.SM }) {
         if (this.isInstanceRunning(inst)) {
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 5 }) {
+            Row({ space: Spacing.XS + 2 }) {
               SymbolGlyph(inst.runMode === 'emulator' ? $r('sys.symbol.display') : $r('sys.symbol.square_grid_2x2'))
-                .fontSize(14)
-                .fontColor([$r('sys.color.font_on_primary')])
+                .fontSize(IconSize.SM)
+                .fontColor([$r('sys.color.icon_on_primary')])
               Text(inst.runMode === 'emulator' ? '打开窗口' : '应用中心')
-                .fontSize(12)
+                .fontSize(FontSize.CAPTION)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_on_primary'))
             }
           }
-          .height(36)
-          .padding({ left: 14, right: 14 })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.LG })
           .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
           .onClick(() => {
             if (inst.runMode === 'emulator') {
               this.openEmulatorWindow(inst);
             } else {
-              this.activeNav = 'apps';
+              this.switchNavAnimated('apps');
             }
           })
 
           Button({ type: ButtonType.Circle }) {
             SymbolGlyph(this.paused ? $r('sys.symbol.play_fill') : $r('sys.symbol.pause_fill'))
-              .fontSize(16)
+              .fontSize(IconSize.SM)
               .fontColor([this.paused ? $r('sys.color.confirm') : $r('sys.color.alert')])
           }
-          .width(36)
-          .height(36)
+          .width(ControlSize.BTN_MD)
+          .height(ControlSize.BTN_MD)
           .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .onClick(() => {
             this.statusText = native.setPaused(!this.paused);
           })
 
           Button({ type: ButtonType.Circle }) {
             SymbolGlyph($r('sys.symbol.power'))
-              .fontSize(16)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.warning')])
           }
-          .width(36)
-          .height(36)
+          .width(ControlSize.BTN_MD)
+          .height(ControlSize.BTN_MD)
           .backgroundColor('#1AE84026')
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .onClick(() => {
             this.stopActiveInstance();
           })
         } else {
           Button({ type: ButtonType.Circle }) {
             SymbolGlyph($r('sys.symbol.play_fill'))
-              .fontSize(17)
+              .fontSize(IconSize.MD)
               .fontColor([$r('sys.color.icon_on_primary')])
           }
-          .width(40)
-          .height(40)
+          .width(ControlSize.BTN_LG)
+          .height(ControlSize.BTN_LG)
           .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
           .onClick(() => {
             this.startDeviceInstance(inst, 'full');
           })
         }
 
-        // More (...) Menu Button
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
-            .fontSize(16)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_secondary')])
         }
-        .width(36)
-        .height(36)
+        .width(ControlSize.BTN_MD)
+        .height(ControlSize.BTN_MD)
         .backgroundColor($r('sys.color.comp_background_tertiary'))
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .bindMenu(this.deviceMoreMenuBuilder(inst))
       }
       .alignItems(VerticalAlign.Center)
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
-    .borderRadius(16)
+    .padding(Spacing.LG)
+    .borderRadius(Radius.CARD)
     .backgroundColor($r('sys.color.comp_background_primary'))
     .border({
-      width: this.isInstanceRunning(inst) ? 1.2 : 0.6,
-      color: this.isInstanceRunning(inst) ? $r('sys.color.brand') : $r('sys.color.comp_divider')
+      width: this.isInstanceRunning(inst) ? 1.2 : (this.hoveredInstId === inst.id ? 1.0 : 0.6),
+      color: this.isInstanceRunning(inst) || this.hoveredInstId === inst.id
+        ? $r('sys.color.brand')
+        : $r('sys.color.comp_divider')
     })
-    .shadow({ radius: 10, color: '#0A000000', offsetY: 2 })
+    .shadow(this.hoveredInstId === inst.id ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
+    .translate({ y: this.hoveredInstId === inst.id ? -1.5 : 0 })
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .onHover((isHover: boolean) => {
+      this.hoveredInstId = isHover ? inst.id : (this.hoveredInstId === inst.id ? '' : this.hoveredInstId);
+    })
   }
 
   @Builder
   private deviceCompactRow(inst: DeviceInstance) {
-    Row({ space: 12 }) {
+    Row({ space: Spacing.MD }) {
       if (this.batchMode) {
         Checkbox()
           .select(this.isSelected(inst.id))
           .selectedColor($r('sys.color.brand'))
           .width(18)
           .height(18)
+          .transition(Motion.checkboxSlideTransition())
           .onChange(() => {
             this.toggleSelection(inst.id);
           })
       }
 
       Text(`#${inst.index}`)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_secondary'))
-        .width(30)
+        .width(28)
 
       Circle({ width: 8, height: 8 })
         .fill(this.isInstanceRunning(inst) ? $r('sys.color.confirm') : $r('sys.color.font_fourth'))
 
       Text(inst.name)
-        .fontSize(14)
+        .fontSize(FontSize.BODY_LG)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_primary'))
         .layoutWeight(1)
@@ -1161,195 +1239,216 @@ struct Index {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
 
       Text(`${inst.androidVersion} · ${inst.cpuCores}核 ${Math.round(inst.memLimitMb / 1024)}G · ${formatGpuModeLabel(inst.gpuMode)} · ${inst.refreshRate}Hz`)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontColor($r('sys.color.font_tertiary'))
 
       if (this.isInstanceRunning(inst)) {
         Button('打开', { type: ButtonType.Capsule })
-          .height(30)
-          .padding({ left: 12, right: 12 })
-          .fontSize(12)
+          .height(ControlSize.BTN_SM)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_on_primary'))
           .backgroundColor($r('sys.color.brand'))
-          .onClick(() => {
-            this.openEmulatorWindow(inst);
-          })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
+          .onClick(() => { this.openEmulatorWindow(inst); })
+
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph($r('sys.symbol.power'))
-            .fontSize(14)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.warning')])
         }
-        .width(30)
-        .height(30)
+        .width(ControlSize.BTN_SM)
+        .height(ControlSize.BTN_SM)
         .backgroundColor('#1AE84026')
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => { this.stopActiveInstance(); })
       } else {
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph($r('sys.symbol.play_fill'))
-            .fontSize(14)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_on_primary')])
         }
-        .width(30)
-        .height(30)
+        .width(ControlSize.BTN_SM)
+        .height(ControlSize.BTN_SM)
         .backgroundColor($r('sys.color.brand'))
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
         .onClick(() => { this.startDeviceInstance(inst, 'full'); })
       }
 
       Button({ type: ButtonType.Circle }) {
         SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
-          .fontSize(14)
+          .fontSize(IconSize.SM)
           .fontColor([$r('sys.color.icon_secondary')])
       }
-      .width(30)
-      .height(30)
+      .width(ControlSize.BTN_SM)
+      .height(ControlSize.BTN_SM)
       .backgroundColor($r('sys.color.comp_background_tertiary'))
+      .hoverEffect(HoverEffect.Highlight)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
       .bindMenu(this.deviceMoreMenuBuilder(inst))
     }
     .width('100%')
-    .height(54)
-    .padding({ left: 16, right: 14 })
-    .borderRadius(12)
+    .height(56)
+    .padding({ left: Spacing.LG, right: Spacing.MD })
+    .borderRadius(Radius.MD)
     .backgroundColor($r('sys.color.comp_background_primary'))
-    .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+    .border({
+      width: this.isInstanceRunning(inst) || this.hoveredInstId === inst.id ? 1.0 : 0.6,
+      color: this.isInstanceRunning(inst) || this.hoveredInstId === inst.id
+        ? $r('sys.color.brand')
+        : $r('sys.color.comp_divider')
+    })
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .onHover((isHover: boolean) => {
+      this.hoveredInstId = isHover ? inst.id : (this.hoveredInstId === inst.id ? '' : this.hoveredInstId);
+    })
   }
 
   @Builder
   private devicesWorkspace() {
-    Column({ space: 14 }) {
-      // MuMu-Style Action Toolbar (Normal Mode vs Batch Mode)
+    Column({ space: Spacing.LG }) {
+      // Animated Action Toolbar (Normal Mode <-> Batch Mode)
       if (!this.batchMode) {
-        Row({ space: 10 }) {
-          // Primary CTA: + 新建设备
+        Row({ space: Spacing.MD }) {
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 6 }) {
+            Row({ space: Spacing.SM }) {
               SymbolGlyph($r('sys.symbol.plus'))
-                .fontSize(15)
+                .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_on_primary')])
               Text('新建设备')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_on_primary'))
             }
           }
-          .height(36)
-          .padding({ left: 16, right: 18 })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.XL })
           .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
           .onClick(() => {
-            this.openCreateDialog();
+            this.openCreateSheet();
           })
 
-          // Batch Operations Button
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 6 }) {
+            Row({ space: Spacing.SM }) {
               SymbolGlyph($r('sys.symbol.checkmark_square'))
-                .fontSize(14)
+                .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_primary')])
               Text('批量操作')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_primary'))
             }
           }
-          .height(36)
-          .padding({ left: 14, right: 16 })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.LG })
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
           .onClick(() => {
-            this.batchMode = true;
-            this.selectedIds = [];
+            this.setBatchModeAnimated(true);
           })
 
-          // Arrange Windows Button
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 6 }) {
+            Row({ space: Spacing.SM }) {
               SymbolGlyph($r('sys.symbol.rectangle_split_2x1'))
-                .fontSize(14)
+                .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_primary')])
               Text('排列窗口')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_primary'))
             }
           }
-          .height(36)
-          .padding({ left: 14, right: 16 })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.LG })
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
           .onClick(() => {
             this.handleArrangeWindows();
           })
 
           Blank()
 
-          // Sort Dropdown
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 5 }) {
+            Row({ space: Spacing.XS + 2 }) {
               SymbolGlyph($r('sys.symbol.sort'))
-                .fontSize(14)
+                .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_secondary')])
               Text(this.sortBy === 'time' ? '按时间' : (this.sortBy === 'name' ? '按名称' : '按编号'))
-                .fontSize(12)
+                .fontSize(FontSize.CAPTION)
                 .fontColor($r('sys.color.font_secondary'))
               SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(11)
+                .fontSize(IconSize.XS)
                 .fontColor([$r('sys.color.icon_tertiary')])
             }
           }
-          .height(34)
-          .padding({ left: 12, right: 12 })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .bindMenu(this.sortMenuBuilder())
 
-          // Segmented Card / Compact View Switch
-          Row({ space: 2 }) {
-            Button({ type: ButtonType.Normal }) {
-              SymbolGlyph($r('sys.symbol.rectangle_grid_1x2'))
-                .fontSize(14)
-                .fontColor([
-                  this.viewMode === 'card'
-                    ? $r('sys.color.icon_emphasize')
-                    : $r('sys.color.icon_secondary')
-                ])
-            }
-            .width(32)
-            .height(28)
-            .borderRadius(14)
-            .backgroundColor(
-              this.viewMode === 'card'
-                ? $r('sys.color.comp_emphasize_tertiary')
-                : Color.Transparent
-            )
-            .onClick(() => { this.updateViewMode('card'); })
+          // Segmented Card / Compact Toggle with Sliding Indicator
+          Stack({ alignContent: Alignment.Start }) {
+            Column()
+              .width(34)
+              .height(28)
+              .borderRadius(14)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+              .translate({ x: this.viewMode === 'card' ? 0 : 36 })
+              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
 
-            Button({ type: ButtonType.Normal }) {
-              SymbolGlyph($r('sys.symbol.list_bullet'))
-                .fontSize(14)
-                .fontColor([
-                  this.viewMode === 'compact'
-                    ? $r('sys.color.icon_emphasize')
-                    : $r('sys.color.icon_secondary')
-                ])
+            Row({ space: 2 }) {
+              Button({ type: ButtonType.Normal }) {
+                SymbolGlyph($r('sys.symbol.rectangle_grid_1x2'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([
+                    this.viewMode === 'card'
+                      ? $r('sys.color.icon_emphasize')
+                      : $r('sys.color.icon_secondary')
+                  ])
+              }
+              .width(34)
+              .height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .onClick(() => { this.updateViewMode('card'); })
+
+              Button({ type: ButtonType.Normal }) {
+                SymbolGlyph($r('sys.symbol.list_bullet'))
+                  .fontSize(IconSize.SM)
+                  .fontColor([
+                    this.viewMode === 'compact'
+                      ? $r('sys.color.icon_emphasize')
+                      : $r('sys.color.icon_secondary')
+                  ])
+              }
+              .width(34)
+              .height(28)
+              .borderRadius(14)
+              .backgroundColor(Color.Transparent)
+              .onClick(() => { this.updateViewMode('compact'); })
             }
-            .width(32)
-            .height(28)
-            .borderRadius(14)
-            .backgroundColor(
-              this.viewMode === 'compact'
-                ? $r('sys.color.comp_emphasize_tertiary')
-                : Color.Transparent
-            )
-            .onClick(() => { this.updateViewMode('compact'); })
           }
           .padding(3)
-          .borderRadius(17)
+          .borderRadius(Radius.CAPSULE)
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
+        .transition(Motion.toolbarSwapTransition())
       } else {
-        // Batch Operations Toolbar (MuMu 0b068f59 style)
-        Row({ space: 10 }) {
-          Row({ space: 6 }) {
+        Row({ space: Spacing.MD }) {
+          Row({ space: Spacing.SM }) {
             Checkbox()
               .select(this.selectedIds.length > 0 && this.selectedIds.length === this.instances.length)
               .selectedColor($r('sys.color.brand'))
@@ -1359,73 +1458,80 @@ struct Index {
                 this.toggleSelectAll();
               })
             Text(`全选 (${this.selectedIds.length}/${this.instances.length})`)
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
           }
-          .padding({ left: 6, right: 6 })
+          .padding({ left: Spacing.SM, right: Spacing.SM })
           .onClick(() => { this.toggleSelectAll(); })
 
           Button('启动首台所选', { type: ButtonType.Capsule })
-            .height(34)
-            .padding({ left: 14, right: 14 })
-            .fontSize(12)
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_on_primary'))
             .backgroundColor($r('sys.color.brand'))
             .enabled(this.selectedIds.length > 0)
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
               const first: DeviceInstance | undefined = this.getInstanceById(this.selectedIds[0]);
               if (first) this.startDeviceInstance(first, 'full');
             })
 
           Button('关闭运行设备', { type: ButtonType.Capsule })
-            .height(34)
-            .padding({ left: 14, right: 14 })
-            .fontSize(12)
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_primary'))
             .backgroundColor($r('sys.color.comp_background_primary'))
             .border({ width: 0.6, color: $r('sys.color.comp_divider') })
             .enabled(this.running)
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => { this.stopActiveInstance(); })
 
           Button({ type: ButtonType.Capsule }) {
-            Row({ space: 4 }) {
+            Row({ space: Spacing.XS }) {
               Text('更多')
-                .fontSize(12)
+                .fontSize(FontSize.CAPTION)
                 .fontColor($r('sys.color.font_primary'))
               SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(11)
+                .fontSize(IconSize.XS)
                 .fontColor([$r('sys.color.icon_secondary')])
             }
           }
-          .height(34)
-          .padding({ left: 14, right: 12 })
+          .height(ControlSize.BTN_SM)
+          .padding({ left: Spacing.LG, right: Spacing.MD })
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .hoverEffect(HoverEffect.Highlight)
           .bindMenu(this.batchMoreMenuBuilder())
 
           Blank()
 
           Button('取消批量操作', { type: ButtonType.Capsule })
-            .height(34)
-            .padding({ left: 14, right: 14 })
-            .fontSize(12)
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_emphasize'))
             .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
-              this.batchMode = false;
-              this.selectedIds = [];
+              this.setBatchModeAnimated(false);
             })
         }
         .width('100%')
-        .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-        .borderRadius(14)
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.SM, bottom: Spacing.SM })
+        .borderRadius(Radius.CARD)
         .backgroundColor($r('sys.color.comp_background_primary'))
         .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+        .transition(Motion.toolbarSwapTransition())
       }
 
-      // Instance List
-      List({ space: this.viewMode === 'card' ? 12 : 8 }) {
+      // Instance List with Card Transitions
+      List({ space: this.viewMode === 'card' ? Spacing.MD : Spacing.SM }) {
         ForEach(
           this.instances,
           (inst: DeviceInstance) => {
@@ -1436,6 +1542,7 @@ struct Index {
                 this.deviceCompactRow(inst)
               }
             }
+            .transition(Motion.cardTransition())
           },
           (inst: DeviceInstance): string =>
             `${inst.id}_${inst.name}_${inst.gpuMode}_${inst.refreshRate}_${inst.cpuCores}_${inst.memLimitMb}_${this.running ? this.activeInstanceId : 'idle'}_${this.paused ? 1 : 0}_${this.batchMode ? 1 : 0}_${this.selectedIds.length}_${this.viewMode}`
@@ -1447,22 +1554,21 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 20, right: 20, top: 16, bottom: 12 })
+    .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.MD })
   }
 
   @Builder
   private appsWorkspace() {
-    Column({ space: 14 }) {
-      // Search + Filter + Refresh Bar
-      Row({ space: 12 }) {
-        Row({ space: 8 }) {
+    Column({ space: Spacing.LG }) {
+      Row({ space: Spacing.MD }) {
+        Row({ space: Spacing.SM }) {
           SymbolGlyph($r('sys.symbol.magnifyingglass'))
-            .fontSize(15)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_tertiary')])
           TextInput({ placeholder: '搜索已安装的 Android 应用名称或包名...', text: this.searchQuery })
             .layoutWeight(1)
-            .height(34)
-            .fontSize(13)
+            .height(ControlSize.INPUT_H)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
             .placeholderColor($r('sys.color.font_tertiary'))
             .backgroundColor(Color.Transparent)
@@ -1472,104 +1578,116 @@ struct Index {
             })
         }
         .layoutWeight(1)
-        .height(38)
-        .padding({ left: 14, right: 12 })
-        .borderRadius(19)
+        .height(ControlSize.BTN_MD)
+        .padding({ left: Spacing.LG, right: Spacing.MD })
+        .borderRadius(Radius.CAPSULE)
         .backgroundColor($r('sys.color.comp_background_primary'))
         .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         .alignItems(VerticalAlign.Center)
 
-        // Segmented Filter
-        Row({ space: 2 }) {
+        // Segmented Filter with animated color transition
+        Row({ space: Spacing.XS }) {
           Button('全部', { type: ButtonType.Normal })
-            .height(30)
-            .padding({ left: 12, right: 12 })
-            .borderRadius(15)
-            .fontSize(12)
+            .height(28)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .borderRadius(14)
+            .fontSize(FontSize.CAPTION)
             .fontColor(this.appFilter === 'all' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
             .backgroundColor(this.appFilter === 'all' ? $r('sys.color.brand') : Color.Transparent)
-            .onClick(() => { this.appFilter = 'all'; })
+            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+            .onClick(() => {
+              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'all'; });
+            })
           Button('第三方', { type: ButtonType.Normal })
-            .height(30)
-            .padding({ left: 12, right: 12 })
-            .borderRadius(15)
-            .fontSize(12)
+            .height(28)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .borderRadius(14)
+            .fontSize(FontSize.CAPTION)
             .fontColor(this.appFilter === 'user' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
             .backgroundColor(this.appFilter === 'user' ? $r('sys.color.brand') : Color.Transparent)
-            .onClick(() => { this.appFilter = 'user'; })
+            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+            .onClick(() => {
+              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'user'; });
+            })
           Button('系统', { type: ButtonType.Normal })
-            .height(30)
-            .padding({ left: 12, right: 12 })
-            .borderRadius(15)
-            .fontSize(12)
+            .height(28)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .borderRadius(14)
+            .fontSize(FontSize.CAPTION)
             .fontColor(this.appFilter === 'system' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
             .backgroundColor(this.appFilter === 'system' ? $r('sys.color.brand') : Color.Transparent)
-            .onClick(() => { this.appFilter = 'system'; })
+            .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+            .onClick(() => {
+              this.runAnimated(Motion.SPRING_SNAPPY, Motion.DUR_SHORT, () => { this.appFilter = 'system'; });
+            })
         }
         .padding(3)
-        .borderRadius(18)
+        .borderRadius(Radius.CAPSULE)
         .backgroundColor($r('sys.color.comp_background_primary'))
         .border({ width: 0.6, color: $r('sys.color.comp_divider') })
 
         Button({ type: ButtonType.Capsule }) {
-          Row({ space: 5 }) {
+          Row({ space: Spacing.XS + 2 }) {
             SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(13)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_primary')])
             Text('刷新')
-              .fontSize(12)
+              .fontSize(FontSize.CAPTION)
               .fontColor($r('sys.color.font_primary'))
           }
         }
-        .height(36)
-        .padding({ left: 14, right: 14 })
+        .height(ControlSize.BTN_MD)
+        .padding({ left: Spacing.LG, right: Spacing.LG })
         .backgroundColor($r('sys.color.comp_background_primary'))
         .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         .enabled(this.wmAgentReady && !this.loadingApps)
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
         .onClick(() => {
           this.refreshApps(true);
         })
       }
       .width('100%')
 
-      // Grid / Empty States
       if (!this.wmAgentReady) {
-        Column({ space: 14 }) {
+        Column({ space: Spacing.MD }) {
           if (this.running) {
             LoadingProgress()
-              .width(36)
-              .height(36)
+              .width(ControlSize.BTN_MD)
+              .height(ControlSize.BTN_MD)
               .color($r('sys.color.brand'))
             Text('Android 14 正在启动，应用列表即将自动同步...')
-              .fontSize(14)
+              .fontSize(FontSize.BODY_LG)
               .fontColor($r('sys.color.font_secondary'))
           } else {
             SymbolGlyph($r('sys.symbol.square_grid_2x2'))
-              .fontSize(42)
+              .fontSize(IconSize.XL)
               .fontColor([$r('sys.color.icon_tertiary')])
             Text('当前没有运行中的 Android 设备')
-              .fontSize(15)
+              .fontSize(FontSize.TITLE_SM)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
             Text('启动任意设备后，即可在此以独立鸿蒙窗口直接运行所有 Android 应用')
-              .fontSize(12)
+              .fontSize(FontSize.CAPTION)
               .fontColor($r('sys.color.font_tertiary'))
             Button('返回设备列表启动', { type: ButtonType.Capsule })
-              .height(36)
-              .padding({ left: 20, right: 20 })
-              .fontSize(13)
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.XL, right: Spacing.XL })
+              .fontSize(FontSize.BODY_MD)
               .fontColor($r('sys.color.font_on_primary'))
               .backgroundColor($r('sys.color.brand'))
-              .onClick(() => { this.activeNav = 'devices'; })
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+              .onClick(() => { this.switchNavAnimated('devices'); })
           }
         }
         .width('100%')
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
       } else if (this.getFilteredApps().length === 0) {
-        Column({ space: 8 }) {
+        Column({ space: Spacing.SM }) {
           Text(this.loadingApps ? '正在同步应用与图标...' : '没有找到匹配的 Android 应用')
-            .fontSize(14)
+            .fontSize(FontSize.BODY_LG)
             .fontColor($r('sys.color.font_secondary'))
         }
         .width('100%')
@@ -1581,31 +1699,31 @@ struct Index {
             this.getFilteredApps(),
             (app: AndroidAppItem) => {
               GridItem() {
-                Column({ space: 10 }) {
-                  Column({ space: 8 }) {
+                Column({ space: Spacing.MD }) {
+                  Column({ space: Spacing.SM }) {
                     if (this.iconsDir.length > 0 && app.iconFile.length > 0) {
                       Image(`file://${this.iconsDir}/${app.iconFile}`)
-                        .width(54)
-                        .height(54)
-                        .borderRadius(14)
+                        .width(56)
+                        .height(56)
+                        .borderRadius(Radius.MD + 2)
                         .objectFit(ImageFit.Contain)
                     } else {
                       Row() {
                         Text(app.label.length > 0 ? app.label.substring(0, 1).toUpperCase() : 'A')
-                          .fontSize(22)
+                          .fontSize(IconSize.LG)
                           .fontWeight(FontWeight.Bold)
                           .fontColor($r('sys.color.font_on_primary'))
                       }
-                      .width(54)
-                      .height(54)
-                      .borderRadius(14)
+                      .width(56)
+                      .height(56)
+                      .borderRadius(Radius.MD + 2)
                       .backgroundColor($r('sys.color.brand'))
                       .justifyContent(FlexAlign.Center)
                       .alignItems(VerticalAlign.Center)
                     }
 
                     Text(app.label)
-                      .fontSize(13)
+                      .fontSize(FontSize.BODY_MD)
                       .fontWeight(FontWeight.Medium)
                       .fontColor($r('sys.color.font_primary'))
                       .maxLines(1)
@@ -1619,34 +1737,35 @@ struct Index {
                     this.openAndroidAppWindow(app.packageName, app.component, app.label, -1);
                   })
 
-                  Row({ space: 6 }) {
+                  Row({ space: Spacing.SM }) {
                     Button({ type: ButtonType.Normal }) {
-                      Row({ space: 3 }) {
+                      Row({ space: Spacing.XS }) {
                         SymbolGlyph($r('sys.symbol.screen_rotation'))
-                          .fontSize(11)
+                          .fontSize(IconSize.XS)
                           .fontColor([$r('sys.color.icon_secondary')])
                         Text(this.getEffectiveModeLabel(app))
-                          .fontSize(10)
+                          .fontSize(FontSize.BADGE)
                           .fontColor($r('sys.color.font_secondary'))
                       }
                     }
-                    .height(24)
-                    .padding({ left: 8, right: 8 })
-                    .borderRadius(12)
+                    .height(ControlSize.BTN_XS)
+                    .padding({ left: Spacing.SM, right: Spacing.SM })
+                    .borderRadius(Radius.MD)
                     .backgroundColor($r('sys.color.background_secondary'))
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
                     .onClick(() => { this.cycleAppWindowPref(app); })
 
                     Button({ type: ButtonType.Normal }) {
-                      Row({ space: 3 }) {
+                      Row({ space: Spacing.XS }) {
                         SymbolGlyph(this.isAppPinned(app.packageName) ? $r('sys.symbol.pin_fill') : $r('sys.symbol.pin'))
-                          .fontSize(11)
+                          .fontSize(IconSize.XS)
                           .fontColor([
                             this.isAppPinned(app.packageName)
                               ? $r('sys.color.confirm')
                               : $r('sys.color.icon_emphasize')
                           ])
                         Text(this.isAppPinned(app.packageName) ? '已加桌' : '加桌')
-                          .fontSize(10)
+                          .fontSize(FontSize.BADGE)
                           .fontColor(
                             this.isAppPinned(app.packageName)
                               ? $r('sys.color.confirm')
@@ -1654,67 +1773,81 @@ struct Index {
                           )
                       }
                     }
-                    .height(24)
-                    .padding({ left: 8, right: 8 })
-                    .borderRadius(12)
+                    .height(ControlSize.BTN_XS)
+                    .padding({ left: Spacing.SM, right: Spacing.SM })
+                    .borderRadius(Radius.MD)
                     .backgroundColor(
                       this.isAppPinned(app.packageName)
                         ? '#1F64BB5C'
                         : $r('sys.color.comp_emphasize_tertiary')
                     )
+                    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
                     .onClick(() => { this.toggleDesktopShortcut(app); })
                   }
                   .justifyContent(FlexAlign.Center)
                 }
                 .width('100%')
-                .padding({ left: 10, right: 10, top: 14, bottom: 12 })
-                .borderRadius(16)
+                .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.LG, bottom: Spacing.MD })
+                .borderRadius(Radius.CARD)
                 .backgroundColor($r('sys.color.comp_background_primary'))
-                .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-                .shadow({ radius: 8, color: '#08000000', offsetY: 2 })
+                .border({
+                  width: this.hoveredAppPkg === app.packageName ? 1.0 : 0.6,
+                  color: this.hoveredAppPkg === app.packageName
+                    ? $r('sys.color.brand')
+                    : $r('sys.color.comp_divider')
+                })
+                .shadow(this.hoveredAppPkg === app.packageName ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
+                .translate({ y: this.hoveredAppPkg === app.packageName ? -2 : 0 })
+                .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+                .onHover((isHover: boolean) => {
+                  this.hoveredAppPkg = isHover ? app.packageName : (this.hoveredAppPkg === app.packageName ? '' : this.hoveredAppPkg);
+                })
               }
+              .transition(Motion.cardTransition())
             },
             (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
           )
         }
         .columnsTemplate('1fr 1fr 1fr 1fr 1fr')
-        .columnsGap(12)
-        .rowsGap(12)
+        .columnsGap(Spacing.MD)
+        .rowsGap(Spacing.MD)
         .width('100%')
         .layoutWeight(1)
       }
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 20, right: 20, top: 16, bottom: 12 })
+    .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.MD })
   }
 
   build() {
     Column({ space: 0 }) {
-      // Integrated HarmonyOS PC Title Bar (48vp, native 3-button avoidance)
-      Row({ space: 10 }) {
-        Row({ space: 10 }) {
+      // 1. Integrated HarmonyOS PC Title Bar (48vp, native 3-button avoidance)
+      // Anchor for Global Settings Half-Modal Sheet
+      Row({ space: Spacing.MD }) {
+        Row({ space: Spacing.MD }) {
           Stack({ alignContent: Alignment.Center }) {
             Column()
               .width(28)
               .height(28)
-              .borderRadius(8)
+              .borderRadius(Radius.SM)
               .backgroundColor($r('sys.color.brand'))
             SymbolGlyph($r('sys.symbol.pad_fill'))
-              .fontSize(16)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_on_primary')])
           }
           Text('svbox Android')
-            .fontSize(15)
+            .fontSize(FontSize.TITLE_SM)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
 
           Text('HarmonyOS PC')
-            .fontSize(10)
+            .fontSize(FontSize.BADGE)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_emphasize'))
-            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-            .borderRadius(6)
+            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+            .borderRadius(Radius.BADGE)
             .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
         }
         .alignItems(VerticalAlign.Center)
@@ -1722,94 +1855,155 @@ struct Index {
         Blank()
 
         if (this.running) {
-          Row({ space: 8 }) {
+          Row({ space: Spacing.SM }) {
             Circle({ width: 7, height: 7 })
               .fill(this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
             Text(`${this.refreshRate}Hz · CPU ${Math.round(this.cpuPercent)}% · ${this.memMb} MB`)
-              .fontSize(11)
+              .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_secondary'))
           }
-          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-          .borderRadius(12)
+          .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS + 1, bottom: Spacing.XS + 1 })
+          .borderRadius(Radius.MD)
           .backgroundColor($r('sys.color.background_secondary'))
+          .transition(Motion.pillPopTransition())
         }
       }
       .width('100%')
-      .height(48)
-      .padding({ left: 16, right: Math.max(152, this.decorRightAvoidVp) })
+      .height(ControlSize.TITLE_BAR_H)
+      .padding({ left: Spacing.LG, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor($r('sys.color.comp_background_primary'))
       .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
+      .bindSheet($$this.showGlobalSettingsSheet, this.globalSettingsSheetBuilder(), {
+        preferType: SheetType.CENTER,
+        width: 580,
+        height: 520,
+        blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+        dragBar: false,
+        showClose: true,
+        title: { title: '设置中心', subtitle: 'svbox Android · HarmonyOS PC' },
+        shadow: ShadowStyle.OUTER_DEFAULT_LG
+      })
 
-      // Main Two-Column HarmonyOS PC + MuMu Layout
+      // 2. Main Two-Column HarmonyOS PC + MuMu Layout
       Row({ space: 0 }) {
-        // Slim Left Navigation Rail (72vp)
-        Column({ space: 8 }) {
-          this.navRailItem('devices', '设备', $r('sys.symbol.display'), 0)
-          this.navRailItem('apps', '应用', $r('sys.symbol.square_grid_2x2'), this.appList.length)
+        // Slim Left Navigation Rail (76vp) with Spring-Sliding Active Highlight
+        // Anchor for Create Instance Half-Modal Sheet
+        Column({ space: 0 }) {
+          Stack({ alignContent: Alignment.TopStart }) {
+            Column()
+              .width('100%')
+              .height(NAV_RAIL_ITEM_H)
+              .borderRadius(Radius.MD)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+              .translate({ y: this.activeNav === 'devices' ? 0 : (NAV_RAIL_ITEM_H + NAV_RAIL_ITEM_GAP) })
+              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+
+            Column({ space: NAV_RAIL_ITEM_GAP }) {
+              this.navRailItem('devices', '设备', $r('sys.symbol.display'), 0)
+              this.navRailItem('apps', '应用', $r('sys.symbol.square_grid_2x2'), this.appList.length)
+            }
+            .width('100%')
+          }
+          .width('100%')
 
           Blank()
 
-          Column({ space: 4 }) {
+          Column({ space: Spacing.XS }) {
             Button({ type: ButtonType.Circle }) {
               SymbolGlyph($r('sys.symbol.gearshape'))
-                .fontSize(18)
+                .fontSize(IconSize.MD)
                 .fontColor([$r('sys.color.icon_secondary')])
             }
-            .width(38)
-            .height(38)
+            .width(ControlSize.BTN_LG)
+            .height(ControlSize.BTN_LG)
             .backgroundColor(Color.Transparent)
-            .stateStyles({
-              pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
-            })
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
             .onClick(() => {
-              this.openGlobalSettingsDialog();
+              this.openGlobalSettingsSheet();
             })
 
             Text('设置')
-              .fontSize(10)
+              .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_tertiary'))
           }
           .alignItems(HorizontalAlign.Center)
-          .padding({ bottom: 4 })
+          .padding({ bottom: Spacing.XS })
         }
-        .width(72)
+        .width(ControlSize.NAV_RAIL_W)
         .height('100%')
-        .padding({ left: 8, right: 8, top: 14, bottom: 10 })
+        .padding({ left: Spacing.SM, right: Spacing.SM, top: Spacing.LG, bottom: Spacing.MD })
         .backgroundColor($r('sys.color.comp_background_primary'))
         .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
+        .bindSheet($$this.showCreateSheet, this.createSheetBuilder(), {
+          preferType: SheetType.CENTER,
+          width: 620,
+          height: 590,
+          blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+          dragBar: false,
+          showClose: true,
+          title: { title: '新建 Android 设备', subtitle: '支持批量创建，每台设备拥有独立隔离数据分区' },
+          shadow: ShadowStyle.OUTER_DEFAULT_LG
+        })
 
-        // Right Workspace Canvas
-        Column({ space: 0 }) {
+        // Right Workspace Canvas with Page Switch Motion
+        // Anchor for Device Settings Half-Modal Sheet
+        Stack() {
           if (this.activeNav === 'devices') {
-            this.devicesWorkspace()
+            Column() {
+              this.devicesWorkspace()
+            }
+            .width('100%')
+            .height('100%')
+            .transition(Motion.pageSwitchTransition())
           } else {
-            this.appsWorkspace()
+            Column() {
+              this.appsWorkspace()
+            }
+            .width('100%')
+            .height('100%')
+            .transition(Motion.pageSwitchTransition())
           }
         }
         .layoutWeight(1)
         .height('100%')
         .backgroundColor($r('sys.color.background_secondary'))
+        .bindSheet($$this.showDeviceSettingsSheet, this.deviceSettingsSheetBuilder(), {
+          preferType: SheetType.CENTER,
+          width: 760,
+          height: 580,
+          blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+          dragBar: false,
+          showClose: true,
+          title: {
+            title: '设备设置',
+            subtitle: this.editingInstance ? `${this.editingInstance.name} (#${this.editingInstance.index})` : ''
+          },
+          shadow: ShadowStyle.OUTER_DEFAULT_LG
+        })
       }
       .width('100%')
       .layoutWeight(1)
 
-      // Clean HarmonyOS Bottom Status Bar (30vp)
-      Row({ space: 12 }) {
+      // 3. Clean HarmonyOS Bottom Status Bar (32vp)
+      // Anchor for Backup & Restore Half-Modal Sheet
+      Row({ space: Spacing.MD }) {
         Text(`共 ${this.instances.length} 台设备 · ${this.running ? '1 台运行中' : '全部已停止'}`)
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_secondary'))
 
         if (this.cloningBusy) {
-          Row({ space: 5 }) {
+          Row({ space: Spacing.XS + 2 }) {
             LoadingProgress().width(14).height(14).color($r('sys.color.brand'))
             Text('正在复制设备数据...')
-              .fontSize(11)
+              .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_emphasize'))
           }
+          .transition(Motion.pillPopTransition())
         } else if (this.statusText.length > 0) {
           Text(`· ${this.statusText === 'Idle' ? '就绪' : this.statusText}`)
-            .fontSize(11)
+            .fontSize(FontSize.MICRO)
             .fontColor($r('sys.color.font_tertiary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1819,16 +2013,29 @@ struct Index {
         }
 
         Text(this.gpuRenderer.length > 0 ? this.gpuRenderer : 'Maleoon Vulkan · svbox Runtime')
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
           .maxLines(1)
       }
       .width('100%')
-      .height(30)
-      .padding({ left: 16, right: 16 })
+      .height(ControlSize.FOOTER_BAR_H)
+      .padding({ left: Spacing.LG, right: Spacing.LG })
       .backgroundColor($r('sys.color.comp_background_primary'))
       .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
+      .bindSheet($$this.showBackupSheet, this.backupSheetBuilder(), {
+        preferType: SheetType.CENTER,
+        width: 540,
+        height: 520,
+        blurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+        dragBar: false,
+        showClose: true,
+        title: {
+          title: '备份与还原',
+          subtitle: this.editingInstance ? `${this.editingInstance.name} (#${this.editingInstance.index})` : ''
+        },
+        shadow: ShadowStyle.OUTER_DEFAULT_LG
+      })
     }
     .width('100%')
     .height('100%')

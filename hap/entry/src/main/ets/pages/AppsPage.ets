@@ -13,6 +13,14 @@ import {
   removeAndroidAppShortcut,
   ShortcutOpResult
 } from '../common/DesktopShortcut';
+import {
+  ControlSize,
+  FontSize,
+  IconSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
 
 const TAG: string = 'SvboxAppsPage';
 
@@ -36,8 +44,16 @@ struct AppsPage {
   @State private appFilter: string = 'all';
   @State private pinnedIds: string[] = [];
   @State private prefEpoch: number = 0;
+  @State private hoveredPkg: string = '';
 
   private pollTimer: number = -1;
+
+  pageTransition() {
+    PageTransitionEnter({ duration: Motion.DUR_MEDIUM, curve: Motion.DECEL_CURVE })
+      .slide(SlideEffect.Right)
+    PageTransitionExit({ duration: Motion.DUR_SHORT, curve: Motion.ACCEL_CURVE })
+      .slide(SlideEffect.Right)
+  }
 
   private showToast(msg: string): void {
     try {
@@ -205,91 +221,94 @@ struct AppsPage {
 
   build() {
     Column({ space: 0 }) {
-      // HarmonyOS PC Adaptive Title Bar
-      Row({ space: 10 }) {
+      Row({ space: Spacing.MD }) {
         Button({ type: ButtonType.Capsule }) {
-          Row({ space: 4 }) {
+          Row({ space: Spacing.XS }) {
             SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(14)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_primary')])
             Text('设备管理')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontColor($r('sys.color.font_primary'))
           }
         }
-        .height(32)
-        .padding({ left: 10, right: 12 })
+        .height(ControlSize.BTN_SM)
+        .padding({ left: Spacing.MD, right: Spacing.MD })
         .backgroundColor($r('sys.color.comp_background_tertiary'))
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
         .onClick(() => {
           this.getUIContext().getRouter().back();
         })
 
-        Row({ space: 6 }) {
+        Row({ space: Spacing.SM }) {
           SymbolGlyph($r('sys.symbol.square_grid_2x2'))
-            .fontSize(16)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_emphasize')])
           Text('应用中心')
-            .fontSize(15)
+            .fontSize(FontSize.TITLE_SM)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
         }
 
         Text(`${this.appList.length} 个应用`)
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_secondary'))
-          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-          .borderRadius(8)
+          .padding({ left: Spacing.SM, right: Spacing.SM, top: Spacing.XS, bottom: Spacing.XS })
+          .borderRadius(Radius.SM)
           .backgroundColor($r('sys.color.background_secondary'))
 
         Blank()
 
-        Row({ space: 5 }) {
+        Row({ space: Spacing.XS + 2 }) {
           SymbolGlyph($r('sys.symbol.pin_fill'))
-            .fontSize(12)
+            .fontSize(IconSize.XS)
             .fontColor([$r('sys.color.icon_emphasize')])
           Text(`桌面 ${this.pinnedIds.length}/10`)
-            .fontSize(11)
+            .fontSize(FontSize.MICRO)
             .fontColor($r('sys.color.font_emphasize'))
         }
-        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-        .borderRadius(12)
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS + 1, bottom: Spacing.XS + 1 })
+        .borderRadius(Radius.MD)
         .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
 
         Button({ type: ButtonType.Capsule }) {
-          Row({ space: 5 }) {
+          Row({ space: Spacing.XS + 2 }) {
             SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-              .fontSize(13)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_primary')])
             Text('刷新')
-              .fontSize(12)
+              .fontSize(FontSize.CAPTION)
               .fontColor($r('sys.color.font_primary'))
           }
         }
-        .height(30)
-        .padding({ left: 12, right: 12 })
+        .height(ControlSize.BTN_SM)
+        .padding({ left: Spacing.MD, right: Spacing.MD })
         .backgroundColor($r('sys.color.comp_background_tertiary'))
         .enabled(this.wmAgentReady && !this.loadingApps)
+        .hoverEffect(HoverEffect.Highlight)
+        .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
         .onClick(() => {
           this.refreshApps(true);
         })
       }
       .width('100%')
-      .height(48)
-      .padding({ left: 16, right: Math.max(152, this.decorRightAvoidVp) })
+      .height(ControlSize.TITLE_BAR_H)
+      .padding({ left: Spacing.LG, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor($r('sys.color.comp_background_primary'))
       .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
 
-      Column({ space: 14 }) {
-        Row({ space: 12 }) {
-          Row({ space: 8 }) {
+      Column({ space: Spacing.LG }) {
+        Row({ space: Spacing.MD }) {
+          Row({ space: Spacing.SM }) {
             SymbolGlyph($r('sys.symbol.magnifyingglass'))
-              .fontSize(15)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_tertiary')])
             TextInput({ placeholder: '搜索 Android 应用名称或包名...', text: this.searchQuery })
               .layoutWeight(1)
-              .height(34)
-              .fontSize(13)
+              .height(ControlSize.INPUT_H)
+              .fontSize(FontSize.BODY_MD)
               .fontColor($r('sys.color.font_primary'))
               .placeholderColor($r('sys.color.font_tertiary'))
               .backgroundColor(Color.Transparent)
@@ -299,63 +318,66 @@ struct AppsPage {
               })
           }
           .layoutWeight(1)
-          .height(38)
-          .padding({ left: 14, right: 12 })
-          .borderRadius(19)
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.MD })
+          .borderRadius(Radius.CAPSULE)
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(VerticalAlign.Center)
 
-          Row({ space: 2 }) {
+          Row({ space: Spacing.XS }) {
             Button('全部', { type: ButtonType.Normal })
-              .height(30)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(15)
-              .fontSize(12)
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
+              .fontSize(FontSize.CAPTION)
               .fontColor(this.appFilter === 'all' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
               .backgroundColor(this.appFilter === 'all' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
               .onClick(() => { this.appFilter = 'all'; })
             Button('第三方', { type: ButtonType.Normal })
-              .height(30)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(15)
-              .fontSize(12)
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
+              .fontSize(FontSize.CAPTION)
               .fontColor(this.appFilter === 'user' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
               .backgroundColor(this.appFilter === 'user' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
               .onClick(() => { this.appFilter = 'user'; })
             Button('系统', { type: ButtonType.Normal })
-              .height(30)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(15)
-              .fontSize(12)
+              .height(28)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(14)
+              .fontSize(FontSize.CAPTION)
               .fontColor(this.appFilter === 'system' ? $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
               .backgroundColor(this.appFilter === 'system' ? $r('sys.color.brand') : Color.Transparent)
+              .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
               .onClick(() => { this.appFilter = 'system'; })
           }
           .padding(3)
-          .borderRadius(18)
+          .borderRadius(Radius.CAPSULE)
           .backgroundColor($r('sys.color.comp_background_primary'))
           .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         }
         .width('100%')
 
         if (!this.wmAgentReady) {
-          Column({ space: 12 }) {
+          Column({ space: Spacing.MD }) {
             LoadingProgress()
-              .width(36)
-              .height(36)
+              .width(ControlSize.BTN_MD)
+              .height(ControlSize.BTN_MD)
               .color($r('sys.color.brand'))
             Text(this.running ? 'Android 14 正在启动，应用列表即将就绪...' : '请先在设备管理中启动 Android 14')
-              .fontSize(14)
+              .fontSize(FontSize.BODY_LG)
               .fontColor($r('sys.color.font_secondary'))
           }
           .width('100%')
           .layoutWeight(1)
           .justifyContent(FlexAlign.Center)
         } else if (this.getFilteredApps().length === 0) {
-          Column({ space: 8 }) {
+          Column({ space: Spacing.SM }) {
             Text(this.loadingApps ? '正在同步应用与图标...' : '暂无匹配应用')
-              .fontSize(14)
+              .fontSize(FontSize.BODY_LG)
               .fontColor($r('sys.color.font_secondary'))
           }
           .width('100%')
@@ -367,31 +389,31 @@ struct AppsPage {
               this.getFilteredApps(),
               (app: AndroidAppItem) => {
                 GridItem() {
-                  Column({ space: 10 }) {
-                    Column({ space: 8 }) {
+                  Column({ space: Spacing.MD }) {
+                    Column({ space: Spacing.SM }) {
                       if (this.iconsDir.length > 0 && app.iconFile.length > 0) {
                         Image(`file://${this.iconsDir}/${app.iconFile}`)
-                          .width(54)
-                          .height(54)
-                          .borderRadius(14)
+                          .width(56)
+                          .height(56)
+                          .borderRadius(Radius.MD + 2)
                           .objectFit(ImageFit.Contain)
                       } else {
                         Row() {
                           Text(app.label.length > 0 ? app.label.substring(0, 1).toUpperCase() : 'A')
-                            .fontSize(22)
+                            .fontSize(IconSize.LG)
                             .fontWeight(FontWeight.Bold)
                             .fontColor($r('sys.color.font_on_primary'))
                         }
-                        .width(54)
-                        .height(54)
-                        .borderRadius(14)
+                        .width(56)
+                        .height(56)
+                        .borderRadius(Radius.MD + 2)
                         .backgroundColor($r('sys.color.brand'))
                         .justifyContent(FlexAlign.Center)
                         .alignItems(VerticalAlign.Center)
                       }
 
                       Text(app.label)
-                        .fontSize(13)
+                        .fontSize(FontSize.BODY_MD)
                         .fontWeight(FontWeight.Medium)
                         .fontColor($r('sys.color.font_primary'))
                         .maxLines(1)
@@ -405,34 +427,35 @@ struct AppsPage {
                       this.openAndroidAppWindow(app);
                     })
 
-                    Row({ space: 6 }) {
+                    Row({ space: Spacing.SM }) {
                       Button({ type: ButtonType.Normal }) {
-                        Row({ space: 3 }) {
+                        Row({ space: Spacing.XS }) {
                           SymbolGlyph($r('sys.symbol.screen_rotation'))
-                            .fontSize(11)
+                            .fontSize(IconSize.XS)
                             .fontColor([$r('sys.color.icon_secondary')])
                           Text(this.getEffectiveModeLabel(app))
-                            .fontSize(10)
+                            .fontSize(FontSize.BADGE)
                             .fontColor($r('sys.color.font_secondary'))
                         }
                       }
-                      .height(24)
-                      .padding({ left: 8, right: 8 })
-                      .borderRadius(12)
+                      .height(ControlSize.BTN_XS)
+                      .padding({ left: Spacing.SM, right: Spacing.SM })
+                      .borderRadius(Radius.MD)
                       .backgroundColor($r('sys.color.background_secondary'))
+                      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
                       .onClick(() => { this.cycleAppWindowPref(app); })
 
                       Button({ type: ButtonType.Normal }) {
-                        Row({ space: 3 }) {
+                        Row({ space: Spacing.XS }) {
                           SymbolGlyph(this.isAppPinned(app.packageName) ? $r('sys.symbol.pin_fill') : $r('sys.symbol.pin'))
-                            .fontSize(11)
+                            .fontSize(IconSize.XS)
                             .fontColor([
                               this.isAppPinned(app.packageName)
                                 ? $r('sys.color.confirm')
                                 : $r('sys.color.icon_emphasize')
                             ])
                           Text(this.isAppPinned(app.packageName) ? '已加桌' : '加桌')
-                            .fontSize(10)
+                            .fontSize(FontSize.BADGE)
                             .fontColor(
                               this.isAppPinned(app.packageName)
                                 ? $r('sys.color.confirm')
@@ -440,38 +463,52 @@ struct AppsPage {
                             )
                         }
                       }
-                      .height(24)
-                      .padding({ left: 8, right: 8 })
-                      .borderRadius(12)
+                      .height(ControlSize.BTN_XS)
+                      .padding({ left: Spacing.SM, right: Spacing.SM })
+                      .borderRadius(Radius.MD)
                       .backgroundColor(
                         this.isAppPinned(app.packageName)
                           ? '#1F64BB5C'
                           : $r('sys.color.comp_emphasize_tertiary')
                       )
+                      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.94 })
                       .onClick(() => { this.toggleDesktopShortcut(app); })
                     }
                     .justifyContent(FlexAlign.Center)
                   }
                   .width('100%')
-                  .padding({ left: 10, right: 10, top: 14, bottom: 12 })
-                  .borderRadius(16)
+                  .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.LG, bottom: Spacing.MD })
+                  .borderRadius(Radius.CARD)
                   .backgroundColor($r('sys.color.comp_background_primary'))
-                  .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+                  .border({
+                    width: this.hoveredPkg === app.packageName ? 1.0 : 0.6,
+                    color: this.hoveredPkg === app.packageName
+                      ? $r('sys.color.brand')
+                      : $r('sys.color.comp_divider')
+                  })
+                  .shadow(this.hoveredPkg === app.packageName ? ShadowStyle.OUTER_DEFAULT_SM : ShadowStyle.OUTER_DEFAULT_XS)
+                  .translate({ y: this.hoveredPkg === app.packageName ? -2 : 0 })
+                  .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+                  .onHover((isHover: boolean) => {
+                    this.hoveredPkg = isHover ? app.packageName : (this.hoveredPkg === app.packageName ? '' : this.hoveredPkg);
+                  })
                 }
+                .transition(Motion.cardTransition())
               },
               (app: AndroidAppItem): string => `${app.packageName}_${this.prefEpoch}_${this.pinnedIds.length}`
             )
           }
           .columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr')
-          .columnsGap(12)
-          .rowsGap(12)
+          .columnsGap(Spacing.MD)
+          .rowsGap(Spacing.MD)
           .width('100%')
           .layoutWeight(1)
         }
       }
       .width('100%')
       .layoutWeight(1)
-      .padding({ left: 20, right: 20, top: 16, bottom: 14 })
+      .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.MD })
     }
     .width('100%')
     .height('100%')

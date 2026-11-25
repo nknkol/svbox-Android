@@ -905,6 +905,12 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
 - **C++ Runtime & NAPI 后端（[android_runtime.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/android_runtime.cpp)、[napi_init.cpp](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/cpp/napi_init.cpp)）**：新增 `setInstanceConfig`（隔离数据目录、自定义 DPI、音频开关、ADB Root 开关、自定义机型 `ro.product.*`、自定义 ADB 端口）、实时磁盘占用统计（`getInstanceDiskMb`）、缓存清理（`cleanInstanceCache`）、后台异步复制实例（`cloneInstanceAsync`）、安全删除（`deleteInstanceData`）及 `tar/tar.gz` 异步备份还原（`backupInstanceAsync` / `restoreInstanceAsync`）。
 - **真机验收（`HAD-W32`）**：已完成待机态与 120Hz Vulkan 运行态截屏视觉核验（`2090×1394`），并确认 `Android 14` + `SvboxWmAgent` + `ADB 127.0.0.1:5555` + `Maleoon 916 Vulkan` 全链路正常开机。
 
+### 11.3 华为设计精修：统一设计令牌、原生半模态面板（`bindSheet`）与完整动效体系
+- **统一设计令牌（[DesignTokens.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/common/DesignTokens.ets)）**：严格收敛全应用间距（`4/8/12/16/20/24 vp` 8vp/4vp 栅格）、图标 5 档尺寸（`12/16/20/24/44 vp`）、字号层级、控件高度与华为官方动效曲线（标准贝塞尔 `cubic-bezier(0.4, 0, 0.2, 1)`、加减速曲线及阻尼弹簧 `springCurve(0, 1, 228, 30)` / `(0, 1, 320, 34)`）。
+- **原生半模态面板重构（`bindSheet` + `SheetType.CENTER` + `BlurStyle.COMPONENT_ULTRA_THICK`）**：将设备设置（[DeviceSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/DeviceSettingsDialog.ets)）、新建设备（[CreateInstanceDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/CreateInstanceDialog.ets)）、备份与还原（[BackupRestoreDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/BackupRestoreDialog.ets)）及全局设置中心（[GlobalSettingsDialog.ets](file:///storage/Users/currentUser/Workspace/svbox-Android/hap/entry/src/main/ets/components/GlobalSettingsDialog.ets)）全部重构为鸿蒙 PC 居中半模态面板，自带系统沉浸毛玻璃材质、原生双行标题栏与关闭按钮及弹簧转场动效，并分散挂载于 4 个独立结构锚点避免冲突。
+- **全链路交互动效**：左侧导航轨、设置侧边栏与视图切换分段开关采用弹簧滑移选中指示器；「设备 ↔ 应用」主工作区、设置 9 子页签、常规/批量工具栏、设备卡片增删与排序、复选框滑入及状态胶囊均配置 `animateTo` + `TransitionEffect` 过渡；卡片与按钮全面覆盖 PC 悬浮微浮起（`onHover` + `ShadowStyle`）与 `ClickEffectLevel.LIGHT` 按压回弹反馈。
+
+
 
 
 

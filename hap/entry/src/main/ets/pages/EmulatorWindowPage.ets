@@ -6,6 +6,14 @@ import {
   findPresetByKey,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
+import {
+  ControlSize,
+  FontSize,
+  IconSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 
 const TAG: string = 'SvboxEmuPage';
@@ -219,37 +227,36 @@ struct EmulatorWindowPage {
   private topIconBtn(iconRes: Resource, onTap: () => void) {
     Button({ type: ButtonType.Normal }) {
       SymbolGlyph(iconRes)
-        .fontSize(15)
+        .fontSize(IconSize.SM)
         .fontColor([$r('sys.color.icon_primary')])
     }
-    .width(28)
-    .height(28)
-    .borderRadius(8)
+    .width(ControlSize.BTN_SM)
+    .height(ControlSize.BTN_SM)
+    .borderRadius(Radius.SM)
     .backgroundColor(Color.Transparent)
-    .stateStyles({
-      pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
-    })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
     .onClick(onTap)
   }
 
   build() {
     Column({ space: 0 }) {
-      // MuMu-Style Ultra-Clean Integrated HarmonyOS PC Top Toolbar (40vp, ZERO bottom chrome!)
-      Row({ space: 4 }) {
-        Row({ space: 7 }) {
+      // MuMu-Style Ultra-Clean HarmonyOS PC Top Toolbar (40vp, ZERO bottom chrome!)
+      Row({ space: Spacing.XS }) {
+        Row({ space: Spacing.SM }) {
           Stack({ alignContent: Alignment.Center }) {
             Column()
-              .width(22)
-              .height(22)
-              .borderRadius(6)
+              .width(24)
+              .height(24)
+              .borderRadius(Radius.BADGE)
               .backgroundColor($r('sys.color.brand'))
             SymbolGlyph($r('sys.symbol.pad_fill'))
-              .fontSize(12)
+              .fontSize(IconSize.XS)
               .fontColor([$r('sys.color.icon_on_primary')])
           }
 
           Text(this.emuInstanceName.length > 0 ? this.emuInstanceName : 'Android 14 · 默认设备')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
@@ -257,19 +264,18 @@ struct EmulatorWindowPage {
             .layoutWeight(1)
 
           Text(`${this.fps}/${this.refreshRate}Hz`)
-            .fontSize(10)
+            .fontSize(FontSize.BADGE)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_emphasize'))
-            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
-            .borderRadius(6)
+            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+            .borderRadius(Radius.BADGE)
             .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
             .maxLines(1)
         }
         .layoutWeight(1)
         .alignItems(VerticalAlign.Center)
 
-        // Compact Android Navigation & Quick Tools directly in slim top toolbar (MuMu 26459fce style)
-        Row({ space: 2 }) {
+        Row({ space: Spacing.XS }) {
           this.topIconBtn($r('sys.symbol.chevron_left'), () => { native.sendNavKey('back'); })
           this.topIconBtn($r('sys.symbol.house'), () => { native.sendNavKey('home'); })
           this.topIconBtn($r('sys.symbol.rectangle_on_rectangle'), () => { native.sendNavKey('recents'); })
@@ -277,28 +283,27 @@ struct EmulatorWindowPage {
 
           Button({ type: ButtonType.Normal }) {
             SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
-              .fontSize(15)
+              .fontSize(IconSize.SM)
               .fontColor([$r('sys.color.icon_primary')])
           }
-          .width(28)
-          .height(28)
-          .borderRadius(8)
+          .width(ControlSize.BTN_SM)
+          .height(ControlSize.BTN_SM)
+          .borderRadius(Radius.SM)
           .backgroundColor(Color.Transparent)
-          .stateStyles({
-            pressed: { .backgroundColor($r('sys.color.interactive_pressed')) }
-          })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .bindMenu(this.emuMoreMenuBuilder())
         }
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .height(40)
-      .padding({ left: 10, right: Math.max(152, this.decorRightAvoidVp) })
+      .height(ControlSize.EMU_BAR_H)
+      .padding({ left: Spacing.MD, right: Math.max(152, this.decorRightAvoidVp) })
       .backgroundColor($r('sys.color.comp_background_primary'))
       .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
 
-      // Full-Height Zero-Copy Vulkan Viewport (No wasted bottom bar!)
+      // Full-Height Zero-Copy Vulkan Viewport
       Stack({ alignContent: Alignment.Center }) {
         XComponent({
           id: 'svbox_display_0',
@@ -312,19 +317,20 @@ struct EmulatorWindowPage {
           .backgroundColor('#000000')
 
         if (!this.running) {
-          Column({ space: 12 }) {
+          Column({ space: Spacing.MD }) {
             LoadingProgress()
-              .width(36)
-              .height(36)
+              .width(ControlSize.BTN_MD)
+              .height(ControlSize.BTN_MD)
               .color($r('sys.color.brand'))
             Text(this.statusText)
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontColor($r('sys.color.font_primary'))
           }
-          .padding({ left: 24, right: 24, top: 20, bottom: 20 })
+          .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.XL, bottom: Spacing.XL })
           .backgroundColor($r('sys.color.comp_background_primary'))
-          .borderRadius(16)
-          .shadow({ radius: 24, color: '#33000000', offsetY: 6 })
+          .borderRadius(Radius.CARD)
+          .shadow(ShadowStyle.OUTER_DEFAULT_LG)
+          .transition(Motion.pillPopTransition())
         }
       }
       .width('100%')

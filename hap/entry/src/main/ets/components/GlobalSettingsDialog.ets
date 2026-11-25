@@ -1,11 +1,18 @@
 import native from 'libentry.so';
+import {
+  ControlSize,
+  FontSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
 import { GlobalSettings } from '../model/InstanceModel';
 
-@CustomDialog
-export struct GlobalSettingsDialog {
-  controller: CustomDialogController;
+@Component
+export struct GlobalSettingsSheet {
   initialSettings: GlobalSettings | undefined = undefined;
   onSave: (next: GlobalSettings) => void = (): void => {};
+  onCancel: () => void = (): void => {};
 
   @State private autoBootDefault: boolean = false;
   @State private batchStartIntervalSec: number = 3;
@@ -26,53 +33,35 @@ export struct GlobalSettingsDialog {
     }
   }
 
+  private animateSelect(fn: () => void): void {
+    try {
+      this.getUIContext().animateTo({
+        duration: Motion.DUR_SHORT,
+        curve: Motion.SPRING_SNAPPY
+      }, fn);
+    } catch (_e) {
+      fn();
+    }
+  }
+
   build() {
     Column({ space: 0 }) {
-      // Header
-      Row() {
-        Row({ space: 8 }) {
-          SymbolGlyph($r('sys.symbol.gearshape_fill'))
-            .fontSize(20)
-            .fontColor([$r('sys.color.icon_emphasize')])
-          Text('设置中心')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('sys.color.font_primary'))
-        }
-        Blank()
-        Button({ type: ButtonType.Circle }) {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(14)
-            .fontColor([$r('sys.color.icon_secondary')])
-        }
-        .width(32)
-        .height(32)
-        .backgroundColor($r('sys.color.comp_background_tertiary'))
-        .onClick(() => {
-          this.controller.close();
-        })
-      }
-      .width('100%')
-      .padding({ left: 24, right: 20, top: 20, bottom: 14 })
-
-      Divider().color($r('sys.color.comp_divider')).opacity(0.4)
-
       Scroll() {
-        Column({ space: 16 }) {
+        Column({ space: Spacing.LG }) {
           // Startup & Multi-instance behavior
-          Column({ space: 12 }) {
+          Column({ space: Spacing.MD }) {
             Text('启动与多开')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
 
-            Row() {
-              Column({ space: 2 }) {
+            Row({ space: Spacing.MD }) {
+              Column({ space: Spacing.XS }) {
                 Text('启动应用时自动开机默认设备')
-                  .fontSize(14)
+                  .fontSize(FontSize.BODY_LG)
                   .fontColor($r('sys.color.font_primary'))
                 Text('关闭后仅打开设备管理面板，按需启动指定实例')
-                  .fontSize(11)
+                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_tertiary'))
               }
               .alignItems(HorizontalAlign.Start)
@@ -88,42 +77,44 @@ export struct GlobalSettingsDialog {
 
             Divider().color($r('sys.color.comp_divider')).opacity(0.35)
 
-            Row() {
-              Column({ space: 2 }) {
+            Row({ space: Spacing.MD }) {
+              Column({ space: Spacing.XS }) {
                 Text('批量操作间隔（秒）')
-                  .fontSize(14)
+                  .fontSize(FontSize.BODY_LG)
                   .fontColor($r('sys.color.font_primary'))
                 Text('避免短时间内触发过高 CPU / IO 峰值')
-                  .fontSize(11)
+                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_tertiary'))
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
 
-              Row({ space: 8 }) {
+              Row({ space: Spacing.SM }) {
                 Button('−', { type: ButtonType.Normal })
-                  .width(30)
-                  .height(30)
-                  .borderRadius(8)
+                  .width(ControlSize.BTN_SM)
+                  .height(ControlSize.BTN_SM)
+                  .borderRadius(Radius.SM)
                   .fontColor($r('sys.color.font_primary'))
                   .backgroundColor($r('sys.color.comp_background_tertiary'))
                   .enabled(this.batchStartIntervalSec > 1)
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
                   .onClick(() => {
                     if (this.batchStartIntervalSec > 1) this.batchStartIntervalSec -= 1;
                   })
                 Text(`${this.batchStartIntervalSec} s`)
-                  .fontSize(13)
+                  .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
                   .fontColor($r('sys.color.font_primary'))
                   .width(36)
                   .textAlign(TextAlign.Center)
                 Button('+', { type: ButtonType.Normal })
-                  .width(30)
-                  .height(30)
-                  .borderRadius(8)
+                  .width(ControlSize.BTN_SM)
+                  .height(ControlSize.BTN_SM)
+                  .borderRadius(Radius.SM)
                   .fontColor($r('sys.color.font_primary'))
                   .backgroundColor($r('sys.color.comp_background_tertiary'))
                   .enabled(this.batchStartIntervalSec < 15)
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
                   .onClick(() => {
                     if (this.batchStartIntervalSec < 15) this.batchStartIntervalSec += 1;
                   })
@@ -132,22 +123,23 @@ export struct GlobalSettingsDialog {
             .width('100%')
           }
           .width('100%')
-          .padding(16)
-          .borderRadius(16)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding(Spacing.LG)
+          .borderRadius(Radius.CARD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(HorizontalAlign.Start)
 
           // Window Arrangement
-          Column({ space: 12 }) {
+          Column({ space: Spacing.MD }) {
             Text('窗口排列方式')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
 
-            Row({ space: 10 }) {
-              Column({ space: 4 }) {
+            Row({ space: Spacing.MD }) {
+              Column({ space: Spacing.XS }) {
                 Text('网格平铺（并排）')
-                  .fontSize(13)
+                  .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
                   .fontColor(
                     this.windowArrangeMode === 'grid'
@@ -155,29 +147,32 @@ export struct GlobalSettingsDialog {
                       : $r('sys.color.font_primary')
                   )
                 Text('按窗口宽度从左向右自动并排对齐')
-                  .fontSize(11)
+                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_tertiary'))
               }
               .layoutWeight(1)
-              .padding(12)
+              .padding(Spacing.MD)
               .alignItems(HorizontalAlign.Start)
-              .borderRadius(12)
+              .borderRadius(Radius.MD)
               .backgroundColor(
                 this.windowArrangeMode === 'grid'
                   ? $r('sys.color.comp_emphasize_tertiary')
-                  : $r('sys.color.comp_background_primary')
+                  : $r('sys.color.background_secondary')
               )
               .border({
-                width: this.windowArrangeMode === 'grid' ? 1.5 : 1,
-                color: this.windowArrangeMode === 'grid' ? $r('sys.color.brand') : Color.Transparent
+                width: this.windowArrangeMode === 'grid' ? 1.5 : 0.6,
+                color: this.windowArrangeMode === 'grid' ? $r('sys.color.brand') : $r('sys.color.comp_divider')
               })
+              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
               .onClick(() => {
-                this.windowArrangeMode = 'grid';
+                this.animateSelect(() => { this.windowArrangeMode = 'grid'; });
               })
 
-              Column({ space: 4 }) {
+              Column({ space: Spacing.XS }) {
                 Text('对角层叠排列')
-                  .fontSize(13)
+                  .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
                   .fontColor(
                     this.windowArrangeMode === 'cascade'
@@ -185,59 +180,64 @@ export struct GlobalSettingsDialog {
                       : $r('sys.color.font_primary')
                   )
                 Text('沿对角线错开排列，方便快速切换窗口')
-                  .fontSize(11)
+                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_tertiary'))
               }
               .layoutWeight(1)
-              .padding(12)
+              .padding(Spacing.MD)
               .alignItems(HorizontalAlign.Start)
-              .borderRadius(12)
+              .borderRadius(Radius.MD)
               .backgroundColor(
                 this.windowArrangeMode === 'cascade'
                   ? $r('sys.color.comp_emphasize_tertiary')
-                  : $r('sys.color.comp_background_primary')
+                  : $r('sys.color.background_secondary')
               )
               .border({
-                width: this.windowArrangeMode === 'cascade' ? 1.5 : 1,
-                color: this.windowArrangeMode === 'cascade' ? $r('sys.color.brand') : Color.Transparent
+                width: this.windowArrangeMode === 'cascade' ? 1.5 : 0.6,
+                color: this.windowArrangeMode === 'cascade' ? $r('sys.color.brand') : $r('sys.color.comp_divider')
               })
+              .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
               .onClick(() => {
-                this.windowArrangeMode = 'cascade';
+                this.animateSelect(() => { this.windowArrangeMode = 'cascade'; });
               })
             }
             .width('100%')
           }
           .width('100%')
-          .padding(16)
-          .borderRadius(16)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding(Spacing.LG)
+          .borderRadius(Radius.CARD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(HorizontalAlign.Start)
 
           // Backup Directory
-          Column({ space: 10 }) {
+          Column({ space: Spacing.MD }) {
             Text('数据与备份目录')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
 
-            Row({ space: 10 }) {
+            Row({ space: Spacing.SM }) {
               TextInput({ text: this.backupDir })
                 .layoutWeight(1)
-                .height(36)
-                .fontSize(12)
+                .height(ControlSize.INPUT_H)
+                .fontSize(FontSize.CAPTION)
                 .fontColor($r('sys.color.font_primary'))
-                .backgroundColor($r('sys.color.comp_background_primary'))
-                .borderRadius(10)
+                .backgroundColor($r('sys.color.background_secondary'))
+                .borderRadius(Radius.MD)
                 .onChange((val: string) => {
                   this.backupDir = val;
                 })
-              Button('检查目录', { type: ButtonType.Normal })
-                .height(36)
-                .padding({ left: 14, right: 14 })
-                .borderRadius(10)
-                .fontSize(12)
+              Button('检查目录', { type: ButtonType.Capsule })
+                .height(ControlSize.INPUT_H)
+                .padding({ left: Spacing.LG, right: Spacing.LG })
+                .fontSize(FontSize.CAPTION)
                 .fontColor($r('sys.color.font_primary'))
                 .backgroundColor($r('sys.color.comp_background_tertiary'))
+                .hoverEffect(HoverEffect.Highlight)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
                 .onClick(() => {
                   const ok: boolean = native.ensureDir(this.backupDir);
                   this.dirStatusHint = ok ? '目录已就绪' : '无法创建目录，请检查路径权限';
@@ -247,44 +247,47 @@ export struct GlobalSettingsDialog {
 
             if (this.dirStatusHint.length > 0) {
               Text(this.dirStatusHint)
-                .fontSize(11)
+                .fontSize(FontSize.MICRO)
                 .fontColor($r('sys.color.confirm'))
+                .transition(Motion.pillPopTransition())
             }
           }
           .width('100%')
-          .padding(16)
-          .borderRadius(16)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding(Spacing.LG)
+          .borderRadius(Radius.CARD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
           .alignItems(HorizontalAlign.Start)
         }
-        .padding({ left: 24, right: 24, top: 18, bottom: 18 })
+        .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.LG })
       }
       .layoutWeight(1)
 
       Divider().color($r('sys.color.comp_divider')).opacity(0.4)
 
-      Row({ space: 12 }) {
-        Text('svbox Android · HarmonyOS PC Edition')
-          .fontSize(12)
-          .fontColor($r('sys.color.font_tertiary'))
+      Row({ space: Spacing.MD }) {
         Blank()
         Button('取消', { type: ButtonType.Capsule })
-          .height(36)
-          .padding({ left: 20, right: 20 })
-          .fontSize(14)
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XL, right: Spacing.XL })
+          .fontSize(FontSize.BODY_LG)
           .fontColor($r('sys.color.font_primary'))
           .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
-            this.controller.close();
+            this.onCancel();
           })
 
         Button('保存设置', { type: ButtonType.Capsule })
-          .height(36)
-          .padding({ left: 22, right: 22 })
-          .fontSize(14)
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XXL, right: Spacing.XXL })
+          .fontSize(FontSize.BODY_LG)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_on_primary'))
           .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
             this.onSave({
               autoBootDefault: this.autoBootDefault,
@@ -296,16 +299,12 @@ export struct GlobalSettingsDialog {
               sortBy: this.sortBy,
               viewMode: this.viewMode,
             });
-            this.controller.close();
           })
       }
       .width('100%')
-      .padding({ left: 24, right: 24, top: 14, bottom: 18 })
+      .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.MD, bottom: Spacing.LG })
     }
-    .width(560)
-    .height(500)
-    .backgroundColor($r('sys.color.comp_background_primary'))
-    .borderRadius(24)
-    .shadow({ radius: 32, color: '#26000000', offsetY: 8 })
+    .width('100%')
+    .height('100%')
   }
 }

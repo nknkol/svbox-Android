@@ -7,6 +7,14 @@ import {
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
 import {
+  ControlSize,
+  FontSize,
+  IconSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
+import {
   cloneInstanceRecord,
   cpuCoresToProfile,
   DEVICE_MODEL_PRESETS,
@@ -37,16 +45,20 @@ const SHORTCUT_ITEMS: ShortcutRow[] = [
   { action: '将当前应用拆出为独立窗口', keys: '模拟器顶栏「拆出」按钮' },
 ];
 
-@CustomDialog
-export struct DeviceSettingsDialog {
-  controller: CustomDialogController;
+const NAV_ITEM_H: number = 38;
+const NAV_ITEM_GAP: number = 4;
+
+@Component
+export struct DeviceSettingsSheet {
   instance: DeviceInstance | undefined = undefined;
   filesDir: string = '';
   isInstanceRunning: boolean = false;
   onSave: (updated: DeviceInstance) => void = (): void => {};
+  onCancel: () => void = (): void => {};
   onToast: (msg: string) => void = (): void => {};
 
   @State private activeTab: string = 'perf';
+  @State private activeMainTabIndex: number = 0;
   @State private draftProfile: string = 'Balanced';
   @State private draftCpuCores: number = 4;
   @State private draftMemMb: number = 4096;
@@ -110,6 +122,36 @@ export struct DeviceSettingsDialog {
     this.refreshDiagnosticsAndDisk();
   }
 
+  private switchTab(tabKey: string, idx: number): void {
+    if (this.activeTab === tabKey) return;
+    try {
+      this.getUIContext().animateTo({
+        duration: Motion.DUR_SHORT,
+        curve: Motion.SPRING_SNAPPY
+      }, () => {
+        this.activeTab = tabKey;
+        this.activeMainTabIndex = idx;
+      });
+    } catch (_e) {
+      this.activeTab = tabKey;
+      this.activeMainTabIndex = idx;
+    }
+    if (tabKey === 'disk' || tabKey === 'diag') {
+      this.refreshDiagnosticsAndDisk();
+    }
+  }
+
+  private animateOption(fn: () => void): void {
+    try {
+      this.getUIContext().animateTo({
+        duration: Motion.DUR_MICRO,
+        curve: Motion.SPRING_SNAPPY
+      }, fn);
+    } catch (_e) {
+      fn();
+    }
+  }
+
   private refreshDiagnosticsAndDisk(): void {
     try {
       const st: RuntimeStatus = native.getStatus();
@@ -125,31 +167,33 @@ export struct DeviceSettingsDialog {
   }
 
   private resetToDefaults(): void {
-    this.draftProfile = 'Balanced';
-    this.draftCpuCores = 4;
-    this.draftMemMb = 4096;
-    this.draftGpuMode = 'vulkan';
-    this.draftRefreshRate = 120;
-    this.draftRunMode = 'emulator';
-    this.draftDeviceType = 'phone';
-    this.draftResKey = '720x1280';
-    this.draftWidth = 720;
-    this.draftHeight = 1280;
-    this.draftDpi = 320;
-    this.draftEnableAudio = true;
-    this.draftEnableRoot = true;
-    this.draftKeepAlive = true;
-    this.draftPreventSleep = false;
-    this.draftAutoGamepad = true;
-    this.draftBrand = '';
-    this.draftModel = '';
-    this.draftAdbPort = 5555;
+    this.animateOption(() => {
+      this.draftProfile = 'Balanced';
+      this.draftCpuCores = 4;
+      this.draftMemMb = 4096;
+      this.draftGpuMode = 'vulkan';
+      this.draftRefreshRate = 120;
+      this.draftRunMode = 'emulator';
+      this.draftDeviceType = 'phone';
+      this.draftResKey = '720x1280';
+      this.draftWidth = 720;
+      this.draftHeight = 1280;
+      this.draftDpi = 320;
+      this.draftEnableAudio = true;
+      this.draftEnableRoot = true;
+      this.draftKeepAlive = true;
+      this.draftPreventSleep = false;
+      this.draftAutoGamepad = true;
+      this.draftBrand = '';
+      this.draftModel = '';
+      this.draftAdbPort = 5555;
+    });
     this.onToast('已恢复默认配置，点击保存后生效');
   }
 
   private handleSave(): void {
     if (!this.instance) {
-      this.controller.close();
+      this.onCancel();
       return;
     }
     const next: DeviceInstance = cloneInstanceRecord(this.instance);
@@ -174,34 +218,38 @@ export struct DeviceSettingsDialog {
     next.deviceModel = this.draftModel.trim();
     next.adbPort = this.draftAdbPort;
     this.onSave(next);
-    this.controller.close();
   }
 
   @Builder
   private optionPill(label: string, active: boolean, onTap: () => void) {
     Button({ type: ButtonType.Normal }) {
       Text(label)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
     }
-    .height(30)
-    .padding({ left: 14, right: 14 })
-    .borderRadius(15)
+    .height(ControlSize.BTN_SM)
+    .padding({ left: Spacing.MD, right: Spacing.MD })
+    .borderRadius(Radius.CAPSULE)
     .backgroundColor(active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
-    .onClick(onTap)
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+    .onClick(() => {
+      this.animateOption(onTap);
+    })
   }
 
   @Builder
   private toggleRow(title: string, desc: string, checked: boolean, onToggle: (v: boolean) => void) {
-    Row({ space: 12 }) {
-      Column({ space: 2 }) {
+    Row({ space: Spacing.MD }) {
+      Column({ space: Spacing.XS }) {
         Text(title)
-          .fontSize(14)
+          .fontSize(FontSize.BODY_LG)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_primary'))
         Text(desc)
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .alignItems(HorizontalAlign.Start)
@@ -212,35 +260,34 @@ export struct DeviceSettingsDialog {
         .onChange(onToggle)
     }
     .width('100%')
-    .padding({ top: 4, bottom: 4 })
+    .padding({ top: Spacing.XS, bottom: Spacing.XS })
   }
 
   @Builder
   private perfTabBody() {
-    Column({ space: 14 }) {
+    Column({ space: Spacing.MD }) {
       if (this.isInstanceRunning) {
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           SymbolGlyph($r('sys.symbol.info_circle'))
-            .fontSize(15)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.icon_emphasize')])
           Text('设备运行中，部分 CPU/内存/渲染设置将在重启设备后生效')
-            .fontSize(12)
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_emphasize'))
             .layoutWeight(1)
         }
         .width('100%')
-        .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-        .borderRadius(12)
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.SM, bottom: Spacing.SM })
+        .borderRadius(Radius.MD)
         .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
       }
 
-      // Performance Preset
-      Column({ space: 10 }) {
+      Column({ space: Spacing.MD }) {
         Text('性能方案')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           this.optionPill('性能模式', this.draftProfile === 'Performance', () => {
             this.draftProfile = 'Performance';
             this.draftCpuCores = profileToCpuCores('Performance');
@@ -256,24 +303,24 @@ export struct DeviceSettingsDialog {
         }
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      // CPU & RAM
-      Column({ space: 12 }) {
+      Column({ space: Spacing.MD }) {
         Text('计算资源分配')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('CPU 核数')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(72)
-          Row({ space: 8 }) {
+            .width(68)
+          Row({ space: Spacing.SM }) {
             this.optionPill('2 核', this.draftCpuCores === 2, () => {
               this.draftCpuCores = 2;
               this.draftProfile = cpuCoresToProfile(2);
@@ -295,12 +342,12 @@ export struct DeviceSettingsDialog {
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('内存上限')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(72)
-          Row({ space: 8 }) {
+            .width(68)
+          Row({ space: Spacing.SM }) {
             this.optionPill('2 GB', this.draftMemMb === 2048, () => { this.draftMemMb = 2048; })
             this.optionPill('4 GB', this.draftMemMb === 4096, () => { this.draftMemMb = 4096; })
             this.optionPill('6 GB', this.draftMemMb === 6144, () => { this.draftMemMb = 6144; })
@@ -311,24 +358,24 @@ export struct DeviceSettingsDialog {
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      // GPU & Refresh Rate
-      Column({ space: 12 }) {
+      Column({ space: Spacing.MD }) {
         Text('图形渲染与高刷引擎')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('显卡渲染')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(72)
-          Row({ space: 8 }) {
+            .width(68)
+          Row({ space: Spacing.SM }) {
             this.optionPill('Vulkan（推荐）', this.draftGpuMode === 'vulkan', () => { this.draftGpuMode = 'vulkan'; })
             this.optionPill('OpenGL ES', this.draftGpuMode === 'gles', () => { this.draftGpuMode = 'gles'; })
             this.optionPill('CPU 软渲', this.draftGpuMode === 'swiftshader', () => { this.draftGpuMode = 'swiftshader'; })
@@ -337,12 +384,12 @@ export struct DeviceSettingsDialog {
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('屏幕帧率')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(72)
-          Row({ space: 8 }) {
+            .width(68)
+          Row({ space: Spacing.SM }) {
             ForEach(
               REFRESH_RATES,
               (hz: number) => {
@@ -356,13 +403,14 @@ export struct DeviceSettingsDialog {
         .alignItems(VerticalAlign.Center)
 
         Text('Vulkan 模式采用宿主 Maleoon 硬件直通与异步提交管线，可流畅运行 120Hz 高帧率应用')
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -370,37 +418,41 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private displayTabBody() {
-    Column({ space: 14 }) {
-      Column({ space: 10 }) {
+    Column({ space: Spacing.MD }) {
+      Column({ space: Spacing.MD }) {
         Text('窗口运行模式')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           this.optionPill('传统模拟器窗口', this.draftRunMode === 'emulator', () => { this.draftRunMode = 'emulator'; })
           this.optionPill('自由多窗口模式', this.draftRunMode === 'multiwindow', () => { this.draftRunMode = 'multiwindow'; })
         }
         Text(
           this.draftRunMode === 'emulator'
             ? '启动后直接打开独立完整 Android 桌面模拟器窗口，并支持随时将前台应用拆出'
-            : '无桌面容器背景运行，通过「应用中心」以独立鸿蒙原生窗口启动各个 Android 应用'
+            : '容器后台运行，通过「应用」中心以独立鸿蒙原生窗口启动各个 Android 应用'
         )
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      Column({ space: 10 }) {
+      Column({ space: Spacing.MD }) {
         Text('分辨率预设')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
 
-        Flex({ wrap: FlexWrap.Wrap, space: { main: { value: 8, unit: LengthUnit.VP }, cross: { value: 8, unit: LengthUnit.VP } } }) {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
           ForEach(
             RESOLUTION_PRESETS,
             (item: ResolutionPresetItem) => {
@@ -418,30 +470,32 @@ export struct DeviceSettingsDialog {
         .width('100%')
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      Column({ space: 10 }) {
+      Column({ space: Spacing.MD }) {
         Text('像素密度（DPI）')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           this.optionPill('240 DPI', this.draftDpi === 240, () => { this.draftDpi = 240; })
           this.optionPill('280 DPI', this.draftDpi === 280, () => { this.draftDpi = 280; })
           this.optionPill('320 DPI', this.draftDpi === 320, () => { this.draftDpi = 320; })
           this.optionPill('420 DPI', this.draftDpi === 420, () => { this.draftDpi = 420; })
         }
         Text(`当前画布：${this.draftWidth} × ${this.draftHeight} · ${this.draftDpi} DPI`)
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -449,8 +503,8 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private audioTabBody() {
-    Column({ space: 14 }) {
-      Column({ space: 10 }) {
+    Column({ space: Spacing.MD }) {
+      Column() {
         this.toggleRow(
           '启用 OHAudio 宿主音频桥接',
           '将 Android 14 音频流低延迟直通至鸿蒙 PC 默认输出设备',
@@ -459,26 +513,28 @@ export struct DeviceSettingsDialog {
         )
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
 
-      Column({ space: 6 }) {
+      Column({ space: Spacing.SM }) {
         Text('音频架构信息')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
         Text('输出管线：audio.primary.svbox.so → IPC Socket → OH_AudioRenderer (48kHz Stereo)')
-          .fontSize(12)
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_primary'))
         Text(this.diagStatus && this.diagStatus.audioActive ? '当前音频状态：活跃播放中' : '当前音频状态：待机就绪')
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -486,24 +542,23 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private diskTabBody() {
-    Column({ space: 14 }) {
-      // Disk Usage & Cleanup
-      Column({ space: 12 }) {
-        Row() {
-          Column({ space: 3 }) {
+    Column({ space: Spacing.MD }) {
+      Column({ space: Spacing.MD }) {
+        Row({ space: Spacing.MD }) {
+          Column({ space: Spacing.XS }) {
             Text('磁盘空间占用')
-              .fontSize(14)
+              .fontSize(FontSize.BODY_LG)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
             Text(`隔离目录：${this.instance ? this.instance.dataSubdir : 'userdata14'}`)
-              .fontSize(11)
+              .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_tertiary'))
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
           Text(formatDiskSize(this.diskUsageMb))
-            .fontSize(18)
+            .fontSize(FontSize.TITLE_LG)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_emphasize'))
         }
@@ -511,26 +566,28 @@ export struct DeviceSettingsDialog {
 
         Divider().color($r('sys.color.comp_divider')).opacity(0.35)
 
-        Row({ space: 10 }) {
-          Column({ space: 2 }) {
+        Row({ space: Spacing.MD }) {
+          Column({ space: Spacing.XS }) {
             Text('磁盘缓存清理')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
             Text('安全清理应用缓存、崩溃日志与 ANR 临时文件，保留已安装应用与账号数据')
-              .fontSize(11)
+              .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_tertiary'))
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
           Button(this.cleaningDisk ? '清理中...' : '立即清理', { type: ButtonType.Capsule })
-            .height(32)
-            .padding({ left: 16, right: 16 })
-            .fontSize(12)
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.LG, right: Spacing.LG })
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_on_primary'))
             .backgroundColor($r('sys.color.brand'))
             .enabled(!this.cleaningDisk)
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
               if (!this.instance) return;
               this.cleaningDisk = true;
@@ -548,30 +605,31 @@ export struct DeviceSettingsDialog {
         .width('100%')
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
 
-      // Shared Folder
-      Column({ space: 8 }) {
+      Column({ space: Spacing.SM }) {
         Text('宿主机共享文件夹')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 10 }) {
+        Row({ space: Spacing.SM }) {
           Text(this.shareDir)
-            .fontSize(12)
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_primary'))
             .layoutWeight(1)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Button('检查目录', { type: ButtonType.Normal })
-            .height(30)
-            .padding({ left: 12, right: 12 })
-            .borderRadius(8)
-            .fontSize(12)
+          Button('检查目录', { type: ButtonType.Capsule })
+            .height(ControlSize.BTN_SM)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .fontSize(FontSize.CAPTION)
             .fontColor($r('sys.color.font_primary'))
             .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .hoverEffect(HoverEffect.Highlight)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
             .onClick(() => {
               const ok: boolean = native.ensureDir(this.shareDir);
               this.onToast(ok ? `共享目录已就绪：${this.shareDir}` : '创建共享目录失败');
@@ -579,16 +637,16 @@ export struct DeviceSettingsDialog {
         }
         .width('100%')
         Text('对应 Android 内部路径：/sdcard/Download/svbox-share')
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      // Compact mode
       Column() {
         this.toggleRow(
           '精简磁盘缓存模式',
@@ -598,58 +656,61 @@ export struct DeviceSettingsDialog {
         )
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
     }
     .width('100%')
   }
 
   @Builder
   private networkTabBody() {
-    Column({ space: 14 }) {
-      Column({ space: 10 }) {
+    Column({ space: Spacing.MD }) {
+      Column({ space: Spacing.SM }) {
         Text('网络桥接模式')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           SymbolGlyph($r('sys.symbol.wifi'))
-            .fontSize(16)
+            .fontSize(IconSize.SM)
             .fontColor([$r('sys.color.confirm')])
           Text('宿主机共享网络（NAT + 内置 DNS 代理 223.5.5.5 / 8.8.8.8）')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
         }
         Text('自动复用鸿蒙 PC 的 WLAN / 有线网络与代理配置，无需额外虚拟网卡驱动')
-          .fontSize(11)
+          .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      Column({ space: 10 }) {
+      Column({ space: Spacing.MD }) {
         Text('ADB 调试端口')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
-        Row({ space: 8 }) {
+        Row({ space: Spacing.SM }) {
           this.optionPill('5555（默认）', this.draftAdbPort === 5555, () => { this.draftAdbPort = 5555; })
           this.optionPill('5557', this.draftAdbPort === 5557, () => { this.draftAdbPort = 5557; })
           this.optionPill('5559', this.draftAdbPort === 5559, () => { this.draftAdbPort = 5559; })
           this.optionPill('16384', this.draftAdbPort === 16384, () => { this.draftAdbPort = 16384; })
         }
         Text(`连接命令：adb connect 127.0.0.1:${this.draftAdbPort}`)
-          .fontSize(12)
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_emphasize'))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -657,14 +718,17 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private modelTabBody() {
-    Column({ space: 14 }) {
-      Column({ space: 10 }) {
+    Column({ space: Spacing.MD }) {
+      Column({ space: Spacing.MD }) {
         Text('常用机型预设')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
 
-        Flex({ wrap: FlexWrap.Wrap, space: { main: { value: 8, unit: LengthUnit.VP }, cross: { value: 8, unit: LengthUnit.VP } } }) {
+        Flex({
+          wrap: FlexWrap.Wrap,
+          space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+        }) {
           ForEach(
             DEVICE_MODEL_PRESETS,
             (preset: DeviceModelPreset) => {
@@ -683,53 +747,55 @@ export struct DeviceSettingsDialog {
         .width('100%')
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
 
-      Column({ space: 12 }) {
+      Column({ space: Spacing.MD }) {
         Text('自定义机型属性（ro.product.*）')
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('品牌')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(56)
+            .width(48)
           TextInput({ placeholder: '留空使用默认，例如 Xiaomi / Google', text: this.draftBrand })
             .layoutWeight(1)
-            .height(36)
-            .fontSize(13)
+            .height(ControlSize.INPUT_H)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_primary'))
-            .borderRadius(10)
+            .backgroundColor($r('sys.color.background_secondary'))
+            .borderRadius(Radius.MD)
             .onChange((v: string) => { this.draftBrand = v; })
         }
         .width('100%')
 
-        Row({ space: 10 }) {
+        Row({ space: Spacing.MD }) {
           Text('型号')
-            .fontSize(13)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .width(56)
+            .width(48)
           TextInput({ placeholder: '留空使用默认，例如 Pixel 8 Pro', text: this.draftModel })
             .layoutWeight(1)
-            .height(36)
-            .fontSize(13)
+            .height(ControlSize.INPUT_H)
+            .fontSize(FontSize.BODY_MD)
             .fontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_primary'))
-            .borderRadius(10)
+            .backgroundColor($r('sys.color.background_secondary'))
+            .borderRadius(Radius.MD)
             .onChange((v: string) => { this.draftModel = v; })
         }
         .width('100%')
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -737,32 +803,33 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private shortcutsTabBody() {
-    Column({ space: 8 }) {
+    Column({ space: Spacing.SM }) {
       Text('常用键鼠操作与快捷键')
-        .fontSize(13)
+        .fontSize(FontSize.BODY_MD)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_secondary'))
-        .margin({ bottom: 4 })
+        .margin({ bottom: Spacing.XS })
 
       ForEach(
         SHORTCUT_ITEMS,
         (row: ShortcutRow) => {
-          Row() {
+          Row({ space: Spacing.MD }) {
             Text(row.action)
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontColor($r('sys.color.font_primary'))
               .layoutWeight(1)
             Text(row.keys)
-              .fontSize(12)
+              .fontSize(FontSize.CAPTION)
               .fontColor($r('sys.color.font_emphasize'))
-              .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-              .borderRadius(8)
+              .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS, bottom: Spacing.XS })
+              .borderRadius(Radius.SM)
               .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
           }
           .width('100%')
-          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-          .borderRadius(12)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding({ left: Spacing.LG, right: Spacing.LG, top: Spacing.MD, bottom: Spacing.MD })
+          .borderRadius(Radius.MD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         },
         (row: ShortcutRow): string => row.action
       )
@@ -773,8 +840,8 @@ export struct DeviceSettingsDialog {
 
   @Builder
   private otherTabBody() {
-    Column({ space: 12 }) {
-      Column({ space: 8 }) {
+    Column({ space: Spacing.MD }) {
+      Column({ space: Spacing.SM }) {
         this.toggleRow(
           '开启 ADB Root 权限',
           '允许通过 adb shell 以 root 身份调试容器环境',
@@ -804,22 +871,23 @@ export struct DeviceSettingsDialog {
         )
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
     }
     .width('100%')
   }
 
   @Builder
   private diagRow(label: string, textVal: string) {
-    Row() {
+    Row({ space: Spacing.MD }) {
       Text(label)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontColor($r('sys.color.font_secondary'))
-        .width(120)
+        .width(116)
       Text(textVal)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_primary'))
         .layoutWeight(1)
@@ -827,32 +895,33 @@ export struct DeviceSettingsDialog {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .width('100%')
-    .padding({ top: 5, bottom: 5 })
+    .padding({ top: Spacing.XS, bottom: Spacing.XS })
   }
 
   @Builder
   private diagTabBody() {
-    Column({ space: 12 }) {
+    Column({ space: Spacing.MD }) {
       Row() {
         Text('实时容器与宿主诊断')
-          .fontSize(14)
+          .fontSize(FontSize.BODY_LG)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_primary'))
         Blank()
-        Button('刷新诊断', { type: ButtonType.Normal })
-          .height(28)
-          .padding({ left: 12, right: 12 })
-          .borderRadius(8)
-          .fontSize(12)
+        Button('刷新诊断', { type: ButtonType.Capsule })
+          .height(ControlSize.BTN_SM)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_emphasize'))
           .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
           .onClick(() => {
             this.refreshDiagnosticsAndDisk();
           })
       }
       .width('100%')
 
-      Column({ space: 4 }) {
+      Column({ space: Spacing.XS }) {
         this.diagRow('容器状态', this.diagStatus && this.diagStatus.running ? `运行中 (${this.diagStatus.statusText})` : '未开机')
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
         this.diagRow('渲染后端', this.diagStatus ? `${formatGpuModeLabel(this.diagStatus.gpuMode)} · ${this.diagStatus.gpuRenderer}` : 'Maleoon Vulkan')
@@ -870,87 +939,85 @@ export struct DeviceSettingsDialog {
         this.diagRow('当前实例磁盘', formatDiskSize(this.diskUsageMb))
       }
       .width('100%')
-      .padding(14)
-      .borderRadius(14)
-      .backgroundColor($r('sys.color.background_secondary'))
+      .padding(Spacing.LG)
+      .borderRadius(Radius.CARD)
+      .backgroundColor($r('sys.color.comp_background_primary'))
+      .border({ width: 0.6, color: $r('sys.color.comp_divider') })
     }
     .width('100%')
   }
 
   build() {
     Column({ space: 0 }) {
-      // Split-pane body (MuMu Settings layout + HarmonyOS Master-Detail)
+      Divider().color($r('sys.color.comp_divider')).opacity(0.35)
+
       Row({ space: 0 }) {
-        // Left Navigation Sidebar
-        Column({ space: 4 }) {
-          Column({ space: 2 }) {
-            Text('设备设置')
-              .fontSize(17)
-              .fontWeight(FontWeight.Bold)
-              .fontColor($r('sys.color.font_primary'))
-            Text(this.instance ? this.instance.name : '')
-              .fontSize(11)
-              .fontColor($r('sys.color.font_tertiary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
+        // Left Sidebar with smooth spring-sliding selection indicator
+        Column({ space: 0 }) {
+          Stack({ alignContent: Alignment.TopStart }) {
+            // Sliding active pill indicator for main 8 tabs
+            if (this.activeMainTabIndex >= 0) {
+              Column()
+                .width('100%')
+                .height(NAV_ITEM_H)
+                .borderRadius(Radius.MD)
+                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+                .translate({ y: this.activeMainTabIndex * (NAV_ITEM_H + NAV_ITEM_GAP) })
+                .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+            }
+
+            Column({ space: NAV_ITEM_GAP }) {
+              ForEach(
+                this.mainTabs,
+                (tab: SettingsNavTab, idx: number) => {
+                  Row({ space: Spacing.MD }) {
+                    SymbolGlyph(tab.icon)
+                      .fontSize(IconSize.SM)
+                      .fontColor([
+                        this.activeTab === tab.key
+                          ? $r('sys.color.icon_emphasize')
+                          : $r('sys.color.icon_secondary')
+                      ])
+                    Text(tab.label)
+                      .fontSize(FontSize.BODY_MD)
+                      .fontWeight(this.activeTab === tab.key ? FontWeight.Medium : FontWeight.Normal)
+                      .fontColor(
+                        this.activeTab === tab.key
+                          ? $r('sys.color.font_emphasize')
+                          : $r('sys.color.font_primary')
+                      )
+                  }
+                  .width('100%')
+                  .height(NAV_ITEM_H)
+                  .padding({ left: Spacing.MD, right: Spacing.MD })
+                  .borderRadius(Radius.MD)
+                  .hoverEffect(HoverEffect.Highlight)
+                  .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
+                  .onClick(() => {
+                    this.switchTab(tab.key, idx);
+                  })
+                },
+                (tab: SettingsNavTab): string => tab.key
+              )
+            }
+            .width('100%')
           }
           .width('100%')
-          .alignItems(HorizontalAlign.Start)
-          .padding({ left: 10, right: 8, top: 6, bottom: 12 })
-
-          ForEach(
-            this.mainTabs,
-            (tab: SettingsNavTab) => {
-              Row({ space: 10 }) {
-                SymbolGlyph(tab.icon)
-                  .fontSize(16)
-                  .fontColor([
-                    this.activeTab === tab.key
-                      ? $r('sys.color.icon_emphasize')
-                      : $r('sys.color.icon_secondary')
-                  ])
-                Text(tab.label)
-                  .fontSize(13)
-                  .fontWeight(this.activeTab === tab.key ? FontWeight.Medium : FontWeight.Normal)
-                  .fontColor(
-                    this.activeTab === tab.key
-                      ? $r('sys.color.font_emphasize')
-                      : $r('sys.color.font_primary')
-                  )
-              }
-              .width('100%')
-              .height(38)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(10)
-              .backgroundColor(
-                this.activeTab === tab.key
-                  ? $r('sys.color.comp_emphasize_tertiary')
-                  : Color.Transparent
-              )
-              .onClick(() => {
-                this.activeTab = tab.key;
-                if (tab.key === 'disk') {
-                  this.refreshDiagnosticsAndDisk();
-                }
-              })
-            },
-            (tab: SettingsNavTab): string => tab.key
-          )
 
           Blank()
 
-          Divider().color($r('sys.color.comp_divider')).opacity(0.4).margin({ top: 6, bottom: 6 })
+          Divider().color($r('sys.color.comp_divider')).opacity(0.35).margin({ top: Spacing.SM, bottom: Spacing.SM })
 
-          Row({ space: 10 }) {
+          Row({ space: Spacing.MD }) {
             SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
-              .fontSize(15)
+              .fontSize(IconSize.SM)
               .fontColor([
                 this.activeTab === 'diag'
                   ? $r('sys.color.icon_emphasize')
                   : $r('sys.color.icon_secondary')
               ])
             Text('设备诊断')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(this.activeTab === 'diag' ? FontWeight.Medium : FontWeight.Normal)
               .fontColor(
                 this.activeTab === 'diag'
@@ -959,139 +1026,109 @@ export struct DeviceSettingsDialog {
               )
           }
           .width('100%')
-          .height(38)
-          .padding({ left: 12, right: 12 })
-          .borderRadius(10)
+          .height(NAV_ITEM_H)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
+          .borderRadius(Radius.MD)
           .backgroundColor(
             this.activeTab === 'diag'
               ? $r('sys.color.comp_emphasize_tertiary')
               : Color.Transparent
           )
+          .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
           .onClick(() => {
-            this.activeTab = 'diag';
-            this.refreshDiagnosticsAndDisk();
+            this.switchTab('diag', -1);
           })
         }
-        .width(172)
+        .width(168)
         .height('100%')
-        .padding({ left: 12, right: 12, top: 14, bottom: 14 })
-        .backgroundColor($r('sys.color.background_secondary'))
-        .border({ width: { right: 1 }, color: $r('sys.color.comp_divider') })
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.MD, bottom: Spacing.MD })
+        .border({ width: { right: 0.6 }, color: $r('sys.color.comp_divider') })
 
-        // Right Content Area
+        // Right Content Area with animated tab transitions
         Column({ space: 0 }) {
-          // Right Top Header with Close Button
-          Row() {
-            Text(
-              this.activeTab === 'perf' ? '性能设置'
-                : (this.activeTab === 'display' ? '显示设置'
-                : (this.activeTab === 'audio' ? '声音设置'
-                : (this.activeTab === 'disk' ? '磁盘与共享目录'
-                : (this.activeTab === 'network' ? '网络与 ADB'
-                : (this.activeTab === 'model' ? '机型模拟'
-                : (this.activeTab === 'shortcuts' ? '快捷键说明'
-                : (this.activeTab === 'other' ? '其他设置' : '设备诊断')))))))
-            )
-              .fontSize(16)
-              .fontWeight(FontWeight.Bold)
-              .fontColor($r('sys.color.font_primary'))
-            Blank()
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph($r('sys.symbol.xmark'))
-                .fontSize(14)
-                .fontColor([$r('sys.color.icon_secondary')])
-            }
-            .width(30)
-            .height(30)
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .onClick(() => {
-              this.controller.close();
-            })
-          }
-          .width('100%')
-          .padding({ left: 22, right: 18, top: 16, bottom: 12 })
-
           Scroll() {
             Column() {
               if (this.activeTab === 'perf') {
-                this.perfTabBody()
+                Column() { this.perfTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'display') {
-                this.displayTabBody()
+                Column() { this.displayTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'audio') {
-                this.audioTabBody()
+                Column() { this.audioTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'disk') {
-                this.diskTabBody()
+                Column() { this.diskTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'network') {
-                this.networkTabBody()
+                Column() { this.networkTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'model') {
-                this.modelTabBody()
+                Column() { this.modelTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'shortcuts') {
-                this.shortcutsTabBody()
+                Column() { this.shortcutsTabBody() }.transition(Motion.tabContentTransition())
               } else if (this.activeTab === 'other') {
-                this.otherTabBody()
+                Column() { this.otherTabBody() }.transition(Motion.tabContentTransition())
               } else {
-                this.diagTabBody()
+                Column() { this.diagTabBody() }.transition(Motion.tabContentTransition())
               }
             }
             .width('100%')
-            .padding({ left: 22, right: 22, top: 4, bottom: 18 })
+            .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.LG, bottom: Spacing.LG })
           }
           .layoutWeight(1)
           .scrollBar(BarState.Auto)
-
-          Divider().color($r('sys.color.comp_divider')).opacity(0.35)
-
-          // Footer Bar
-          Row({ space: 10 }) {
-            Button('恢复默认', { type: ButtonType.Normal })
-              .height(34)
-              .padding({ left: 14, right: 14 })
-              .borderRadius(17)
-              .fontSize(13)
-              .fontColor($r('sys.color.font_secondary'))
-              .backgroundColor(Color.Transparent)
-              .onClick(() => {
-                this.resetToDefaults();
-              })
-
-            Blank()
-
-            Button('取消', { type: ButtonType.Capsule })
-              .height(36)
-              .padding({ left: 20, right: 20 })
-              .fontSize(13)
-              .fontColor($r('sys.color.font_primary'))
-              .backgroundColor($r('sys.color.comp_background_tertiary'))
-              .onClick(() => {
-                this.controller.close();
-              })
-
-            Button('保存设置', { type: ButtonType.Capsule })
-              .height(36)
-              .padding({ left: 22, right: 22 })
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.font_on_primary'))
-              .backgroundColor($r('sys.color.brand'))
-              .onClick(() => {
-                this.handleSave();
-              })
-          }
-          .width('100%')
-          .padding({ left: 18, right: 22, top: 12, bottom: 14 })
         }
         .layoutWeight(1)
         .height('100%')
-        .backgroundColor($r('sys.color.comp_background_primary'))
       }
       .width('100%')
-      .height('100%')
+      .layoutWeight(1)
+
+      Divider().color($r('sys.color.comp_divider')).opacity(0.35)
+
+      // Sheet Footer Bar
+      Row({ space: Spacing.MD }) {
+        Button('恢复默认', { type: ButtonType.Capsule })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.LG, right: Spacing.LG })
+          .fontSize(FontSize.BODY_MD)
+          .fontColor($r('sys.color.font_secondary'))
+          .backgroundColor(Color.Transparent)
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.resetToDefaults();
+          })
+
+        Blank()
+
+        Button('取消', { type: ButtonType.Capsule })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XL, right: Spacing.XL })
+          .fontSize(FontSize.BODY_MD)
+          .fontColor($r('sys.color.font_primary'))
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.onCancel();
+          })
+
+        Button('保存设置', { type: ButtonType.Capsule })
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XXL, right: Spacing.XXL })
+          .fontSize(FontSize.BODY_MD)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_on_primary'))
+          .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
+          .onClick(() => {
+            this.handleSave();
+          })
+      }
+      .width('100%')
+      .padding({ left: Spacing.XL, right: Spacing.XL, top: Spacing.MD, bottom: Spacing.LG })
     }
-    .width(740)
-    .height(540)
-    .clip(true)
-    .backgroundColor($r('sys.color.comp_background_primary'))
-    .borderRadius(24)
-    .shadow({ radius: 36, color: '#2B000000', offsetY: 10 })
+    .width('100%')
+    .height('100%')
   }
 }

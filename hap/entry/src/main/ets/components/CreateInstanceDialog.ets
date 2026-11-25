@@ -1,9 +1,17 @@
+import {
+  ControlSize,
+  FontSize,
+  IconSize,
+  Motion,
+  Radius,
+  Spacing
+} from '../common/DesignTokens';
 import { CreateInstanceOptions } from '../model/InstanceModel';
 
-@CustomDialog
-export struct CreateInstanceDialog {
-  controller: CustomDialogController;
+@Component
+export struct CreateInstanceSheet {
   onConfirm: (opts: CreateInstanceOptions) => void = (): void => {};
+  onCancel: () => void = (): void => {};
 
   @State private deviceType: string = 'phone';
   @State private count: number = 1;
@@ -14,70 +22,87 @@ export struct CreateInstanceDialog {
   @State private compactDisk: boolean = false;
   @State private namePrefix: string = '';
 
+  private animateSelection(fn: () => void): void {
+    try {
+      this.getUIContext().animateTo({
+        duration: Motion.DUR_SHORT,
+        curve: Motion.SPRING_SNAPPY
+      }, fn);
+    } catch (_e) {
+      fn();
+    }
+  }
+
   @Builder
   private typeCard(key: string, title: string, desc: string, iconRes: Resource) {
-    Column({ space: 6 }) {
-      Row({ space: 8 }) {
-        Stack({ alignContent: Alignment.Center }) {
-          Column()
-            .width(34)
-            .height(34)
-            .borderRadius(10)
-            .backgroundColor(
-              this.deviceType === key
-                ? $r('sys.color.comp_emphasize_secondary')
-                : $r('sys.color.comp_background_tertiary')
-            )
-          SymbolGlyph(iconRes)
-            .fontSize(18)
-            .fontColor([
-              this.deviceType === key
-                ? $r('sys.color.icon_emphasize')
-                : $r('sys.color.icon_secondary')
-            ])
-        }
-        Column({ space: 2 }) {
-          Text(title)
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(
-              this.deviceType === key
-                ? $r('sys.color.font_emphasize')
-                : $r('sys.color.font_primary')
-            )
-          Text(desc)
-            .fontSize(11)
-            .fontColor($r('sys.color.font_secondary'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
+    Row({ space: Spacing.MD }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width(ControlSize.BTN_MD)
+          .height(ControlSize.BTN_MD)
+          .borderRadius(Radius.MD)
+          .backgroundColor(
+            this.deviceType === key
+              ? $r('sys.color.comp_emphasize_secondary')
+              : $r('sys.color.comp_background_tertiary')
+          )
+          .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+        SymbolGlyph(iconRes)
+          .fontSize(IconSize.MD)
+          .fontColor([
+            this.deviceType === key
+              ? $r('sys.color.icon_emphasize')
+              : $r('sys.color.icon_secondary')
+          ])
       }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
+      Column({ space: Spacing.XS }) {
+        Text(title)
+          .fontSize(FontSize.BODY_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(
+            this.deviceType === key
+              ? $r('sys.color.font_emphasize')
+              : $r('sys.color.font_primary')
+          )
+        Text(desc)
+          .fontSize(FontSize.MICRO)
+          .fontColor($r('sys.color.font_secondary'))
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
     }
     .layoutWeight(1)
-    .padding(12)
-    .borderRadius(14)
+    .padding(Spacing.MD)
+    .borderRadius(Radius.CARD)
     .backgroundColor(
       this.deviceType === key
         ? $r('sys.color.comp_emphasize_tertiary')
-        : $r('sys.color.background_secondary')
+        : $r('sys.color.comp_background_primary')
     )
     .border({
-      width: this.deviceType === key ? 1.5 : 1,
-      color: this.deviceType === key ? $r('sys.color.brand') : Color.Transparent
+      width: this.deviceType === key ? 1.5 : 0.6,
+      color: this.deviceType === key ? $r('sys.color.brand') : $r('sys.color.comp_divider')
     })
+    .scale({
+      x: this.deviceType === key ? 1.0 : 0.99,
+      y: this.deviceType === key ? 1.0 : 0.99
+    })
+    .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
     .onClick(() => {
-      this.deviceType = key;
+      this.animateSelection(() => {
+        this.deviceType = key;
+      });
     })
   }
 
   @Builder
   private scenarioCard(key: string, title: string, spec: string, desc: string) {
-    Column({ space: 4 }) {
+    Column({ space: Spacing.XS }) {
       Row() {
         Text(title)
-          .fontSize(13)
+          .fontSize(FontSize.BODY_MD)
           .fontWeight(FontWeight.Medium)
           .fontColor(
             this.scenario === key
@@ -87,36 +112,42 @@ export struct CreateInstanceDialog {
         Blank()
         if (this.scenario === key) {
           SymbolGlyph($r('sys.symbol.checkmark'))
-            .fontSize(13)
+            .fontSize(IconSize.XS)
             .fontColor([$r('sys.color.icon_emphasize')])
+            .transition(Motion.pillPopTransition())
         }
       }
       .width('100%')
 
       Text(spec)
-        .fontSize(11)
+        .fontSize(FontSize.MICRO)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('sys.color.font_secondary'))
       Text(desc)
-        .fontSize(11)
+        .fontSize(FontSize.MICRO)
         .fontColor($r('sys.color.font_tertiary'))
         .maxLines(2)
     }
     .layoutWeight(1)
-    .padding(12)
+    .padding(Spacing.MD)
     .alignItems(HorizontalAlign.Start)
-    .borderRadius(14)
+    .borderRadius(Radius.CARD)
     .backgroundColor(
       this.scenario === key
         ? $r('sys.color.comp_emphasize_tertiary')
-        : $r('sys.color.background_secondary')
+        : $r('sys.color.comp_background_primary')
     )
     .border({
-      width: this.scenario === key ? 1.5 : 1,
-      color: this.scenario === key ? $r('sys.color.brand') : Color.Transparent
+      width: this.scenario === key ? 1.5 : 0.6,
+      color: this.scenario === key ? $r('sys.color.brand') : $r('sys.color.comp_divider')
     })
+    .animation({ duration: Motion.DUR_SHORT, curve: Motion.SPRING_SNAPPY })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.97 })
     .onClick(() => {
-      this.scenario = key;
+      this.animateSelection(() => {
+        this.scenario = key;
+      });
     })
   }
 
@@ -124,57 +155,33 @@ export struct CreateInstanceDialog {
   private segmentChip(label: string, active: boolean, onTap: () => void) {
     Button({ type: ButtonType.Normal }) {
       Text(label)
-        .fontSize(12)
+        .fontSize(FontSize.CAPTION)
         .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
     }
-    .height(30)
-    .padding({ left: 14, right: 14 })
-    .borderRadius(15)
+    .height(ControlSize.BTN_SM)
+    .padding({ left: Spacing.MD, right: Spacing.MD })
+    .borderRadius(Radius.CAPSULE)
     .backgroundColor(active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
-    .onClick(onTap)
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+    .onClick(() => {
+      this.animateSelection(onTap);
+    })
   }
 
   build() {
     Column({ space: 0 }) {
-      // Dialog Header
-      Row() {
-        Row({ space: 8 }) {
-          SymbolGlyph($r('sys.symbol.plus_circle'))
-            .fontSize(20)
-            .fontColor([$r('sys.color.icon_emphasize')])
-          Text('新建 Android 设备')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('sys.color.font_primary'))
-        }
-        Blank()
-        Button({ type: ButtonType.Circle }) {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(14)
-            .fontColor([$r('sys.color.icon_secondary')])
-        }
-        .width(32)
-        .height(32)
-        .backgroundColor($r('sys.color.comp_background_tertiary'))
-        .onClick(() => {
-          this.controller.close();
-        })
-      }
-      .width('100%')
-      .padding({ left: 24, right: 20, top: 20, bottom: 14 })
-
-      Divider().color($r('sys.color.comp_divider')).opacity(0.4)
-
       Scroll() {
-        Column({ space: 18 }) {
+        Column({ space: Spacing.LG }) {
           // 1. Device Type
-          Column({ space: 8 }) {
+          Column({ space: Spacing.SM }) {
             Text('设备形态')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
-            Row({ space: 12 }) {
+            Row({ space: Spacing.MD }) {
               this.typeCard('phone', '手机', '720×1280 竖屏 · 320 DPI', $r('sys.symbol.phone_1'))
               this.typeCard('tablet', '平板', '1600×900 横屏 · 280 DPI', $r('sys.symbol.pad_fill'))
             }
@@ -183,88 +190,91 @@ export struct CreateInstanceDialog {
           .width('100%')
           .alignItems(HorizontalAlign.Start)
 
-          // 2. Android Version + Count + Name
-          Row({ space: 16 }) {
-            Column({ space: 6 }) {
+          // 2. Android Image + Count + Name
+          Row({ space: Spacing.LG }) {
+            Column({ space: Spacing.SM }) {
               Text('系统镜像')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_secondary'))
-              Row({ space: 8 }) {
+              Row({ space: Spacing.SM }) {
                 Text('Android 14')
-                  .fontSize(13)
+                  .fontSize(FontSize.BODY_MD)
                   .fontWeight(FontWeight.Medium)
                   .fontColor($r('sys.color.font_emphasize'))
-                Text('API 34 · arm64')
-                  .fontSize(11)
+                Text('API 34')
+                  .fontSize(FontSize.MICRO)
                   .fontColor($r('sys.color.font_secondary'))
               }
-              .height(36)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(10)
+              .height(ControlSize.INPUT_H)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(Radius.MD)
               .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
               .border({ width: 1, color: $r('sys.color.brand') })
             }
             .alignItems(HorizontalAlign.Start)
 
-            Column({ space: 6 }) {
+            Column({ space: Spacing.SM }) {
               Text('创建数量')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_secondary'))
-              Row({ space: 8 }) {
+              Row({ space: Spacing.SM }) {
                 Button({ type: ButtonType.Normal }) {
                   Text('−')
-                    .fontSize(16)
+                    .fontSize(FontSize.TITLE_MD)
                     .fontColor($r('sys.color.font_primary'))
                 }
-                .width(32)
-                .height(32)
-                .borderRadius(8)
+                .width(ControlSize.BTN_SM)
+                .height(ControlSize.BTN_SM)
+                .borderRadius(Radius.SM)
                 .backgroundColor($r('sys.color.comp_background_tertiary'))
                 .enabled(this.count > 1)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
                 .onClick(() => {
                   if (this.count > 1) this.count -= 1;
                 })
 
                 Text(`${this.count}`)
-                  .fontSize(14)
+                  .fontSize(FontSize.BODY_LG)
                   .fontWeight(FontWeight.Medium)
                   .fontColor($r('sys.color.font_primary'))
-                  .width(28)
+                  .width(24)
                   .textAlign(TextAlign.Center)
 
                 Button({ type: ButtonType.Normal }) {
                   Text('+')
-                    .fontSize(16)
+                    .fontSize(FontSize.TITLE_MD)
                     .fontColor($r('sys.color.font_primary'))
                 }
-                .width(32)
-                .height(32)
-                .borderRadius(8)
+                .width(ControlSize.BTN_SM)
+                .height(ControlSize.BTN_SM)
+                .borderRadius(Radius.SM)
                 .backgroundColor($r('sys.color.comp_background_tertiary'))
                 .enabled(this.count < 5)
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
                 .onClick(() => {
                   if (this.count < 5) this.count += 1;
                 })
               }
-              .height(36)
+              .height(ControlSize.INPUT_H)
               .alignItems(VerticalAlign.Center)
             }
             .alignItems(HorizontalAlign.Start)
 
-            Column({ space: 6 }) {
+            Column({ space: Spacing.SM }) {
               Text('设备名称（可选）')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_secondary'))
-              TextInput({ placeholder: '例如：日常工作 / 游戏测试', text: this.namePrefix })
-                .height(36)
-                .fontSize(13)
+              TextInput({ placeholder: '例如：工作环境 / 测试机', text: this.namePrefix })
+                .height(ControlSize.INPUT_H)
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_primary'))
                 .placeholderColor($r('sys.color.font_tertiary'))
-                .backgroundColor($r('sys.color.background_secondary'))
-                .borderRadius(10)
+                .backgroundColor($r('sys.color.comp_background_primary'))
+                .borderRadius(Radius.MD)
+                .border({ width: 0.6, color: $r('sys.color.comp_divider') })
                 .maxLength(32)
                 .onChange((val: string) => {
                   this.namePrefix = val;
@@ -275,16 +285,16 @@ export struct CreateInstanceDialog {
           }
           .width('100%')
 
-          // 3. Scenario Presets (MuMu style)
-          Column({ space: 8 }) {
+          // 3. Scenario Presets
+          Column({ space: Spacing.SM }) {
             Text('性能场景')
-              .fontSize(13)
+              .fontSize(FontSize.BODY_MD)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
-            Row({ space: 10 }) {
-              this.scenarioCard('normal', '普通多开', '4 核 · 4 GB', '日常社交与应用均衡流畅')
-              this.scenarioCard('performance', '性能模式', '8 核 · 6 GB', '大型应用与高帧率满血体验')
-              this.scenarioCard('extreme', '极致多开', '2 核 · 2 GB', '精简资源占用，轻量独立环境')
+            Row({ space: Spacing.MD }) {
+              this.scenarioCard('normal', '普通多开', '4 核 · 4 GB', '日常应用均衡流畅')
+              this.scenarioCard('performance', '性能模式', '8 核 · 6 GB', '高帧率满血体验')
+              this.scenarioCard('extreme', '极致多开', '2 核 · 2 GB', '轻量低占用环境')
             }
             .width('100%')
           }
@@ -292,13 +302,13 @@ export struct CreateInstanceDialog {
           .alignItems(HorizontalAlign.Start)
 
           // 4. Graphics Engine, Refresh Rate & Launch Mode
-          Column({ space: 12 }) {
-            Row({ space: 12 }) {
+          Column({ space: Spacing.MD }) {
+            Row({ space: Spacing.MD }) {
               Text('渲染引擎')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(72)
-              Row({ space: 8 }) {
+                .width(68)
+              Row({ space: Spacing.SM }) {
                 this.segmentChip('Vulkan 加速', this.gpuMode === 'vulkan', () => { this.gpuMode = 'vulkan'; })
                 this.segmentChip('OpenGL ES', this.gpuMode === 'gles', () => { this.gpuMode = 'gles'; })
                 this.segmentChip('CPU 软渲', this.gpuMode === 'swiftshader', () => { this.gpuMode = 'swiftshader'; })
@@ -307,12 +317,12 @@ export struct CreateInstanceDialog {
             .width('100%')
             .alignItems(VerticalAlign.Center)
 
-            Row({ space: 12 }) {
-              Text('刷新率')
-                .fontSize(13)
+            Row({ space: Spacing.MD }) {
+              Text('屏幕帧率')
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(72)
-              Row({ space: 8 }) {
+                .width(68)
+              Row({ space: Spacing.SM }) {
                 this.segmentChip('60 Hz', this.refreshRate === 60, () => { this.refreshRate = 60; })
                 this.segmentChip('90 Hz', this.refreshRate === 90, () => { this.refreshRate = 90; })
                 this.segmentChip('120 Hz', this.refreshRate === 120, () => { this.refreshRate = 120; })
@@ -321,12 +331,12 @@ export struct CreateInstanceDialog {
             .width('100%')
             .alignItems(VerticalAlign.Center)
 
-            Row({ space: 12 }) {
+            Row({ space: Spacing.MD }) {
               Text('窗口模式')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontColor($r('sys.color.font_secondary'))
-                .width(72)
-              Row({ space: 8 }) {
+                .width(68)
+              Row({ space: Spacing.SM }) {
                 this.segmentChip('传统模拟器', this.runMode === 'emulator', () => { this.runMode = 'emulator'; })
                 this.segmentChip('自由多窗', this.runMode === 'multiwindow', () => { this.runMode = 'multiwindow'; })
               }
@@ -335,23 +345,25 @@ export struct CreateInstanceDialog {
             .alignItems(VerticalAlign.Center)
           }
           .width('100%')
-          .padding(14)
-          .borderRadius(14)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding(Spacing.LG)
+          .borderRadius(Radius.CARD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
 
-          // 5. Compact Disk Toggle
-          Row() {
-            Column({ space: 2 }) {
+          // 5. Compact Disk Mode
+          Row({ space: Spacing.MD }) {
+            Column({ space: Spacing.XS }) {
               Text('独立隔离数据分区（精简缓存模式）')
-                .fontSize(13)
+                .fontSize(FontSize.BODY_MD)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_primary'))
-              Text('每个设备拥有独立 /data 与 /sdcard 目录，互不干扰')
-                .fontSize(11)
+              Text('每台设备均拥有独立 /data 与 /sdcard 目录，互不干扰')
+                .fontSize(FontSize.MICRO)
                 .fontColor($r('sys.color.font_tertiary'))
             }
             .alignItems(HorizontalAlign.Start)
-            Blank()
+            .layoutWeight(1)
+
             Toggle({ type: ToggleType.Switch, isOn: this.compactDisk })
               .selectedColor($r('sys.color.brand'))
               .onChange((isOn: boolean) => {
@@ -359,40 +371,45 @@ export struct CreateInstanceDialog {
               })
           }
           .width('100%')
-          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-          .borderRadius(14)
-          .backgroundColor($r('sys.color.background_secondary'))
+          .padding({ left: Spacing.LG, right: Spacing.LG, top: Spacing.MD, bottom: Spacing.MD })
+          .borderRadius(Radius.CARD)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
         }
-        .padding({ left: 24, right: 24, top: 18, bottom: 18 })
+        .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.SM, bottom: Spacing.LG })
       }
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
 
       Divider().color($r('sys.color.comp_divider')).opacity(0.4)
 
-      // Footer
-      Row({ space: 12 }) {
+      // Sheet Footer
+      Row({ space: Spacing.MD }) {
         Text(`将创建 ${this.count} 台独立 Android 14 设备`)
-          .fontSize(12)
+          .fontSize(FontSize.CAPTION)
           .fontColor($r('sys.color.font_tertiary'))
         Blank()
         Button('取消', { type: ButtonType.Capsule })
-          .height(38)
-          .padding({ left: 22, right: 22 })
-          .fontSize(14)
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XL, right: Spacing.XL })
+          .fontSize(FontSize.BODY_LG)
           .fontColor($r('sys.color.font_primary'))
           .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
-            this.controller.close();
+            this.onCancel();
           })
 
         Button('立即创建', { type: ButtonType.Capsule })
-          .height(38)
-          .padding({ left: 24, right: 24 })
-          .fontSize(14)
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.XXL, right: Spacing.XXL })
+          .fontSize(FontSize.BODY_LG)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_on_primary'))
           .backgroundColor($r('sys.color.brand'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.96 })
           .onClick(() => {
             this.onConfirm({
               deviceType: this.deviceType,
@@ -405,16 +422,12 @@ export struct CreateInstanceDialog {
               refreshRate: this.refreshRate,
               runMode: this.runMode,
             });
-            this.controller.close();
           })
       }
       .width('100%')
-      .padding({ left: 24, right: 24, top: 14, bottom: 18 })
+      .padding({ left: Spacing.XXL, right: Spacing.XXL, top: Spacing.MD, bottom: Spacing.LG })
     }
-    .width(600)
-    .height(580)
-    .backgroundColor($r('sys.color.comp_background_primary'))
-    .borderRadius(24)
-    .shadow({ radius: 32, color: '#26000000', offsetY: 8 })
+    .width('100%')
+    .height('100%')
   }
 }
