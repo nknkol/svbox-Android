@@ -146,6 +146,7 @@ private:
     std::string audioHalPath_;
     std::string audioSvcPath_;
     std::string cameraSvcPath_;
+    std::string sensorsSvcPath_;
     std::string gpuGuestDir_;
     std::string androidDir_;
     std::string rootfs_;

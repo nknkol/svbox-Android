@@ -217,7 +217,7 @@ void WriteFile(const std::string& path, const std::string& content) {
 
 void WriteEthernetStaticIpConfig(const std::string& path) {
     // Standard AOSP IpConfigStore v3 binary format (DataOutputStream big-endian)
-    // configuring emulator-style static eth0 (10.0.2.15/24, gw 10.0.2.2, dns 223.5.5.5 & 8.8.8.8).
+    // configuring private LAN static eth0 (192.168.100.15/24, gw 192.168.100.1, dns 223.5.5.5 & 8.8.8.8).
     std::vector<uint8_t> out;
     auto putBe32 = [&](uint32_t v) {
         out.push_back(static_cast<uint8_t>((v >> 24) & 0xffu));
@@ -233,8 +233,8 @@ void WriteEthernetStaticIpConfig(const std::string& path) {
     };
     putBe32(3); // IPCONFIG_FILE_VERSION = 3
     putUtf("ipAssignment"); putUtf("STATIC");
-    putUtf("linkAddress");  putUtf("10.0.2.15"); putBe32(24);
-    putUtf("gateway");      putBe32(0); putBe32(1); putUtf("10.0.2.2");
+    putUtf("linkAddress");  putUtf("192.168.100.15"); putBe32(24);
+    putUtf("gateway");      putBe32(0); putBe32(1); putUtf("192.168.100.1");
     putUtf("dns");          putUtf("223.5.5.5");
     putUtf("dns");          putUtf("8.8.8.8");
     putUtf("proxySettings"); putUtf("NONE");
@@ -468,6 +468,30 @@ static void StageSyntheticThermal(const std::string& thDir) {
     WriteFile(z1 + "/type", "battery\n");
     WriteFile(z1 + "/temp", "28500\n");
     WriteFile(z1 + "/mode", "enabled\n");
+}
+
+static void StageSyntheticSysNet(const std::string& netDir, const std::string& ethMac) {
+    RemoveDirRecursive(netDir);
+    auto stageIface = [&](const std::string& name, int ifindex, int mtu, const char* flags,
+                          const char* operstate, const std::string& mac, int type) {
+        const std::string d = netDir + "/" + name;
+        const std::string st = d + "/statistics";
+        MkdirP(st);
+        WriteFile(d + "/ifindex", std::to_string(ifindex) + "\n");
+        WriteFile(d + "/mtu", std::to_string(mtu) + "\n");
+        WriteFile(d + "/flags", std::string(flags) + "\n");
+        WriteFile(d + "/operstate", std::string(operstate) + "\n");
+        WriteFile(d + "/carrier", "1\n");
+        WriteFile(d + "/address", mac + "\n");
+        WriteFile(d + "/type", std::to_string(type) + "\n");
+        WriteFile(d + "/tx_queue_len", "1000\n");
+        for (const char* k : { "rx_bytes", "tx_bytes", "rx_packets", "tx_packets",
+                               "rx_errors", "tx_errors", "rx_dropped", "tx_dropped" }) {
+            WriteFile(st + "/" + k, "0\n");
+        }
+    };
+    stageIface("lo", 1, 65536, "0x0049", "unknown", "00:00:00:00:00:00", 772);
+    stageIface("eth0", 2, 1500, "0x1043", "up", ethMac, 1);
 }
 
 static std::string LoadOrCreatePersistentMac(const std::string& path, bool lowercase) {
@@ -1448,6 +1472,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/sys_cpu:/sys/devices/system/cpu",
         "-v", runBase_ + "/sys_power_supply:/sys/class/power_supply",
         "-v", runBase_ + "/sys_thermal:/sys/class/thermal",
+        "-v", runBase_ + "/sys_net:/sys/class/net",
         "-v", runBase_ + "/cpuset:/dev/cpuset",
         "-v", runBase_ + "/stune:/dev/stune",
         "-v", runBase_ + "/mnt:/mnt",
@@ -1744,6 +1769,10 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
         FileExists(hnpBin + "/svbox-cameraserver")
             ? (hnpBin + "/svbox-cameraserver")
             : (androidDir + "/camera_stub/svbox-cameraserver");
+    const std::string sensorsSvc =
+        FileExists(hnpBin + "/svbox-sensors-service")
+            ? (hnpBin + "/svbox-sensors-service")
+            : (androidDir + "/sensors_hal/svbox-sensors-service");
     const std::string hnpGpuGuest = "/data/app/svbox.org/svbox_0.1.0/gpu_guest/lib64";
     const std::string devGpuGuest = androidDir + "/gpu/build_guest/out/lib64";
     const std::string gpuGuestDir =
@@ -1786,6 +1815,7 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     audioHalPath_ = FileExists(audioHal) ? audioHal : "";
     audioSvcPath_ = FileExists(audioSvc) ? audioSvc : "";
     cameraSvcPath_ = FileExists(cameraSvc) ? cameraSvc : "";
+    sensorsSvcPath_ = FileExists(sensorsSvc) ? sensorsSvc : "";
     gpuGuestDir_ = gpuGuestDir;
     androidDir_ = androidDir;
     rootfs_ = rootfs;
@@ -2461,7 +2491,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Rebuild ephemeral overlay upper + injection layer + linkerconfig cleanly on every boot
     // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
     // Forget any owner.db entries for ephemeral trees before deleting them on the host.
-    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig", runBase_ + "/sys_cpu", runBase_ + "/sys_power_supply", runBase_ + "/sys_thermal" });
+    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig", runBase_ + "/sys_cpu", runBase_ + "/sys_power_supply", runBase_ + "/sys_thermal", runBase_ + "/sys_net" });
     RemoveDirRecursive(rootUpper_);
     MkdirP(rootUpper_);
     RemoveDirRecursive(injectLayer_);
@@ -2571,9 +2601,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     const int stagedCpuCount = CountCpusetCores(activeCpusetSnap);
     const std::string stagedCpuRange = (stagedCpuCount <= 1) ? "0" : ("0-" + std::to_string(stagedCpuCount - 1));
+    const std::string ethMac = LoadOrCreatePersistentMac(dataBase_ + "/eth_mac.txt", true);
     StageSyntheticSysCpu(runBase_ + "/sys_cpu", stagedCpuCount, profileSnap);
     StageSyntheticPowerSupply(runBase_ + "/sys_power_supply");
     StageSyntheticThermal(runBase_ + "/sys_thermal");
+    StageSyntheticSysNet(runBase_ + "/sys_net", ethMac);
 
     for (const char* sub : { "", "/foreground", "/background", "/system-background", "/top-app" }) {
         const std::string base = runBase_ + "/cpuset" + sub;
@@ -2939,7 +2971,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     if (FileExists(svboxNet)) {
         Spawn({ svboxNet,
                 "--sock", sockDir + "/net.sock",
-                "--iface", "eth0:10.0.2.15/24:10.0.2.2:02:00:00:00:00:01",
+                "--iface", "eth0:192.168.100.15/24:192.168.100.1:" + ethMac,
                 "--dns", "223.5.5.5",
                 "--log-level", "2" },
               false, logDir + "/svbox_net.log");
@@ -3016,6 +3048,24 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             if (CopyRegularFile(audioHalPath_, dst)) {
                 chmod(dst.c_str(), 0644);
             }
+        }
+        if (!sensorsSvcPath_.empty() && FileExists(sensorsSvcPath_)) {
+            MkdirP(injectLayer_ + "/vendor/bin/hw");
+            const std::string dst = injectLayer_ + "/vendor/bin/hw/svbox-sensors-service";
+            if (CopyRegularFile(sensorsSvcPath_, dst)) {
+                chmod(dst.c_str(), 0755);
+            }
+            MkdirP(injectLayer_ + "/vendor/etc/vintf/manifest");
+            const std::string xml = injectLayer_ + "/vendor/etc/vintf/manifest/svbox-sensors.xml";
+            WriteFile(xml,
+                      "<manifest version=\"1.0\" type=\"device\">\n"
+                      "    <hal format=\"aidl\">\n"
+                      "        <name>android.hardware.sensors</name>\n"
+                      "        <version>2</version>\n"
+                      "        <fqname>ISensors/default</fqname>\n"
+                      "    </hal>\n"
+                      "</manifest>\n");
+            chmod(xml.c_str(), 0644);
         }
         int gpuCopied = 0;
         if (useGfx) {
@@ -3362,6 +3412,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         launchPaced("keymaster", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.keymaster@4.1-service" });
         if (FileExists(rootfs_ + "/vendor/bin/hw/android.hardware.thermal@2.0-service.mock")) {
             launchPaced("thermal", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.thermal@2.0-service.mock" });
+        }
+        if (FileExists(injectLayer_ + "/vendor/bin/hw/svbox-sensors-service")) {
+            launchPaced("sensors", { "-e", sfLdPath, "vendor/bin/hw/svbox-sensors-service" });
         }
         // Note: stock vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim has an upstream
         // compile-time ABI bug in initialize_impl() (optional<Address> offset 16 vs 32) causing

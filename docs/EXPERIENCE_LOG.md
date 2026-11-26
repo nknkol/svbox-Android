@@ -1061,6 +1061,27 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - `svbox` 专项测试（`mremap(MREMAP_DONTUNMAP)` on `exec_copy` 源/目标字节全一致、`MAP_PRIVATE` `mprotect(RX)` 成功、`MAP_SHARED` 保持 `-EACCES`）+ 84 项 SVC + `fake_ids` + `backstop` 全部 PASS，Layer 1 纯净度通过。
   - 真机冷启 Microsoft Edge（PID `51944`）：`+1.53s` 越过启动页进入引导/默认浏览器授权弹窗，`com.microsoft.emmx_zygote`（`52072`）与隔离渲染进程 `com.microsoft.emmx:sandboxed_process0`（`52088`）稳定常驻，**`SIGTRAP` / `aw_browser_terminator` / `unrecognized Groups format` 全部清零**。
 
+### 11.15 Linux / Android 14 容器标准接口全量对齐（Phase 1–3）及前后兼容性/性能基准对比
+- **背景与目标**：对比上游 Linux 容器（Waydroid/LXC）与真实 Android 14 设备，系统排查并分 3 阶段对齐 Layer 1（`svbox`，100% 通用 Linux/POSIX 语义，零 Android/应用硬编码）与 Layer 2（`svbox-Android`，零改动 `rootfs/` 与 `rootfs14/`）的 14 项关键接口差异（`L1-1`–`L1-7` + `L2-1`–`L2-7`），并在对齐前后执行标准化兼容性评分与性能微基准对比。
+- **Phase 1 — Layer 1 `svbox` 通用 Linux 容器语义（commit `0f69d15`）**：
+  - `L1-1` 跨 PID `/proc/<pid>/{maps,smaps,fd,map_files}` 通过 `vdev_match_memfd()` 按 `--vdev` 名称还原 `/dev/*` 设备路径，消除 `/memfd:svbox-*` 泄漏；
+  - `L1-2` 修复 `union_view.c` 空 lower 目录 `.` 返回 `ENOENT`（消除 `ls -la /dev /sys` 的 `d????????? .`），并在 `vfs_ops.c` 修正 `statfs`/`fstatfs` `f_type`（`/dev` `0x1021994` `tmpfs`、`/sys` `0x62656572` `sysfs`、`cgroup`/`bpf`/`proc`）；
+  - `L1-3` 新增 `-v HOST:GUEST[:MODE][,nomnt]` 与 `--proc-cmdline STR`；`/proc/self/mounts` 与 `mountinfo` 过滤内部单文件/子目录 bind 并合成标准 `tmpfs /dev` 与 `sysfs /sys`；
+  - `L1-4`–`L1-6` 缓冲虚拟化 `/proc/<pid>/{status,smaps_rollup,cgroup}`（`FDSize: 64`、`Cpus_allowed_list` 对齐 `--cpuset`、剥离鸿蒙特有 `PurgSum/PurgPin/Pss_HHP` 及 `load/iolimit/workingset/dummy` 控制器）；`/proc/stat` 单调递增 `CLOCK_BOOTTIME` 节拍；`/proc/cmdline` 及 `/proc/net/{tcp,tcp6,udp,udp6,unix,arp}`、`/proc/{modules,swaps}` 标准头回退。
+- **Phase 2 — Layer 2 `svbox-Android` 系统属性、电源/温控与启动稳定性（commit `47b0da2`）**：
+  - `L2-1` / `L2-6` 合成 `/sys/class/power_supply/{ac,battery}/*`、`/sys/class/thermal/thermal_zone{0,1}/*` 及 `cpufreq/stats/time_in_state`；`dumpsys battery` 报真实状态（`present=true, level=88, voltage=4210, temp=285, Li-ion`），`KernelCpuSpeedReader` 报错由 22 清零；
+  - `L2-3` 清理 `eng.frank.*`/`redroid`/`ro.adb.secure=0` 属性并前置生成脱敏分区 `build.prop` 供 `propd` 与磁盘共享单一真相源；`hwcomposer_ranchu.cpp` 优先读取 `ro.sf.display.*`；非 root 模式不启动 `adbd` 且 `adb_enabled=0, development_settings_enabled=0`；
+  - `L2-4` 定位上游 Redroid14 `bluetooth@1.1-service.sim` 编译期 `std::optional<Address>` 偏移 16 vs 32 ABI 缺陷导致必现 `SIGABRT`，在 `injectLayer_` 声明无蓝牙特性并停止拉起缺陷二进制，开机 `Fatal signal 6` 由 10 清零；
+  - `L2-7` 启动 `system/bin/gpuservice`，`Failed to get gpu service` 报错由 16 清零。
+- **Phase 3 — 嵌套 Seccomp、虚拟 Sensors HAL 与实时网络统计（`svbox` `3b7de06` + `svbox-Android` 本次提交）**：
+  - `L1-7` 将 `BACKSTOP_TRAP_DATA` 升至 `0xffff`，在 wrapped seccomp 前缀中保留内部 `raw_syscall` 放行同时让 `fast_passthrough_svc` 接受 guest BPF 过滤，并通过 `SVBOX_PR_GET_GUEST_SECCOMP_TRAPS` 区分 guest `SECCOMP_RET_TRAP`（含 `data==0` 与 `data!=0`）与宿主沙箱 `si_errno==0` 拦截，实现 10/10 嵌套 seccomp 模式全通且不误伤 Chromium/Edge；
+  - `L2-5` `net_stack.c` 读写映射 `svbox_net_state` 并用无锁 FD 位图原子统计 `AF_INET/AF_INET6` 收发字节与包数，同时提供 `/sys/class/net/<iface>/statistics/*`；`android_runtime.cpp` 切换至私网 `192.168.100.15/24`（gw `192.168.100.1`）+ 持久化随机 MAC（`eth_mac.txt`）并挂载 `/sys/class/net` 目录骨架；
+  - `L2-2` 新增纯 C `sensors_hal/svbox_sensors_service.c`（AIDL V2 `android.hardware.sensors.ISensors/default` + FMQ 共享内存环 + futex EventFlag）及 VINTF 清单片段，向 `SensorService` 提供 8 个硬件传感器（含 9 个 AOSP 融合传感器共 **17 个在线传感器**）与实时加速度/环境事件流。
+- **真机前后对比（`HAD-W32`，`enableRoot=false`，`syscallMode=adaptive`）**：
+  - **兼容性评分**：Android 14 评分卡 **`0 / 13` -> `13 / 13 PASS`**；Layer 1 `L1-7` 嵌套 seccomp **`FAIL (0/2)` -> `PASS (10/10)`**；全开机日志崩溃/报错：`Fatal signal` `10 -> 0`、`KernelCpuSpeedReader` `22 -> 0`、`Failed to get gpu service` `16 -> 0`、`FATAL EXCEPTION` `0 -> 0`。
+  - **性能微基准（中位数，3 轮）**：`svbox` 核心 syscall 无回退且小幅优化（`stat` `20,795 -> 17,701 ns` -14.9%、`pread_4k` `1,793 -> 1,511 ns` -15.7%、`mmap_64k` `3,251 -> 2,785 ns` -14.3%）；procfs/statfs 显著加速（`proc_status` `76,743 -> 51,151 ns` -33.3%、`proc_maps` `73,388 -> 57,852 ns` -21.2%、`proc_cgroup` `85,573 -> 51,304 ns` -40.0%、`proc_stat` `519,082 -> 363,326 ns` -30.0%、`statfs_sys` `12,998 -> 10,173 ns` -21.7%）；Android 14 开机 ~13s、SurfaceFlinger 维持 **120.00 Hz**（Maleoon 916 Vulkan/GLES）、在线服务 **235**。
+  - **应用回归**：Microsoft Edge（主进程 + `zygote` + `sandboxed_process0`）与《王者荣耀》（主进程 + `xg_vip_service`）均正常启动在线、**0 `Fatal signal` / 0 `SIGTRAP` / 0 `SIGSYS` / 0 `aw_browser_terminator`**，`/proc/net/dev` 实时递增至 `eth0 rx=462,208 B / tx=91,727 B`；`rootfs/` 与 `rootfs14/` 零改动。
+
 
 
 
