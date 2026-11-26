@@ -2,7 +2,9 @@ import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import native from 'libentry.so';
-import { AppWindowPref, appWindowPrefs } from '../common/AppWindowPrefs';
+import { AndroidAppItem, AppWindowPref, appWindowPrefs, loadCachedAppList } from '../common/AppWindowPrefs';
+import { syncHostClipboardToAndroid } from '../common/InputBridgeHelper';
+import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
   applyImmersiveDecor,
   applyMissionIconAndQuickBar,
@@ -69,6 +71,7 @@ export default class AppWindowAbility extends UIAbility {
         native.setDisplayVisible(this.displaySlot, true);
         if (native.isWmAgentReady()) {
           native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
+          syncHostClipboardToAndroid(false);
         }
       } catch (_e) {
       }
@@ -91,11 +94,36 @@ export default class AppWindowAbility extends UIAbility {
       registerSlotWindow(this.displaySlot, win);
 
       const globalHz: number = AppStorage.get<number>('refreshRate') ?? 60;
-      const pref: AppWindowPref = appWindowPrefs.getPref(this.context.filesDir, this.androidPkg, undefined, globalHz);
+      let appMeta: AndroidAppItem | undefined = undefined;
+      let cachedApps: AndroidAppItem[] = AppStorage.get<AndroidAppItem[]>('androidApps') ?? [];
+      if (cachedApps.length === 0) {
+        const primary: DeviceInstance | undefined =
+          instanceManager.getById(this.context.filesDir, 'inst_0') ?? instanceManager.getAll(this.context.filesDir)[0];
+        cachedApps = loadCachedAppList(this.context.filesDir, primary ? primary.dataSubdir : 'userdata14');
+      }
+      for (let i: number = 0; i < cachedApps.length; i++) {
+        if (cachedApps[i].packageName === this.androidPkg) {
+          appMeta = cachedApps[i];
+          break;
+        }
+      }
+      const pref: AppWindowPref = appWindowPrefs.getPref(this.context.filesDir, this.androidPkg, appMeta, globalHz);
 
       try {
         win.resize(pref.winW, pref.winH);
       } catch (_e) {
+      }
+      if (pref.mode === 'fixed_portrait' || pref.mode === 'fixed_landscape') {
+        const ratio: number = pref.mode === 'fixed_landscape' ? (1280.0 / 784.0) : (720.0 / 1344.0);
+        try {
+          win.setContentAspectRatio(ratio, false, false).catch(() => {});
+        } catch (_e) {
+        }
+      } else {
+        try {
+          win.resetAspectRatio().catch(() => {});
+        } catch (_e) {
+        }
       }
 
       const props: window.WindowProperties = win.getWindowProperties();
@@ -114,6 +142,7 @@ export default class AppWindowAbility extends UIAbility {
             native.setDisplayVisible(this.displaySlot, true);
             if (native.isWmAgentReady()) {
               native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
+              syncHostClipboardToAndroid(false);
             }
           } catch (_e) {
           }

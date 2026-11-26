@@ -10,8 +10,14 @@ import {
   computeDpiForSize,
   findPresetByKey,
   getCachedIconsDir,
+  loadCachedAppList,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
+import {
+  pasteHostClipboardToAndroid,
+  sendTextToAndroid,
+  syncHostClipboardToAndroid
+} from '../common/InputBridgeHelper';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
   applyMissionIconAndQuickBar,
@@ -58,9 +64,16 @@ struct AppWindowPage {
   @State private iconUri: string = '';
   @State private topBarHex: string = '#161920';
   @State private isDarkBar: boolean = true;
+  @State private showImeBar: boolean = false;
+  @State private imeDraft: string = '';
 
   private bootPollTimer: number = -1;
   private resizeDebounceTimer: number = -1;
+  private resizeInFlight: boolean = false;
+  private pendingResizeW: number = 0;
+  private pendingResizeH: number = 0;
+  private lastAppliedW: number = 0;
+  private lastAppliedH: number = 0;
   private displayCreated: boolean = false;
   private iconApplied: boolean = false;
   private lastSampledArgb: number = 0;
@@ -69,7 +82,14 @@ struct AppWindowPage {
   private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
 
   private lookupAppMeta(): AndroidAppItem | undefined {
-    const cached: AndroidAppItem[] | undefined = AppStorage.get<AndroidAppItem[]>('androidApps');
+    let cached: AndroidAppItem[] | undefined = AppStorage.get<AndroidAppItem[]>('androidApps');
+    if (!cached || cached.length === 0) {
+      const filesDir: string = this.sandboxFilesDir.length > 0
+        ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
+      const primary: DeviceInstance | undefined =
+        instanceManager.getById(filesDir, 'inst_0') ?? instanceManager.getAll(filesDir)[0];
+      cached = loadCachedAppList(filesDir, primary ? primary.dataSubdir : 'userdata14');
+    }
     if (cached) {
       for (let i: number = 0; i < cached.length; i++) {
         if (cached[i].packageName === this.androidPkg) {
@@ -253,14 +273,104 @@ struct AppWindowPage {
         return;
       }
       const ds: DisplayStats = native.getDisplayStats(this.displaySlot);
-      if (ds.width > 0 && ds.height > 0 && this.winMode === 'adaptive') {
-        this.dispW = ds.width;
-        this.dispH = ds.height;
-      }
       if (ds.topBarColor && ds.topBarColor !== 0) {
         this.applySampledTopColor(ds.topBarColor);
       }
     } catch (_e) {
+    }
+  }
+
+  private applyWindowAspectPolicy(needUpdateRect: boolean): void {
+    const win: window.Window | undefined = getSlotWindow(this.displaySlot);
+    if (!win) return;
+    if (this.winMode === 'adaptive') {
+      try {
+        win.resetAspectRatio().catch(() => {});
+      } catch (_e) {
+      }
+    } else {
+      const isLand: boolean = this.dispW > this.dispH;
+      // Include 38vp title bar (~64px at typical desktop scale) so XComponent fits edge-to-edge without black bars.
+      const ratio: number = isLand ? (this.dispW / (this.dispH + 64.0)) : (this.dispW / (this.dispH + 64.0));
+      try {
+        win.setContentAspectRatio(ratio, false, needUpdateRect).catch(() => {});
+      } catch (_e) {
+      }
+    }
+  }
+
+  private modePillLabel(): string {
+    if (this.winMode === 'adaptive') return '支持·自由';
+    if (this.winMode === 'fixed_landscape') return '兼容·横屏';
+    return '兼容·竖屏';
+  }
+
+  private async switchWindowMode(nextMode: string): Promise<void> {
+    if (this.winMode === nextMode) return;
+    const win: window.Window | undefined = getSlotWindow(this.displaySlot);
+    this.winMode = nextMode;
+    if (nextMode === 'adaptive') {
+      this.applyWindowAspectPolicy(false);
+      const sz: number[] = this.computeAdaptiveTargetSize();
+      this.dispW = sz[0];
+      this.dispH = sz[1];
+      this.persistPref();
+      if (this.ready && this.displaySlot >= 1) {
+        this.queueAdaptiveResize(sz[0], sz[1]);
+      }
+      return;
+    }
+
+    const isLand: boolean = nextMode === 'fixed_landscape';
+    const preset: ResolutionPresetItem = findPresetByKey(isLand ? '1280x720' : '720x1280');
+    this.presetKey = preset.key;
+    this.dispW = preset.w;
+    this.dispH = preset.h;
+    this.lastAppliedW = preset.w;
+    this.lastAppliedH = preset.h;
+    this.pendingResizeW = 0;
+    this.pendingResizeH = 0;
+    if (win) {
+      try {
+        await win.resize(isLand ? 1480 : 860, isLand ? 940 : 1380);
+      } catch (_e) {
+      }
+    }
+    this.applyWindowAspectPolicy(true);
+    this.persistPref();
+    if (this.ready && this.displaySlot >= 1) {
+      const dpi: number = computeDpiForSize(preset.w, preset.h);
+      try {
+        await native.wmRpcAsync(`RESIZE_DISPLAY ${this.displaySlot} ${preset.w} ${preset.h} ${dpi}`);
+      } catch (_e) {
+      }
+    }
+  }
+
+  private async handleSubmitImeText(): Promise<void> {
+    const txt: string = this.imeDraft;
+    if (txt.length === 0 || !this.ready) return;
+    this.imeDraft = '';
+    await sendTextToAndroid(this.displaySlot, txt);
+  }
+
+  private async handlePasteClipboard(): Promise<void> {
+    if (!this.ready) return;
+    await pasteHostClipboardToAndroid(this.displaySlot);
+  }
+
+  @Builder
+  private modeMenuBuilder() {
+    Menu() {
+      MenuItem({ content: this.winMode === 'adaptive' ? '✓ 支持模式（自由调整尺寸）' : '支持模式（自由调整尺寸）' })
+        .onClick(() => { this.switchWindowMode('adaptive'); })
+      MenuItem({ content: this.winMode === 'fixed_portrait' ? '✓ 兼容模式 · 竖屏（等比缩放）' : '兼容模式 · 竖屏（等比缩放）' })
+        .onClick(() => { this.switchWindowMode('fixed_portrait'); })
+      MenuItem({ content: this.winMode === 'fixed_landscape' ? '✓ 兼容模式 · 横屏（等比缩放）' : '兼容模式 · 横屏（等比缩放）' })
+        .onClick(() => { this.switchWindowMode('fixed_landscape'); })
+      MenuItem({ content: '粘贴鸿蒙剪贴板到此窗口' })
+        .enabled(this.ready)
+        .onClick(() => { this.handlePasteClipboard(); })
     }
   }
 
@@ -290,6 +400,9 @@ struct AppWindowPage {
       }
       this.ready = true;
       this.bannerText = '';
+      this.lastAppliedW = this.dispW;
+      this.lastAppliedH = this.dispH;
+      this.applyWindowAspectPolicy(false);
       native.setDisplayRefreshRate(this.displaySlot, this.curHz);
       native.setDisplayVisible(this.displaySlot, true);
     } catch (err) {
@@ -320,22 +433,49 @@ struct AppWindowPage {
     }
     this.resizeDebounceTimer = setTimeout(() => {
       this.resizeDebounceTimer = -1;
-      this.applyAdaptiveResize();
-    }, 180);
+      const sz: number[] = this.computeAdaptiveTargetSize();
+      this.queueAdaptiveResize(sz[0], sz[1]);
+    }, 80);
   }
 
-  private async applyAdaptiveResize(): Promise<void> {
-    if (!this.ready || this.winMode !== 'adaptive' || this.displaySlot < 1 || !this.stageReady) return;
-    const sz: number[] = this.computeAdaptiveTargetSize();
-    const targetW: number = sz[0];
-    const targetH: number = sz[1];
-    if (Math.abs(targetW - this.dispW) < 4 && Math.abs(targetH - this.dispH) < 4) return;
-    const dpi: number = computeAdaptiveDpi(targetW, targetH);
-    this.dispW = targetW;
-    this.dispH = targetH;
+  private queueAdaptiveResize(targetW: number, targetH: number): void {
+    if (!this.ready || this.winMode !== 'adaptive' || this.displaySlot < 1) return;
+    if (Math.abs(targetW - this.lastAppliedW) < 4 && Math.abs(targetH - this.lastAppliedH) < 4 && !this.resizeInFlight) {
+      return;
+    }
+    this.pendingResizeW = targetW;
+    this.pendingResizeH = targetH;
+    if (this.resizeInFlight) {
+      return;
+    }
+    this.drainAdaptiveResizeQueue();
+  }
+
+  private async drainAdaptiveResizeQueue(): Promise<void> {
+    if (this.resizeInFlight) return;
+    this.resizeInFlight = true;
     try {
-      await native.wmRpcAsync(`RESIZE_DISPLAY ${this.displaySlot} ${targetW} ${targetH} ${dpi}`);
-    } catch (_e) {
+      while (this.pendingResizeW > 0 && this.pendingResizeH > 0 && this.winMode === 'adaptive' && this.ready) {
+        const w: number = this.pendingResizeW;
+        const h: number = this.pendingResizeH;
+        this.pendingResizeW = 0;
+        this.pendingResizeH = 0;
+        if (Math.abs(w - this.lastAppliedW) < 4 && Math.abs(h - this.lastAppliedH) < 4) {
+          continue;
+        }
+        const dpi: number = computeAdaptiveDpi(w, h);
+        this.dispW = w;
+        this.dispH = h;
+        try {
+          await native.wmRpcAsync(`RESIZE_DISPLAY ${this.displaySlot} ${w} ${h} ${dpi}`);
+          this.lastAppliedW = w;
+          this.lastAppliedH = h;
+        } catch (_e) {
+          break;
+        }
+      }
+    } finally {
+      this.resizeInFlight = false;
     }
   }
 
@@ -354,27 +494,8 @@ struct AppWindowPage {
       return;
     }
 
-    // Fixed mode: switch between fixed_portrait (720x1280) and fixed_landscape (1280x720)
-    const nextKey: string = isLandscapeNow ? '720x1280' : '1280x720';
-    this.winMode = isLandscapeNow ? 'fixed_portrait' : 'fixed_landscape';
-    const preset: ResolutionPresetItem = findPresetByKey(nextKey);
-    this.presetKey = preset.key;
-    this.dispW = preset.w;
-    this.dispH = preset.h;
-    if (win) {
-      try {
-        await win.resize(isLandscapeNow ? 860 : 1480, isLandscapeNow ? 1380 : 940);
-      } catch (_e) {
-      }
-    }
-    this.persistPref();
-    if (this.ready && this.displaySlot >= 1) {
-      const dpi: number = computeDpiForSize(preset.w, preset.h);
-      try {
-        await native.wmRpcAsync(`RESIZE_DISPLAY ${this.displaySlot} ${preset.w} ${preset.h} ${dpi}`);
-      } catch (_e) {
-      }
-    }
+    // Compat mode: switch between fixed_portrait (720x1280) and fixed_landscape (1280x720)
+    await this.switchWindowMode(isLandscapeNow ? 'fixed_portrait' : 'fixed_landscape');
   }
 
   private computeFitWidth(): number {
@@ -452,6 +573,39 @@ struct AppWindowPage {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
+        // Support Mode vs Compat Mode switcher pill + IME Bridge + Orientation toggle
+        Button({ type: ButtonType.Normal }) {
+          Text(this.modePillLabel())
+            .fontSize(11)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.titleInkColor())
+            .maxLines(1)
+        }
+        .height(24)
+        .padding({ left: 8, right: 8 })
+        .borderRadius(12)
+        .backgroundColor(this.buttonHoverBg())
+        .bindMenu(this.modeMenuBuilder())
+
+        Button({ type: ButtonType.Normal }) {
+          SymbolGlyph($r('sys.symbol.keyboard'))
+            .fontSize(15)
+            .fontColor([this.showImeBar ? '#38BDF8' : this.titleInkColor()])
+        }
+        .width(28)
+        .height(28)
+        .borderRadius(6)
+        .backgroundColor(Color.Transparent)
+        .stateStyles({
+          pressed: { .backgroundColor(this.buttonHoverBg()) }
+        })
+        .onClick(() => {
+          this.showImeBar = !this.showImeBar;
+          if (this.showImeBar) {
+            syncHostClipboardToAndroid(false);
+          }
+        })
+
         // Single Portrait/Landscape toggle button placed directly left of system 3-button area
         Button({ type: ButtonType.Normal }) {
           SymbolGlyph($r('sys.symbol.screen_rotation'))
@@ -485,8 +639,8 @@ struct AppWindowPage {
         })
           .focusable(true)
           .defaultFocus(true)
-          .width(this.computeFitWidth())
-          .height(this.computeFitHeight())
+          .width(this.winMode === 'adaptive' ? '100%' : this.computeFitWidth())
+          .height(this.winMode === 'adaptive' ? '100%' : this.computeFitHeight())
           .backgroundColor('#000000')
 
         if (!this.ready || this.bannerText.length > 0) {
@@ -528,6 +682,46 @@ struct AppWindowPage {
           }
         }
       })
+
+      if (this.showImeBar) {
+        Row({ space: 8 }) {
+          TextInput({ placeholder: '鸿蒙中文输入法桥接：输入后回车发送至当前窗口', text: this.imeDraft })
+            .layoutWeight(1)
+            .height(32)
+            .fontSize(13)
+            .fontColor('#F3F4F6')
+            .placeholderColor('#9CA3AF')
+            .backgroundColor('#262B36')
+            .borderRadius(8)
+            .enterKeyType(EnterKeyType.Send)
+            .onChange((val: string) => { this.imeDraft = val; })
+            .onSubmit(() => { this.handleSubmitImeText(); })
+
+          Button('发送', { type: ButtonType.Capsule })
+            .height(30)
+            .padding({ left: 12, right: 12 })
+            .fontSize(12)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#0A59F7')
+            .enabled(this.imeDraft.length > 0 && this.ready)
+            .onClick(() => { this.handleSubmitImeText(); })
+
+          PasteButton({ text: PasteDescription.PASTE })
+            .height(30)
+            .fontSize(12)
+            .fontColor('#F3F4F6')
+            .backgroundColor('#374151')
+            .onClick((_ev: ClickEvent, res: PasteButtonOnClickResult) => {
+              if (res === PasteButtonOnClickResult.SUCCESS) {
+                this.handlePasteClipboard();
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+        .backgroundColor('#161920')
+        .alignItems(VerticalAlign.Center)
+      }
     }
     .width('100%')
     .height('100%')

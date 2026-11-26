@@ -12,7 +12,9 @@ import java.io.FileOutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -81,8 +83,12 @@ public class SvboxWmAgent {
     private Object inputMgr;
     private Object atm;
     private Object am;
+    private Object clipboardMgr;
 
     private final Object slotLock = new Object();
+    private final Object resizeLock = new Object();
+    private final Object clipLock = new Object();
+    private volatile String lastClipText = "";
     private final Map<Integer, DisplaySlot> slotsByIdx = new HashMap<Integer, DisplaySlot>();
     private final Map<Integer, DisplaySlot> slotsByAndroidId = new HashMap<Integer, DisplaySlot>();
     private final CopyOnWriteArrayList<Integer> eventFds = new CopyOnWriteArrayList<Integer>();
@@ -121,6 +127,15 @@ public class SvboxWmAgent {
             serverThread.setDaemon(false);
             serverThread.start();
 
+            Thread clipThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    clipboardWatchLoop();
+                }
+            }, "svbox-clip-watch");
+            clipThread.setDaemon(true);
+            clipThread.start();
+
             log("SvboxWmAgent ready: ctrl=" + ctrlSockPath + " present=" + presentSockPath);
             looperCls.getMethod("loop").invoke(null);
         } catch (Throwable t) {
@@ -151,6 +166,12 @@ public class SvboxWmAgent {
                 getSvc.invoke(null, "activity_task"));
         am = asInterface("android.app.IActivityManager$Stub",
                 getSvc.invoke(null, "activity"));
+        try {
+            clipboardMgr = asInterface("android.content.IClipboard$Stub",
+                    getSvc.invoke(null, "clipboard"));
+        } catch (Throwable t) {
+            log("IClipboard init warning: " + t);
+        }
 
         File dir = new File(iconsDir);
         if (!dir.exists()) {
@@ -398,7 +419,19 @@ public class SvboxWmAgent {
             } else if ("SEND_KEY".equals(cmd) && parts.length >= 3) {
                 int slot = Integer.parseInt(parts[1]);
                 int keyCode = Integer.parseInt(parts[2]);
-                return cmdSendKey(slot, keyCode);
+                return cmdSendKey(slot, keyCode, 0);
+            } else if ("SEND_KEY_COMBO".equals(cmd) && parts.length >= 4) {
+                int slot = Integer.parseInt(parts[1]);
+                int keyCode = Integer.parseInt(parts[2]);
+                int metaState = Integer.parseInt(parts[3]);
+                return cmdSendKey(slot, keyCode, metaState);
+            } else if ("SET_CLIPBOARD".equals(cmd) && parts.length >= 2) {
+                return cmdSetClipboard(parts[1]);
+            } else if ("GET_CLIPBOARD".equals(cmd)) {
+                return cmdGetClipboard();
+            } else if ("INPUT_TEXT".equals(cmd) && parts.length >= 3) {
+                int slot = Integer.parseInt(parts[1]);
+                return cmdInputText(slot, parts[2]);
             } else if ("CLOSE_APP".equals(cmd) && parts.length >= 2) {
                 int slot = Integer.parseInt(parts[1]);
                 String pkg = parts.length >= 3 ? parts[2] : "";
@@ -470,7 +503,7 @@ public class SvboxWmAgent {
         Method createMethod = displayMgr.getClass().getMethod(
                 "createVirtualDisplay", cfgCls, cbIface, projIface, String.class);
         int androidDisplayId = ((Integer) createMethod.invoke(
-                displayMgr, config, cb, null, "android")).intValue();
+                displayMgr, config, cb, null, "com.android.shell")).intValue();
 
         if (androidDisplayId <= 0) {
             surface.release();
@@ -554,47 +587,49 @@ public class SvboxWmAgent {
         if (h < 240) h = 240;
         if (dpi < 120) dpi = 240;
 
-        DisplaySlot ds;
-        synchronized (slotLock) {
-            ds = slotsByIdx.get(slot);
-        }
-        if (ds == null) return "{\"ok\":false,\"error\":\"slot not active\"}";
-        if (ds.width == w && ds.height == h && ds.dpi == dpi) {
+        synchronized (resizeLock) {
+            DisplaySlot ds;
+            synchronized (slotLock) {
+                ds = slotsByIdx.get(slot);
+            }
+            if (ds == null) return "{\"ok\":false,\"error\":\"slot not active\"}";
+            if (ds.width == w && ds.height == h && ds.dpi == dpi) {
+                return "{\"ok\":true,\"slot\":" + slot + ",\"displayId\":" + ds.androidDisplayId
+                        + ",\"width\":" + w + ",\"height\":" + h + ",\"dpi\":" + dpi + ",\"unchanged\":true}";
+            }
+
+            long newReader = nativeCreateReader(slot, w, h, presentSockPath);
+            if (newReader == 0) {
+                return "{\"ok\":false,\"error\":\"new AImageReader failed\"}";
+            }
+            Surface newSurface = nativeGetReaderSurface(newReader);
+            if (newSurface == null) {
+                nativeDestroyReader(newReader);
+                return "{\"ok\":false,\"error\":\"new getWindow failed\"}";
+            }
+
+            Class<?> cbIface = Class.forName("android.hardware.display.IVirtualDisplayCallback");
+            displayMgr.getClass().getMethod("resizeVirtualDisplay", cbIface, int.class, int.class, int.class)
+                    .invoke(displayMgr, ds.callback, w, h, dpi);
+            displayMgr.getClass().getMethod("setVirtualDisplaySurface", cbIface, Surface.class)
+                    .invoke(displayMgr, ds.callback, newSurface);
+
+            long oldReader = ds.readerHandle;
+            Surface oldSurface = ds.surface;
+            ds.readerHandle = newReader;
+            ds.surface = newSurface;
+            ds.width = w;
+            ds.height = h;
+            ds.dpi = dpi;
+
+            if (oldSurface != null) oldSurface.release();
+            if (oldReader != 0) nativeDestroyReader(oldReader);
+
+            log("Resized VirtualDisplay slot=" + slot + " displayId=" + ds.androidDisplayId
+                    + " -> " + w + "x" + h + "@" + dpi + "dpi");
             return "{\"ok\":true,\"slot\":" + slot + ",\"displayId\":" + ds.androidDisplayId
-                    + ",\"width\":" + w + ",\"height\":" + h + ",\"dpi\":" + dpi + ",\"unchanged\":true}";
+                    + ",\"width\":" + w + ",\"height\":" + h + ",\"dpi\":" + dpi + "}";
         }
-
-        long newReader = nativeCreateReader(slot, w, h, presentSockPath);
-        if (newReader == 0) {
-            return "{\"ok\":false,\"error\":\"new AImageReader failed\"}";
-        }
-        Surface newSurface = nativeGetReaderSurface(newReader);
-        if (newSurface == null) {
-            nativeDestroyReader(newReader);
-            return "{\"ok\":false,\"error\":\"new getWindow failed\"}";
-        }
-
-        Class<?> cbIface = Class.forName("android.hardware.display.IVirtualDisplayCallback");
-        displayMgr.getClass().getMethod("resizeVirtualDisplay", cbIface, int.class, int.class, int.class)
-                .invoke(displayMgr, ds.callback, w, h, dpi);
-        displayMgr.getClass().getMethod("setVirtualDisplaySurface", cbIface, Surface.class)
-                .invoke(displayMgr, ds.callback, newSurface);
-
-        long oldReader = ds.readerHandle;
-        Surface oldSurface = ds.surface;
-        ds.readerHandle = newReader;
-        ds.surface = newSurface;
-        ds.width = w;
-        ds.height = h;
-        ds.dpi = dpi;
-
-        if (oldSurface != null) oldSurface.release();
-        if (oldReader != 0) nativeDestroyReader(oldReader);
-
-        log("Resized VirtualDisplay slot=" + slot + " displayId=" + ds.androidDisplayId
-                + " -> " + w + "x" + h + "@" + dpi + "dpi");
-        return "{\"ok\":true,\"slot\":" + slot + ",\"displayId\":" + ds.androidDisplayId
-                + ",\"width\":" + w + ",\"height\":" + h + ",\"dpi\":" + dpi + "}";
     }
 
     private String cmdDestroyDisplay(int slot) {
@@ -678,7 +713,7 @@ public class SvboxWmAgent {
                 appThreadCls, String.class, String.class, intentCls, String.class,
                 ibinderCls, String.class, int.class, int.class, profCls, bundleCls, int.class);
         int rc = ((Integer) startAsUser.invoke(atm,
-                null, "android", null, intent, null, null, null, 0, 0, null, bundle, 0)).intValue();
+                null, "com.android.shell", null, intent, null, null, null, 0, 0, null, bundle, 0)).intValue();
         try {
             atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, displayId);
         } catch (Throwable ignored) {}
@@ -784,15 +819,22 @@ public class SvboxWmAgent {
         return "{\"ok\":true,\"displayId\":" + displayId + "}";
     }
 
-    private String cmdSendKey(int slot, int keyCode) throws Exception {
-        int displayId = 0;
-        if (slot > 0) {
-            synchronized (slotLock) {
-                DisplaySlot ds = slotsByIdx.get(slot);
-                if (ds == null) return "{\"ok\":false,\"error\":\"slot not active\"}";
-                displayId = ds.androidDisplayId;
-            }
+    private String cmdSendKey(int slot, int keyCode, int metaState) throws Exception {
+        int displayId = resolveDisplayIdForSlot(slot);
+        if (displayId < 0) return "{\"ok\":false,\"error\":\"slot not active\"}";
+        injectSingleKey(displayId, keyCode, metaState);
+        return "{\"ok\":true,\"displayId\":" + displayId + ",\"keyCode\":" + keyCode + "}";
+    }
+
+    private int resolveDisplayIdForSlot(int slot) {
+        if (slot <= 0) return 0;
+        synchronized (slotLock) {
+            DisplaySlot ds = slotsByIdx.get(slot);
+            return ds != null ? ds.androidDisplayId : -1;
         }
+    }
+
+    private void injectSingleKey(int displayId, int keyCode, int metaState) throws Exception {
         long now = ((Long) Class.forName("android.os.SystemClock")
                 .getMethod("uptimeMillis").invoke(null)).longValue();
         Class<?> keCls = Class.forName("android.view.KeyEvent");
@@ -803,14 +845,161 @@ public class SvboxWmAgent {
         Method setDisp = ieCls.getMethod("setDisplayId", int.class);
         Method inject = inputMgr.getClass().getMethod("injectInputEvent", ieCls, int.class);
 
-        Object down = keCtor.newInstance(now, now, 0 /* ACTION_DOWN */, keyCode, 0, 0, -1, 0, 0, 0x101 /* KEYBOARD */);
+        Object down = keCtor.newInstance(now, now, 0 /* ACTION_DOWN */, keyCode, 0, metaState, -1, 0, 0, 0x101 /* KEYBOARD */);
         setDisp.invoke(down, displayId);
         inject.invoke(inputMgr, down, 0 /* ASYNC */);
 
-        Object up = keCtor.newInstance(now, now + 15, 1 /* ACTION_UP */, keyCode, 0, 0, -1, 0, 0, 0x101);
+        Object up = keCtor.newInstance(now, now + 15, 1 /* ACTION_UP */, keyCode, 0, metaState, -1, 0, 0, 0x101);
         setDisp.invoke(up, displayId);
         inject.invoke(inputMgr, up, 0 /* ASYNC */);
-        return "{\"ok\":true,\"displayId\":" + displayId + ",\"keyCode\":" + keyCode + "}";
+    }
+
+    private boolean setAndroidClipboardText(String text) {
+        if (clipboardMgr == null || text == null) return false;
+        try {
+            Class<?> cdCls = Class.forName("android.content.ClipData");
+            Object clip = cdCls.getMethod("newPlainText", CharSequence.class, CharSequence.class)
+                    .invoke(null, "svbox", text);
+            Method[] methods = clipboardMgr.getClass().getMethods();
+            for (Method m : methods) {
+                if (!"setPrimaryClip".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 5) {
+                    m.invoke(clipboardMgr, clip, "com.android.shell", null, 0, 0);
+                    return true;
+                } else if (pt.length == 4) {
+                    m.invoke(clipboardMgr, clip, "com.android.shell", null, 0);
+                    return true;
+                } else if (pt.length == 3) {
+                    m.invoke(clipboardMgr, clip, "com.android.shell", 0);
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            log("setAndroidClipboardText failed: " + t);
+        }
+        return false;
+    }
+
+    private String getAndroidClipboardText() {
+        if (clipboardMgr == null) return null;
+        try {
+            Object clip = null;
+            Method[] methods = clipboardMgr.getClass().getMethods();
+            for (Method m : methods) {
+                if (!"getPrimaryClip".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 4) {
+                    clip = m.invoke(clipboardMgr, "com.android.shell", null, 0, 0);
+                    break;
+                } else if (pt.length == 3) {
+                    clip = m.invoke(clipboardMgr, "com.android.shell", null, 0);
+                    break;
+                } else if (pt.length == 2) {
+                    clip = m.invoke(clipboardMgr, "com.android.shell", 0);
+                    break;
+                }
+            }
+            if (clip == null) return "";
+            int cnt = ((Integer) clip.getClass().getMethod("getItemCount").invoke(clip)).intValue();
+            if (cnt <= 0) return "";
+            Object item = clip.getClass().getMethod("getItemAt", int.class).invoke(clip, 0);
+            if (item == null) return "";
+            Object txt = item.getClass().getMethod("getText").invoke(item);
+            return txt != null ? txt.toString() : "";
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private String cmdSetClipboard(String b64) {
+        try {
+            String text = new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8);
+            synchronized (clipLock) {
+                lastClipText = text;
+                boolean ok = setAndroidClipboardText(text);
+                return "{\"ok\":" + (ok ? "true" : "false") + ",\"len\":" + text.length() + "}";
+            }
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + jsonStr(String.valueOf(t)) + "}";
+        }
+    }
+
+    private String cmdGetClipboard() {
+        String text = getAndroidClipboardText();
+        if (text == null) text = "";
+        String b64 = Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+        return "{\"ok\":true,\"b64\":" + jsonStr(b64) + ",\"len\":" + text.length() + "}";
+    }
+
+    private String cmdInputText(int slot, String b64) throws Exception {
+        int displayId = resolveDisplayIdForSlot(slot);
+        if (displayId < 0) return "{\"ok\":false,\"error\":\"slot not active\"}";
+        String text = new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8);
+        if (text.isEmpty()) return "{\"ok\":true,\"len\":0}";
+
+        boolean pureAscii = text.length() <= 64;
+        if (pureAscii) {
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c < 0x20 || c > 0x7E) {
+                    pureAscii = false;
+                    break;
+                }
+            }
+        }
+        if (pureAscii) {
+            try {
+                Class<?> kcmCls = Class.forName("android.view.KeyCharacterMap");
+                Object kcm = kcmCls.getMethod("load", int.class).invoke(null, -1 /* VIRTUAL_KEYBOARD */);
+                Object[] events = (Object[]) kcmCls.getMethod("getEvents", char[].class).invoke(kcm, (Object) text.toCharArray());
+                if (events != null && events.length > 0) {
+                    Class<?> ieCls = Class.forName("android.view.InputEvent");
+                    Method setDisp = ieCls.getMethod("setDisplayId", int.class);
+                    Method inject = inputMgr.getClass().getMethod("injectInputEvent", ieCls, int.class);
+                    for (Object ev : events) {
+                        setDisp.invoke(ev, displayId);
+                        inject.invoke(inputMgr, ev, 0 /* ASYNC */);
+                    }
+                    return "{\"ok\":true,\"mode\":\"kcm\",\"len\":" + text.length() + "}";
+                }
+            } catch (Throwable t) {
+                log("KeyCharacterMap inject fallback to clipboard paste: " + t);
+            }
+        }
+
+        // Unicode / Chinese / Emoji path: write clipboard and inject KEYCODE_PASTE (279)
+        synchronized (clipLock) {
+            lastClipText = text;
+            setAndroidClipboardText(text);
+        }
+        try { Thread.sleep(20); } catch (InterruptedException ignored) {}
+        injectSingleKey(displayId, 279 /* KEYCODE_PASTE */, 0);
+        return "{\"ok\":true,\"mode\":\"paste\",\"len\":" + text.length() + "}";
+    }
+
+    private void clipboardWatchLoop() {
+        while (true) {
+            try {
+                Thread.sleep(450);
+                if (eventFds.isEmpty() || clipboardMgr == null) continue;
+                String cur = getAndroidClipboardText();
+                if (cur == null || cur.isEmpty()) continue;
+                boolean changed = false;
+                synchronized (clipLock) {
+                    if (!cur.equals(lastClipText)) {
+                        lastClipText = cur;
+                        changed = true;
+                    }
+                }
+                if (changed && cur.length() <= 65536) {
+                    String b64 = Base64.getEncoder().encodeToString(cur.getBytes(StandardCharsets.UTF_8));
+                    String ev = "{\"event\":\"CLIPBOARD_CHANGED\",\"b64\":" + jsonStr(b64) + "}";
+                    broadcastEvent(ev);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private String cmdCloseApp(int slot, String pkg) throws Exception {

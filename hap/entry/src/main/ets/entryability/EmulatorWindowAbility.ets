@@ -4,6 +4,7 @@ import { window } from '@kit.ArkUI';
 import native from 'libentry.so';
 import { findPresetByKey, InstanceConfig, instanceConfigStore, ResolutionPresetItem } from '../common/AppWindowPrefs';
 import { applyImmersiveDecor, registerSlotWindow, unregisterSlotWindow, updateDecorButtonTheme } from '../common/WindowHelper';
+import { syncHostClipboardToAndroid } from '../common/InputBridgeHelper';
 
 const TAG: string = 'SvboxEmuWin';
 
@@ -59,6 +60,7 @@ export default class EmulatorWindowAbility extends UIAbility {
       native.setDisplayVisible(0, true);
       if (native.isWmAgentReady()) {
         native.wmRpcAsync('FOCUS_DISPLAY 0');
+        syncHostClipboardToAndroid(false);
       }
     } catch (_e) {
     }
@@ -88,6 +90,11 @@ export default class EmulatorWindowAbility extends UIAbility {
       } catch (_e) {
       }
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', 136);
+      win.on('windowEvent', (ev: window.WindowEventType) => {
+        if (ev === window.WindowEventType.WINDOW_ACTIVE) {
+          syncHostClipboardToAndroid(false);
+        }
+      });
     } catch (err) {
       hilog.error(0x0000, TAG, 'windowStage setup error: %{public}s', String(err));
     }

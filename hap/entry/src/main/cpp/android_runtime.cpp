@@ -2914,6 +2914,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     MkdirP(ipcDir + "/icons");
     MkdirP(dataBase_ + "/icons");
+    chmod(ipcDir.c_str(), 0777);
+    chmod((dataBase_ + "/icons").c_str(), 0777);
     {
         std::lock_guard<std::mutex> lk(mu_);
         wmSockPath_ = ipcDir + "/wm_agent.sock";
@@ -3585,6 +3587,15 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
             if (hasWmAgent) {
                 std::vector<std::string> wmArgv = BaseSvboxArgs();
+                // Run SvboxWmAgent as SHELL_UID (2000, com.android.shell) so ClipboardService
+                // (READ_CLIPBOARD_IN_BACKGROUND), DisplayManager, InputManager, and ActivityTaskManager
+                // grant full scrcpy-equivalent privileges without focus denials.
+                for (size_t ui = 0; ui + 1 < wmArgv.size(); ++ui) {
+                    if (wmArgv[ui] == "-u") {
+                        wmArgv[ui + 1] = "2000:2000";
+                        break;
+                    }
+                }
                 wmArgv.push_back("-e");
                 wmArgv.push_back("CLASSPATH=/data/local/tmp/svbox_wm/svbox-wm-agent.jar");
                 wmArgv.push_back("--");

@@ -14,6 +14,11 @@ import {
   Radius,
   Spacing
 } from '../common/DesignTokens';
+import {
+  pasteHostClipboardToAndroid,
+  sendTextToAndroid,
+  syncHostClipboardToAndroid
+} from '../common/InputBridgeHelper';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 
 const TAG: string = 'SvboxEmuPage';
@@ -45,6 +50,8 @@ struct EmulatorWindowPage {
   @State private statusText: string = '正在连接 Android 14 模拟器屏幕...';
   @State private stageW: number = 420;
   @State private stageH: number = 720;
+  @State private showImeBar: boolean = false;
+  @State private imeDraft: string = '';
 
   private pollTimer: number = -1;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
@@ -218,9 +225,37 @@ struct EmulatorWindowPage {
         .onClick(() => { native.sendNavKey('vol_down'); })
       MenuItem({ content: '电源键 / 锁屏唤醒' })
         .onClick(() => { native.sendNavKey('power'); })
+      MenuItem({ content: '粘贴鸿蒙剪贴板到 Android' })
+        .enabled(this.wmAgentReady)
+        .onClick(() => { this.handlePasteClipboard(); })
       MenuItem({ content: '拆出前台应用到独立窗口' })
         .enabled(this.wmAgentReady)
         .onClick(() => { this.handlePopOutCurrentApp(); })
+    }
+  }
+
+  private async handleSubmitImeText(): Promise<void> {
+    const txt: string = this.imeDraft;
+    if (txt.length === 0) return;
+    if (!this.wmAgentReady) {
+      this.showToast('等待窗口代理就绪后再发送文本');
+      return;
+    }
+    this.imeDraft = '';
+    const ok: boolean = await sendTextToAndroid(0, txt);
+    if (!ok) {
+      this.showToast('文本提交失败，请确认 Android 输入框已获焦');
+    }
+  }
+
+  private async handlePasteClipboard(): Promise<void> {
+    if (!this.wmAgentReady) {
+      this.showToast('等待窗口代理就绪');
+      return;
+    }
+    const ok: boolean = await pasteHostClipboardToAndroid(0);
+    if (!ok) {
+      this.showToast('鸿蒙剪贴板为空或未读取到文本');
     }
   }
 
@@ -277,6 +312,12 @@ struct EmulatorWindowPage {
         .alignItems(VerticalAlign.Center)
 
         Row({ space: Spacing.XS }) {
+          this.topIconBtn($r('sys.symbol.keyboard'), () => {
+            this.showImeBar = !this.showImeBar;
+            if (this.showImeBar) {
+              syncHostClipboardToAndroid(false);
+            }
+          })
           this.topIconBtn($r('sys.symbol.chevron_left'), () => { native.sendNavKey('back'); })
           this.topIconBtn($r('sys.symbol.house'), () => { native.sendNavKey('home'); })
           this.topIconBtn($r('sys.symbol.rectangle_on_rectangle'), () => { native.sendNavKey('recents'); })
@@ -345,6 +386,47 @@ struct EmulatorWindowPage {
           this.stageH = h;
         }
       })
+
+      if (this.showImeBar) {
+        Row({ space: Spacing.SM }) {
+          TextInput({ placeholder: '鸿蒙中文输入法桥接：输入后按回车直接上屏到 Android', text: this.imeDraft })
+            .layoutWeight(1)
+            .height(34)
+            .fontSize(FontSize.BODY_MD)
+            .fontColor($r('sys.color.font_primary'))
+            .placeholderColor($r('sys.color.font_tertiary'))
+            .backgroundColor($r('sys.color.background_secondary'))
+            .borderRadius(Radius.MD)
+            .enterKeyType(EnterKeyType.Send)
+            .onChange((val: string) => { this.imeDraft = val; })
+            .onSubmit(() => { this.handleSubmitImeText(); })
+
+          Button('发送', { type: ButtonType.Capsule })
+            .height(32)
+            .padding({ left: Spacing.MD, right: Spacing.MD })
+            .fontSize(FontSize.CAPTION)
+            .fontColor($r('sys.color.font_on_primary'))
+            .backgroundColor($r('sys.color.brand'))
+            .enabled(this.imeDraft.length > 0 && this.wmAgentReady)
+            .onClick(() => { this.handleSubmitImeText(); })
+
+          PasteButton({ text: PasteDescription.PASTE })
+            .height(32)
+            .fontSize(FontSize.CAPTION)
+            .fontColor($r('sys.color.font_primary'))
+            .backgroundColor($r('sys.color.comp_background_tertiary'))
+            .onClick((_ev: ClickEvent, res: PasteButtonOnClickResult) => {
+              if (res === PasteButtonOnClickResult.SUCCESS) {
+                this.handlePasteClipboard();
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS + 2, bottom: Spacing.XS + 2 })
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
+        .alignItems(VerticalAlign.Center)
+      }
     }
     .width('100%')
     .height('100%')

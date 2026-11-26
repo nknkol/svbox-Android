@@ -29,6 +29,7 @@ import {
   Spacing
 } from '../common/DesignTokens';
 import { arrangeOpenWindows } from '../common/WindowHelper';
+import { applyAndroidClipboardToHost } from '../common/InputBridgeHelper';
 import {
   CreateInstanceOptions,
   defaultGlobalSettings,
@@ -518,6 +519,11 @@ struct Index {
             String(ev['label'] ?? pkg),
             Number(ev['taskId'] ?? -1)
           );
+        } else if (evName === 'CLIPBOARD_CHANGED') {
+          const b64: string = String(ev['b64'] ?? '');
+          if (b64.length > 0) {
+            applyAndroidClipboardToHost(b64);
+          }
         }
       }
     } catch (_e) {
@@ -915,9 +921,9 @@ struct Index {
     const pref: AppWindowPref = appWindowPrefs.getPref(
       this.getSandboxFilesDir(), app.packageName, app, this.refreshRate
     );
-    if (pref.mode === 'adaptive') return '自由';
-    if (pref.mode === 'fixed_landscape') return '横屏';
-    return '竖屏';
+    if (pref.mode === 'adaptive') return '支持·自由';
+    if (pref.mode === 'fixed_landscape') return '兼容·横';
+    return '兼容·竖';
   }
 
   private cycleAppWindowPref(app: AndroidAppItem): void {
