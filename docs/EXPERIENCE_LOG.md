@@ -1047,6 +1047,20 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - `svbox` 全量回归 **100% PASS**（`make check-oci`、`test/vfs/test_svc.py` 84/84、`test/fs_policy/fake_ids.py`、`backstop.py`）；容器内 root 列举 `/proc/self/map_files` 0 泄漏、UID `10091` 返回 `EPERM`，`/proc/self/maps` 显示标准 `[vvar]` / `[vdso]`。
   - 真机实测《王者荣耀》主进程（PID `5199`）成功登录并进入大厅（`_m_isLobbyLoginFinish:True`，连同 `estPlugin`、`webview_zygote`、`sandboxed_process0` 并发运行），**连续稳定存活超过 8 分钟以上零 `SIGBUS`/零 `SIGSEGV`/零 `emuglGLESv2_enc` 报错**，`xg_vip_service`（PID `6826`）同样持续稳定在线 6 分钟以上。
 
+### 11.14 根治 Microsoft Edge（Chromium 130+）启动卡死：`mremap(MREMAP_DONTUNMAP)` 清零 `map_exec_copy` 代码段致 V8 `SIGTRAP` + `Groups:` 格式对齐
+- **现象**：打开 Microsoft Edge（`com.microsoft.emmx`）永久卡在启动 Logo 页，后台 `com.microsoft.emmx:sandboxed_process0`（`CrRendererMain`）反复触发 `SIGTRAP (TRAP_BRKPT)` 崩溃，且 Crashpad 报 `format error: unrecognized Groups format`。
+- **精准根因**：
+  1. Chromium 126+/130+ V8 `CodeRange::RemapEmbeddedBuiltins()` 对 `libchrome.so` 内嵌 builtins 段（`0x22f000` B）调用 `mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, dst)` 与 `mprotect(dst, len, PROT_READ | PROT_EXEC)` 后，执行自检 `CHECK(*dst == *src)`。
+  2. 在真实 Linux 文件私有映射上，`MREMAP_DONTUNMAP` 会保留源处文件内容（读源地址自动从文件重缺页）；但因鸿蒙禁止文件页可执行，`svbox` 的 `map_exec_copy()` 将 `libchrome.so` `.text` 转为 `MAP_ANONYMOUS` 匿名拷贝，透传 `MREMAP_DONTUNMAP` 导致内核把匿名页整体迁走并将原 `src` **清零为全 `0`**（`x8=0xadbe6bf9d503245f` vs `x9=0x0`），立即触发 V8 `SIGTRAP`。
+  3. 同时 `pb_proc_status()` 输出 `/proc/<pid>/status` 的 `Groups:` 行缺少上游 Linux 内核 `fs/proc/array.c` 的尾部空格，导致 Crashpad 解析报格式错误。
+- **Layer 1 `svbox` 通用 Linux 修复（[`dispatch.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/dispatch.c)、[`vfs_procfs.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_procfs.c)，零 Android/浏览器硬编码）**：
+  1. 在 `dispatch.c` 拦截 `__NR_mremap`：当携带 `MREMAP_DONTUNMAP` 且源区间重叠受追踪 `map_exec_copy` VMA 时，以 `MAP_PRIVATE | MAP_ANONYMOUS` 在目标处新建副本、`memcpy` 拷贝并调用 `platform_mprotect_exec(PROT_READ | PROT_EXEC)`，保持源与目标双侧字节完整一致。
+  2. 在 `dispatch.c` 新增 `mprotect_private_exec_copy()`：鸿蒙下对 `MAP_PRIVATE` 非匿名页调用 `mprotect(..., PROT_EXEC)` 遇 `-EACCES` 时，自动匿名拷贝升级为可执行（严格跳过 `MAP_SHARED`）。
+  3. 在 `vfs_procfs.c` 补齐 `Groups:` 每项后的尾随空格以与 Linux `fs/proc/array.c` 字节级一致。
+- **真机实测与回归验证（`HAD-W32`）**：
+  - `svbox` 专项测试（`mremap(MREMAP_DONTUNMAP)` on `exec_copy` 源/目标字节全一致、`MAP_PRIVATE` `mprotect(RX)` 成功、`MAP_SHARED` 保持 `-EACCES`）+ 84 项 SVC + `fake_ids` + `backstop` 全部 PASS，Layer 1 纯净度通过。
+  - 真机冷启 Microsoft Edge（PID `51944`）：`+1.53s` 越过启动页进入引导/默认浏览器授权弹窗，`com.microsoft.emmx_zygote`（`52072`）与隔离渲染进程 `com.microsoft.emmx:sandboxed_process0`（`52088`）稳定常驻，**`SIGTRAP` / `aw_browser_terminator` / `unrecognized Groups format` 全部清零**。
+
 
 
 
