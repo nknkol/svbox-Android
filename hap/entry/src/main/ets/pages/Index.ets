@@ -31,6 +31,11 @@ import {
 import { arrangeOpenWindows } from '../common/WindowHelper';
 import { applyAndroidClipboardToHost } from '../common/InputBridgeHelper';
 import {
+  getDeviceFormLabel,
+  isMobileDevice,
+  supportsMultiInstance
+} from '../common/DeviceProfile';
+import {
   CreateInstanceOptions,
   defaultGlobalSettings,
   DeviceInstance,
@@ -145,7 +150,11 @@ struct Index {
 
   private reloadInstances(animated: boolean = false): void {
     const filesDir: string = this.getSandboxFilesDir();
-    const nextList: DeviceInstance[] = instanceManager.getSorted(filesDir, this.sortBy);
+    const allSorted: DeviceInstance[] = instanceManager.getSorted(filesDir, this.sortBy);
+    // Mobile devices run strictly in single-container mode (primary inst_0 only)
+    const nextList: DeviceInstance[] = supportsMultiInstance()
+      ? allSorted
+      : (allSorted.length > 0 ? [allSorted[0]] : []);
     if (animated) {
       this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_MEDIUM, () => {
         this.instances = nextList;
@@ -266,6 +275,11 @@ struct Index {
         this.reloadInstances(false);
       }
       AppStorage.setOrCreate<number>('refreshRate', primary.refreshRate);
+
+      // On mobile devices, land directly on the one-tap offline app grid (single-container freeform mode)
+      if (isMobileDevice() && !AppStorage.get<string>('autoStart')) {
+        this.activeNav = 'apps';
+      }
 
       const autoStart: string | undefined = AppStorage.get<string>('autoStart');
       if (autoStart === 'bootanim' || autoStart === 'full') {
@@ -1145,13 +1159,17 @@ struct Index {
         .onClick(() => { this.cleanDeviceDisk(inst); })
       MenuItem({ content: '重命名' })
         .onClick(() => { this.openRenameDialog(inst); })
-      MenuItem({ content: '复制设备' })
-        .onClick(() => { this.cloneDeviceInstance(inst); })
+      if (supportsMultiInstance()) {
+        MenuItem({ content: '复制设备' })
+          .onClick(() => { this.cloneDeviceInstance(inst); })
+      }
       MenuItem({ content: '备份与还原' })
         .onClick(() => { this.openBackupSheet(inst); })
-      MenuItem({ content: '删除设备' })
-        .enabled(inst.id !== 'inst_0' && !this.isInstanceRunning(inst))
-        .onClick(() => { this.confirmDeleteDevice(inst); })
+      if (supportsMultiInstance()) {
+        MenuItem({ content: '删除设备' })
+          .enabled(inst.id !== 'inst_0' && !this.isInstanceRunning(inst))
+          .onClick(() => { this.confirmDeleteDevice(inst); })
+      }
     }
   }
 
@@ -1784,45 +1802,55 @@ struct Index {
           space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
         }) {
           Row({ space: Spacing.SM }) {
-            Button({ type: ButtonType.Capsule }) {
-              Row({ space: Spacing.XS + 2 }) {
-                SymbolGlyph($r('sys.symbol.plus'))
-                  .fontSize(IconSize.SM)
-                  .fontColor([$r('sys.color.icon_on_primary')])
-                Text(this.bp === 'sm' ? '新建' : '新建设备')
-                  .fontSize(FontSize.BODY_MD)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('sys.color.font_on_primary'))
+            if (supportsMultiInstance()) {
+              Button({ type: ButtonType.Capsule }) {
+                Row({ space: Spacing.XS + 2 }) {
+                  SymbolGlyph($r('sys.symbol.plus'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([$r('sys.color.icon_on_primary')])
+                  Text(this.bp === 'sm' ? '新建' : '新建设备')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('sys.color.font_on_primary'))
+                }
               }
-            }
-            .height(ControlSize.BTN_MD)
-            .padding({ left: Spacing.MD, right: Spacing.LG })
-            .backgroundColor($r('sys.color.brand'))
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-            .onClick(() => {
-              this.openCreateSheet();
-            })
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.MD, right: Spacing.LG })
+              .backgroundColor($r('sys.color.brand'))
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                this.openCreateSheet();
+              })
 
-            Button({ type: ButtonType.Capsule }) {
-              Row({ space: Spacing.XS + 2 }) {
-                SymbolGlyph($r('sys.symbol.checkmark_square'))
-                  .fontSize(IconSize.SM)
-                  .fontColor([$r('sys.color.icon_primary')])
-                Text(this.bp === 'sm' ? '批量' : '批量操作')
-                  .fontSize(FontSize.BODY_MD)
-                  .fontColor($r('sys.color.font_primary'))
+              Button({ type: ButtonType.Capsule }) {
+                Row({ space: Spacing.XS + 2 }) {
+                  SymbolGlyph($r('sys.symbol.checkmark_square'))
+                    .fontSize(IconSize.SM)
+                    .fontColor([$r('sys.color.icon_primary')])
+                  Text(this.bp === 'sm' ? '批量' : '批量操作')
+                    .fontSize(FontSize.BODY_MD)
+                    .fontColor($r('sys.color.font_primary'))
+                }
               }
+              .height(ControlSize.BTN_MD)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .backgroundColor($r('sys.color.comp_background_primary'))
+              .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                this.setBatchModeAnimated(true);
+              })
+            } else {
+              Text('移动设备单容器模式 · 自由多窗')
+                .fontSize(FontSize.CAPTION)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('sys.color.font_emphasize'))
+                .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS + 2, bottom: Spacing.XS + 2 })
+                .borderRadius(Radius.MD)
+                .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
             }
-            .height(ControlSize.BTN_MD)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .backgroundColor($r('sys.color.comp_background_primary'))
-            .border({ width: 0.6, color: $r('sys.color.comp_divider') })
-            .hoverEffect(HoverEffect.Highlight)
-            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-            .onClick(() => {
-              this.setBatchModeAnimated(true);
-            })
 
             if (this.bp !== 'sm') {
               Button({ type: ButtonType.Capsule }) {
@@ -2438,7 +2466,7 @@ struct Index {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
 
           if (this.bp !== 'sm') {
-            Text('HarmonyOS PC')
+            Text(getDeviceFormLabel())
               .fontSize(FontSize.BADGE)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_emphasize'))

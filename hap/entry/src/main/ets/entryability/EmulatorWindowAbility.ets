@@ -1,8 +1,9 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import native from 'libentry.so';
 import { findPresetByKey, InstanceConfig, instanceConfigStore, ResolutionPresetItem } from '../common/AppWindowPrefs';
+import { getDeviceFormFactor } from '../common/DeviceProfile';
 import { applyImmersiveDecor, registerSlotWindow, unregisterSlotWindow, updateDecorButtonTheme } from '../common/WindowHelper';
 import { syncHostClipboardToAndroid } from '../common/InputBridgeHelper';
 
@@ -85,9 +86,11 @@ export default class EmulatorWindowAbility extends UIAbility {
       const isLand: boolean = preset.w > preset.h;
       const winW: number = isLand ? 1560 : 820;
       const winH: number = isLand ? 960 : 1460;
-      try {
-        win.resize(winW, winH);
-      } catch (_e) {
+      if (getDeviceFormFactor() !== 'phone') {
+        try {
+          win.resize(winW, winH);
+        } catch (_e) {
+        }
       }
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', 136);
       win.on('windowEvent', (ev: window.WindowEventType) => {
@@ -105,6 +108,10 @@ export default class EmulatorWindowAbility extends UIAbility {
         return;
       }
       if (!this.mainWindow) return;
+      try {
+        this.mainWindow.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
+      } catch (_e) {
+      }
       const isDark: boolean = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
       const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 40, isDark);
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', rightAvoid);

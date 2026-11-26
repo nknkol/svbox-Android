@@ -18,6 +18,17 @@ import {
   sendTextToAndroid,
   syncHostClipboardToAndroid
 } from '../common/InputBridgeHelper';
+import { supportsPcKeymap } from '../common/DeviceProfile';
+import {
+  applyKeymapToNative,
+  KeymapProfile,
+  keymapStore
+} from '../common/KeymapStore';
+import {
+  KeymapEditorOverlay,
+  KeymapHintLayer,
+  MacroAutomationOverlay
+} from '../components/KeymapOverlay';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
   applyMissionIconAndQuickBar,
@@ -66,6 +77,9 @@ struct AppWindowPage {
   @State private isDarkBar: boolean = true;
   @State private showImeBar: boolean = false;
   @State private imeDraft: string = '';
+  @State private keymapProfile: KeymapProfile = { pkg: '', enabled: false, showHints: true, items: [] };
+  @State private showKeymapEditor: boolean = false;
+  @State private showMacroPanel: boolean = false;
 
   private bootPollTimer: number = -1;
   private resizeDebounceTimer: number = -1;
@@ -184,6 +198,12 @@ struct AppWindowPage {
     this.loadPrefs();
     try {
       native.setDisplayRefreshRate(this.displaySlot, this.curHz);
+      if (supportsPcKeymap()) {
+        const kmDir: string = this.sandboxFilesDir.length > 0
+          ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
+        this.keymapProfile = keymapStore.getProfile(kmDir, this.androidPkg);
+        applyKeymapToNative(this.displaySlot, this.keymapProfile);
+      }
     } catch (_e) {
     }
 
@@ -236,6 +256,10 @@ struct AppWindowPage {
     if (this.resizeDebounceTimer !== -1) {
       clearTimeout(this.resizeDebounceTimer);
       this.resizeDebounceTimer = -1;
+    }
+    try {
+      native.setKeymapConfig(this.displaySlot, false, '');
+    } catch (_e) {
     }
   }
 
@@ -526,6 +550,23 @@ struct AppWindowPage {
     return Math.max(120, Math.round(padW / aspect));
   }
 
+  private getOverlayW(): number {
+    return this.winMode === 'adaptive' ? Math.max(120, this.stageVpW) : this.computeFitWidth();
+  }
+
+  private getOverlayH(): number {
+    return this.winMode === 'adaptive' ? Math.max(120, this.stageVpH) : this.computeFitHeight();
+  }
+
+  private handleSaveKeymap(profile: KeymapProfile): void {
+    const filesDir: string = this.sandboxFilesDir.length > 0
+      ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
+    this.keymapProfile = profile;
+    this.showKeymapEditor = false;
+    keymapStore.saveProfile(filesDir, profile);
+    applyKeymapToNative(this.displaySlot, profile);
+  }
+
   private titleInkColor(): string {
     return this.isDarkBar ? '#F3F4F6' : '#181C24';
   }
@@ -573,7 +614,7 @@ struct AppWindowPage {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
-        // Support Mode vs Compat Mode switcher pill + IME Bridge + Orientation toggle
+        // Support Mode vs Compat Mode switcher pill + Keymap + Automation + IME Bridge + Orientation toggle
         Button({ type: ButtonType.Normal }) {
           Text(this.modePillLabel())
             .fontSize(11)
@@ -586,6 +627,42 @@ struct AppWindowPage {
         .borderRadius(12)
         .backgroundColor(this.buttonHoverBg())
         .bindMenu(this.modeMenuBuilder())
+
+        if (supportsPcKeymap()) {
+          Button({ type: ButtonType.Normal }) {
+            SymbolGlyph($r('sys.symbol.gamecontroller'))
+              .fontSize(15)
+              .fontColor([this.keymapProfile.enabled || this.showKeymapEditor ? '#38BDF8' : this.titleInkColor()])
+          }
+          .width(28)
+          .height(28)
+          .borderRadius(6)
+          .backgroundColor(Color.Transparent)
+          .stateStyles({
+            pressed: { .backgroundColor(this.buttonHoverBg()) }
+          })
+          .onClick(() => {
+            this.showMacroPanel = false;
+            this.showKeymapEditor = !this.showKeymapEditor;
+          })
+
+          Button({ type: ButtonType.Normal }) {
+            SymbolGlyph($r('sys.symbol.bolt_fill'))
+              .fontSize(15)
+              .fontColor([this.showMacroPanel ? '#38BDF8' : this.titleInkColor()])
+          }
+          .width(28)
+          .height(28)
+          .borderRadius(6)
+          .backgroundColor(Color.Transparent)
+          .stateStyles({
+            pressed: { .backgroundColor(this.buttonHoverBg()) }
+          })
+          .onClick(() => {
+            this.showKeymapEditor = false;
+            this.showMacroPanel = !this.showMacroPanel;
+          })
+        }
 
         Button({ type: ButtonType.Normal }) {
           SymbolGlyph($r('sys.symbol.keyboard'))
@@ -642,6 +719,38 @@ struct AppWindowPage {
           .width(this.winMode === 'adaptive' ? '100%' : this.computeFitWidth())
           .height(this.winMode === 'adaptive' ? '100%' : this.computeFitHeight())
           .backgroundColor('#000000')
+
+        if (this.keymapProfile.enabled && this.keymapProfile.showHints &&
+            !this.showKeymapEditor && this.keymapProfile.items.length > 0 && this.stageReady) {
+          KeymapHintLayer({
+            items: this.keymapProfile.items,
+            viewW: this.getOverlayW(),
+            viewH: this.getOverlayH(),
+          })
+        }
+
+        if (this.showKeymapEditor && this.stageReady) {
+          KeymapEditorOverlay({
+            pkg: this.androidPkg,
+            viewW: this.getOverlayW(),
+            viewH: this.getOverlayH(),
+            initialProfile: this.keymapProfile,
+            onSave: (p: KeymapProfile) => { this.handleSaveKeymap(p); },
+            onClose: () => { this.showKeymapEditor = false; },
+          })
+        }
+
+        if (this.showMacroPanel && this.stageReady) {
+          MacroAutomationOverlay({
+            filesDir: this.sandboxFilesDir.length > 0
+              ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files',
+            pkg: this.androidPkg,
+            displaySlot: this.displaySlot,
+            viewW: this.getOverlayW(),
+            viewH: this.getOverlayH(),
+            onClose: () => { this.showMacroPanel = false; },
+          })
+        }
 
         if (!this.ready || this.bannerText.length > 0) {
           Column({ space: 10 }) {

@@ -27,6 +27,7 @@ export default class EntryAbility extends UIAbility {
     const rawSyscall: Object | undefined = want.parameters ? want.parameters['syscallMode'] : undefined;
     const rawDiskGb: Object | undefined = want.parameters ? want.parameters['diskLimitGb'] : undefined;
     const rawGms: Object | undefined = want.parameters ? want.parameters['enableGms'] : undefined;
+    const rawForm: Object | undefined = want.parameters ? want.parameters['deviceForm'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const uiModeStr: string = typeof rawUiMode === 'string' ? rawUiMode : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
@@ -42,6 +43,10 @@ export default class EntryAbility extends UIAbility {
     const syscallStr: string = typeof rawSyscall === 'string' ? rawSyscall : '';
     const diskGbStr: string = typeof rawDiskGb === 'string' ? rawDiskGb : (typeof rawDiskGb === 'number' ? String(rawDiskGb) : '');
     const gmsStr: string = typeof rawGms === 'string' ? rawGms : (typeof rawGms === 'boolean' ? String(rawGms) : '');
+    const formStr: string = typeof rawForm === 'string' ? rawForm : '';
+    if (formStr === 'pc' || formStr === 'tablet' || formStr === 'phone' || formStr === 'mobile') {
+      AppStorage.setOrCreate<string>('deviceFormOverride', formStr);
+    }
 
     if (setHzStr.length > 0 && autoStr.length === 0) {
       const hz: number = Number(setHzStr);

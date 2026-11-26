@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <errno.h>
@@ -1127,4 +1128,246 @@ void InputBridge::InjectOhosKey(int32_t ohosKeyCode, bool down) {
     if (lk != 0) {
         InjectLinuxKey(lk, down);
     }
+}
+
+void InputBridge::InjectNormalizedTouch(int displaySlot, int32_t fingerId, int action, float nx, float ny) {
+    if (!running_.load()) return;
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
+    float cx = std::clamp(nx, 0.0f, 1.0f);
+    float cy = std::clamp(ny, 0.0f, 1.0f);
+    float spanW = 0.0f;
+    float spanH = 0.0f;
+    if (displaySlot == 0) {
+        int32_t sw = surfaceW_.load();
+        int32_t sh = surfaceH_.load();
+        spanW = static_cast<float>(sw > 0 ? sw : displayW_.load());
+        spanH = static_cast<float>(sh > 0 ? sh : displayH_.load());
+    } else {
+        auto& st = secondaryTouchState_[displaySlot - 1];
+        int32_t sw = st.surfaceW.load();
+        int32_t sh = st.surfaceH.load();
+        spanW = static_cast<float>(sw > 0 ? sw : 1000);
+        spanH = static_cast<float>(sh > 0 ? sh : 1000);
+    }
+    InjectTouchForDisplay(displaySlot, fingerId, action, cx * spanW, cy * spanH);
+}
+
+void InputBridge::SetKeymapConfig(int displaySlot, bool enabled, const std::string& rulesSpec) {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
+    std::vector<int32_t> releaseFingers;
+    {
+        std::lock_guard<std::mutex> lk(keymapMu_);
+        auto& km = keymaps_[displaySlot];
+        if (km.dpad.fingerActive) releaseFingers.push_back(500);
+        for (const auto& t : km.taps) {
+            if (t.held) releaseFingers.push_back(t.fingerId);
+        }
+        if (km.rmb.held) releaseFingers.push_back(519);
+
+        km = KeymapSlotState{};
+        km.enabled = enabled;
+        int32_t nextFinger = 501;
+
+        size_t pos = 0;
+        while (pos < rulesSpec.size()) {
+            size_t nl = rulesSpec.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                ? rulesSpec.substr(pos)
+                : rulesSpec.substr(pos, nl - pos);
+            pos = (nl == std::string::npos) ? rulesSpec.size() : (nl + 1);
+            if (line.empty()) continue;
+
+            std::vector<std::string> tok;
+            size_t p = 0;
+            while (p <= line.size()) {
+                size_t bar = line.find('|', p);
+                if (bar == std::string::npos) {
+                    tok.push_back(line.substr(p));
+                    break;
+                }
+                tok.push_back(line.substr(p, bar - p));
+                p = bar + 1;
+            }
+            if (tok.empty()) continue;
+            if (tok[0] == "dpad" && tok.size() >= 8) {
+                km.dpad.present = true;
+                km.dpad.upKey = std::atoi(tok[1].c_str());
+                km.dpad.downKey = std::atoi(tok[2].c_str());
+                km.dpad.leftKey = std::atoi(tok[3].c_str());
+                km.dpad.rightKey = std::atoi(tok[4].c_str());
+                km.dpad.cx = std::clamp(std::strtof(tok[5].c_str(), nullptr), 0.02f, 0.98f);
+                km.dpad.cy = std::clamp(std::strtof(tok[6].c_str(), nullptr), 0.02f, 0.98f);
+                km.dpad.radius = std::clamp(std::strtof(tok[7].c_str(), nullptr), 0.04f, 0.35f);
+            } else if (tok[0] == "tap" && tok.size() >= 4 && nextFinger <= 518) {
+                KeymapTap t;
+                t.keyCode = std::atoi(tok[1].c_str());
+                t.nx = std::clamp(std::strtof(tok[2].c_str(), nullptr), 0.01f, 0.99f);
+                t.ny = std::clamp(std::strtof(tok[3].c_str(), nullptr), 0.01f, 0.99f);
+                t.fingerId = nextFinger++;
+                if (t.keyCode > 0) km.taps.push_back(t);
+            } else if (tok[0] == "rmb" && tok.size() >= 5) {
+                km.rmb.present = true;
+                km.rmb.cx = std::clamp(std::strtof(tok[1].c_str(), nullptr), 0.02f, 0.98f);
+                km.rmb.cy = std::clamp(std::strtof(tok[2].c_str(), nullptr), 0.02f, 0.98f);
+                km.rmb.radius = std::clamp(std::strtof(tok[3].c_str(), nullptr), 0.04f, 0.35f);
+                km.rmb.direct = (std::atoi(tok[4].c_str()) != 0);
+            }
+        }
+    }
+    for (int32_t fid : releaseFingers) {
+        InjectNormalizedTouch(displaySlot, fid, 2, 0.5f, 0.5f);
+    }
+}
+
+bool InputBridge::IsKeymapEnabled(int displaySlot) const {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
+    std::lock_guard<std::mutex> lk(keymapMu_);
+    return keymaps_[displaySlot].enabled;
+}
+
+bool InputBridge::HandleKeymapKey(int displaySlot, int32_t ohosKeyCode, bool down) {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
+    struct PendingTouch {
+        int32_t fid;
+        int action;
+        float nx;
+        float ny;
+    };
+    std::vector<PendingTouch> actions;
+    bool consumed = false;
+
+    {
+        std::lock_guard<std::mutex> lk(keymapMu_);
+        auto& km = keymaps_[displaySlot];
+        if (!km.enabled) return false;
+
+        if (km.dpad.present) {
+            bool matched = false;
+            if (ohosKeyCode == km.dpad.upKey) { km.dpad.heldUp = down; matched = true; }
+            else if (ohosKeyCode == km.dpad.downKey) { km.dpad.heldDown = down; matched = true; }
+            else if (ohosKeyCode == km.dpad.leftKey) { km.dpad.heldLeft = down; matched = true; }
+            else if (ohosKeyCode == km.dpad.rightKey) { km.dpad.heldRight = down; matched = true; }
+
+            if (matched) {
+                consumed = true;
+                float dx = (km.dpad.heldRight ? 1.0f : 0.0f) - (km.dpad.heldLeft ? 1.0f : 0.0f);
+                float dy = (km.dpad.heldDown ? 1.0f : 0.0f) - (km.dpad.heldUp ? 1.0f : 0.0f);
+                float mag = std::sqrt(dx * dx + dy * dy);
+                if (mag > 0.01f) {
+                    float tx = std::clamp(km.dpad.cx + (dx / mag) * km.dpad.radius, 0.01f, 0.99f);
+                    float ty = std::clamp(km.dpad.cy + (dy / mag) * km.dpad.radius, 0.01f, 0.99f);
+                    if (!km.dpad.fingerActive) {
+                        km.dpad.fingerActive = true;
+                        actions.push_back({ 500, 0, km.dpad.cx, km.dpad.cy });
+                        actions.push_back({ 500, 1, tx, ty });
+                    } else {
+                        actions.push_back({ 500, 1, tx, ty });
+                    }
+                } else if (km.dpad.fingerActive) {
+                    km.dpad.fingerActive = false;
+                    actions.push_back({ 500, 2, km.dpad.cx, km.dpad.cy });
+                }
+            }
+        }
+
+        if (!consumed) {
+            for (auto& t : km.taps) {
+                if (t.keyCode == ohosKeyCode) {
+                    consumed = true;
+                    if (down && !t.held) {
+                        t.held = true;
+                        actions.push_back({ t.fingerId, 0, t.nx, t.ny });
+                    } else if (!down && t.held) {
+                        t.held = false;
+                        actions.push_back({ t.fingerId, 2, t.nx, t.ny });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    for (const auto& a : actions) {
+        InjectNormalizedTouch(displaySlot, a.fid, a.action, a.nx, a.ny);
+    }
+    return consumed;
+}
+
+bool InputBridge::HandleKeymapMouse(int displaySlot, int action, int button, float x, float y) {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
+    float spanW = 0.0f;
+    float spanH = 0.0f;
+    if (displaySlot == 0) {
+        int32_t sw = surfaceW_.load();
+        int32_t sh = surfaceH_.load();
+        spanW = static_cast<float>(sw > 0 ? sw : displayW_.load());
+        spanH = static_cast<float>(sh > 0 ? sh : displayH_.load());
+    } else {
+        auto& st = secondaryTouchState_[displaySlot - 1];
+        int32_t sw = st.surfaceW.load();
+        int32_t sh = st.surfaceH.load();
+        spanW = static_cast<float>(sw > 0 ? sw : 1000);
+        spanH = static_cast<float>(sh > 0 ? sh : 1000);
+    }
+    float nx = std::clamp(x / std::max(1.0f, spanW), 0.0f, 1.0f);
+    float ny = std::clamp(y / std::max(1.0f, spanH), 0.0f, 1.0f);
+
+    int emitAction = -1;
+    float ex = 0.5f, ey = 0.5f;
+    float startX = 0.5f, startY = 0.5f;
+    bool emitDownFirst = false;
+
+    {
+        std::lock_guard<std::mutex> lk(keymapMu_);
+        auto& km = keymaps_[displaySlot];
+        if (!km.enabled || !km.rmb.present) return false;
+
+        auto computeTarget = [&]() {
+            if (km.rmb.direct) {
+                ex = nx;
+                ey = ny;
+                startX = nx;
+                startY = ny;
+            } else {
+                // MOBA right-click move: project vector from screen center (0.5, 0.5) onto joystick ring
+                float dx = nx - 0.5f;
+                float dy = ny - 0.5f;
+                float mag = std::sqrt(dx * dx + dy * dy);
+                startX = km.rmb.cx;
+                startY = km.rmb.cy;
+                if (mag > 0.01f) {
+                    ex = std::clamp(km.rmb.cx + (dx / mag) * km.rmb.radius, 0.01f, 0.99f);
+                    ey = std::clamp(km.rmb.cy + (dy / mag) * km.rmb.radius, 0.01f, 0.99f);
+                } else {
+                    ex = km.rmb.cx;
+                    ey = km.rmb.cy;
+                }
+            }
+        };
+
+        if (action == 1 && button == 2) {
+            km.rmb.held = true;
+            computeTarget();
+            emitDownFirst = true;
+            emitAction = 1;
+        } else if (action == 3 && km.rmb.held) {
+            computeTarget();
+            emitAction = 1;
+        } else if ((action == 2 || action == 4) && (button == 2 || km.rmb.held)) {
+            if (!km.rmb.held) return false;
+            km.rmb.held = false;
+            computeTarget();
+            emitAction = 2;
+        } else {
+            return false;
+        }
+    }
+
+    if (emitDownFirst) {
+        InjectNormalizedTouch(displaySlot, 519, 0, startX, startY);
+    }
+    if (emitAction >= 0) {
+        InjectNormalizedTouch(displaySlot, 519, emitAction, ex, ey);
+    }
+    return true;
 }

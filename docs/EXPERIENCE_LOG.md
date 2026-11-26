@@ -1116,6 +1116,11 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     2. `SvboxWmAgent` 新增基于 `lastUpdateTime` 的磁盘标签缓存 `/ipc/icons/labels.tsv` 并采用紧凑堆参数 `-Xms4m -Xmx32m`，避免 `PackageManager.loadLabel/loadIcon` 在 `ResourcesManager` 永久 mmap 全部已安装 APK（`.apk mmap 28.0 -> 2.5 MB`，`SvboxWmAgent` 总 PSS `146.0 -> 111.8 MB`）。
     3. 按 `memLimitMb`（2G/4G/6G/8G+）分档动态注入 `dalvik.vm.heap*`（`heaptargetutilization=0.75`）、限制 `dalvik.vm.madvise.*` 预读膨胀、配置 `activity_manager_constants max_cached_processes`，并新增 `trimMemory()` 一键清理与全窗隐藏 20 秒自动后台清理机制。
   - 真机验证（4GB 档纯净 AOSP 空闲态）：总 Guest PSS 从 `1,413.1 MB` 降至 `1,183.1 MB`（`-230 MB / -16.3%`），Cached PSS 从 `237.3 MB` 降至 `13.7 MB`（`-94.2%`），`dumpsys meminfo` 空闲估算恢复真实（`Free 644 MB`）。
+- **阶段 5（移动设备支持 + PC 键鼠映射与自动化脚本）**：
+  - **移动设备优化（`DeviceProfile.ets` + `Index.ets` + `EmulatorWindowAbility`/`AppWindowAbility`）**：基于 `deviceInfo.deviceType`（并支持 `--ps deviceForm mobile|tablet|pc` 调试覆写）识别 PC / 平板 / 手机形态；移动端强制单容器模式（隐藏新建设备、批量管理、克隆/删除实例），默认直达离线应用中心单点拉起自由多窗；全窗口启用 `KeyboardAvoidMode.RESIZE` 避免软键盘遮挡，优化前后台切换无缝恢复渲染且不销毁 Vulkan 桥接。
+  - **PC 键鼠映射引擎（`ohos_bridge/src/input_bridge.cpp` + `KeymapStore.ets` + `KeymapOverlay.ets`）**：在原生 C++ `InputBridge` 中实现零往返延迟多指虚拟触控合成（`InjectNormalizedTouch` + `SetKeymapConfig` + `HandleKeymapKey`/`HandleKeymapMouse`），支持 `WASD` 8 向模拟摇杆（finger `500`）、多键并行点击（finger `501..518`）与右键走位（finger `519`），并在模拟器与自由多窗内提供实时可拖拽键位编辑器、半透明无遮挡提示层与 MOBA/FPS/通用一键模板，按包名持久化至 `keymaps.json`。
+  - **轻量自动化脚本/宏（`MacroStore` + `MacroRunner` + `MacroAutomationOverlay`）**：支持屏幕可视化录制点击/滑动与等待间隔（录制同时实时透传至 Android）、按包名持久化至 `macros.json`、支持 `1次/5次/20次/无限` 循环回放与随时中断。
+  - 全链路真机回归（启用 GMS + Stage 4 瘦身 + Stage 5 全功能）：GMS 开启态总 Guest PSS 由 `2,316.7 MB` 降至 `1,691.7 MB`（`-625.0 MB / -27.0%`），7 个 GMS 进程、剪贴板 UTF-8 双向同步、`TRIM_MEMORY` 与动态 8 核拓扑均通过，零 JS/Android 致命异常。
 
 
 

@@ -181,6 +181,14 @@ void DispatchMouseEventCB(OH_NativeXComponent* component, void* window) {
     if (OH_NativeXComponent_GetMouseEvent(component, window, &ev) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
         return;
     }
+    if (InputBridge::Instance().HandleKeymapMouse(
+            slot,
+            static_cast<int>(ev.action),
+            static_cast<int>(ev.button),
+            ev.x,
+            ev.y)) {
+        return;
+    }
     InputBridge::Instance().InjectMouseForDisplay(
         slot,
         static_cast<int>(ev.action),
@@ -192,6 +200,7 @@ void DispatchMouseEventCB(OH_NativeXComponent* component, void* window) {
 void DispatchHoverEventCB(OH_NativeXComponent*, bool) {}
 
 bool DispatchKeyEventCB(OH_NativeXComponent* component, void*) {
+    int32_t slot = DisplaySlotFromXC(component);
     OH_NativeXComponent_KeyEvent* kev = nullptr;
     if (OH_NativeXComponent_GetKeyEvent(component, &kev) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS || !kev) {
         return false;
@@ -201,9 +210,11 @@ bool DispatchKeyEventCB(OH_NativeXComponent* component, void*) {
     OH_NativeXComponent_GetKeyEventAction(kev, &act);
     OH_NativeXComponent_GetKeyEventCode(kev, &code);
     if (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN || act == OH_NATIVEXCOMPONENT_KEY_ACTION_UP) {
-        InputBridge::Instance().InjectOhosKey(
-            static_cast<int32_t>(code),
-            act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN);
+        bool down = (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN);
+        if (InputBridge::Instance().HandleKeymapKey(slot, static_cast<int32_t>(code), down)) {
+            return true;
+        }
+        InputBridge::Instance().InjectOhosKey(static_cast<int32_t>(code), down);
         return true;
     }
     return false;
@@ -627,6 +638,34 @@ napi_value InjectTapNapi(napi_env env, napi_callback_info info) {
         usleep(45000);
         InputBridge::Instance().InjectTouch(0, 2, x, y);
     }).detach();
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value InjectNormTouchNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value args[5] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    int32_t fingerId = argc > 1 ? GetInt32Arg(env, args[1], 520) : 520;
+    int32_t action = argc > 2 ? GetInt32Arg(env, args[2], 0) : 0;
+    float nx = argc > 3 ? static_cast<float>(GetDoubleArg(env, args[3], 0.5)) : 0.5f;
+    float ny = argc > 4 ? static_cast<float>(GetDoubleArg(env, args[4], 0.5)) : 0.5f;
+    InputBridge::Instance().InjectNormalizedTouch(slot, fingerId, action, nx, ny);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value SetKeymapConfigNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    bool enabled = argc > 1 ? GetBoolArg(env, args[1], false) : false;
+    std::string spec = argc > 2 ? GetStringArg(env, args[2]) : "";
+    InputBridge::Instance().SetKeymapConfig(slot, enabled, spec);
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
@@ -1242,6 +1281,8 @@ napi_value Init(napi_env env, napi_value exports) {
         { "installLocalApkAsync", nullptr, InstallLocalApkAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "dumpProcs", nullptr, DumpProcsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectTap", nullptr, InjectTapNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "injectNormTouch", nullptr, InjectNormTouchNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setKeymapConfig", nullptr, SetKeymapConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectGamepadButton", nullptr, InjectGamepadButtonNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectGamepadAxis", nullptr, InjectGamepadAxisNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

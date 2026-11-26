@@ -19,6 +19,17 @@ import {
   sendTextToAndroid,
   syncHostClipboardToAndroid
 } from '../common/InputBridgeHelper';
+import { supportsPcKeymap } from '../common/DeviceProfile';
+import {
+  applyKeymapToNative,
+  KeymapProfile,
+  keymapStore
+} from '../common/KeymapStore';
+import {
+  KeymapEditorOverlay,
+  KeymapHintLayer,
+  MacroAutomationOverlay
+} from '../components/KeymapOverlay';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 
 const TAG: string = 'SvboxEmuPage';
@@ -52,6 +63,9 @@ struct EmulatorWindowPage {
   @State private stageH: number = 720;
   @State private showImeBar: boolean = false;
   @State private imeDraft: string = '';
+  @State private keymapProfile: KeymapProfile = { pkg: '__emulator__', enabled: false, showHints: true, items: [] };
+  @State private showKeymapEditor: boolean = false;
+  @State private showMacroPanel: boolean = false;
 
   private pollTimer: number = -1;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
@@ -123,6 +137,10 @@ struct EmulatorWindowPage {
       if (native.isWmAgentReady()) {
         native.wmRpcAsync('FOCUS_DISPLAY 0');
       }
+      if (supportsPcKeymap()) {
+        this.keymapProfile = keymapStore.getProfile(filesDir, '__emulator__');
+        applyKeymapToNative(0, this.keymapProfile);
+      }
     } catch (_e) {
     }
 
@@ -151,6 +169,7 @@ struct EmulatorWindowPage {
       this.pollTimer = -1;
     }
     try {
+      native.setKeymapConfig(0, false, '');
       native.setDisplayVisible(0, false);
     } catch (_e) {
     }
@@ -228,6 +247,20 @@ struct EmulatorWindowPage {
       MenuItem({ content: '粘贴鸿蒙剪贴板到 Android' })
         .enabled(this.wmAgentReady)
         .onClick(() => { this.handlePasteClipboard(); })
+      if (supportsPcKeymap()) {
+        MenuItem({ content: this.keymapProfile.enabled ? '关闭键鼠映射' : '开启键鼠映射' })
+          .onClick(() => { this.toggleKeymapEnabled(); })
+        MenuItem({ content: '编辑键鼠映射布局...' })
+          .onClick(() => {
+            this.showMacroPanel = false;
+            this.showKeymapEditor = true;
+          })
+        MenuItem({ content: '自动化脚本 / 宏录制...' })
+          .onClick(() => {
+            this.showKeymapEditor = false;
+            this.showMacroPanel = !this.showMacroPanel;
+          })
+      }
       MenuItem({ content: '拆出前台应用到独立窗口' })
         .enabled(this.wmAgentReady)
         .onClick(() => { this.handlePopOutCurrentApp(); })
@@ -246,6 +279,37 @@ struct EmulatorWindowPage {
     if (!ok) {
       this.showToast('文本提交失败，请确认 Android 输入框已获焦');
     }
+  }
+
+  private getFilesDir(): string {
+    return this.sandboxFilesDir.length > 0
+      ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
+  }
+
+  private toggleKeymapEnabled(): void {
+    if (this.keymapProfile.items.length === 0) {
+      this.showKeymapEditor = true;
+      this.showToast('尚未配置键位，请选择模板或添加键位');
+      return;
+    }
+    const next: KeymapProfile = {
+      pkg: this.keymapProfile.pkg,
+      enabled: !this.keymapProfile.enabled,
+      showHints: this.keymapProfile.showHints,
+      items: this.keymapProfile.items,
+    };
+    this.keymapProfile = next;
+    keymapStore.saveProfile(this.getFilesDir(), next);
+    applyKeymapToNative(0, next);
+    this.showToast(next.enabled ? '已开启键鼠映射' : '已关闭键鼠映射');
+  }
+
+  private handleSaveKeymap(profile: KeymapProfile): void {
+    this.keymapProfile = profile;
+    this.showKeymapEditor = false;
+    keymapStore.saveProfile(this.getFilesDir(), profile);
+    applyKeymapToNative(0, profile);
+    this.showToast(profile.enabled ? `键鼠映射已生效 (${profile.items.length} 项)` : '键鼠映射已清空');
   }
 
   private async handlePasteClipboard(): Promise<void> {
@@ -312,6 +376,16 @@ struct EmulatorWindowPage {
         .alignItems(VerticalAlign.Center)
 
         Row({ space: Spacing.XS }) {
+          if (supportsPcKeymap()) {
+            this.topIconBtn($r('sys.symbol.gamecontroller'), () => {
+              this.showMacroPanel = false;
+              this.showKeymapEditor = !this.showKeymapEditor;
+            })
+            this.topIconBtn($r('sys.symbol.bolt_fill'), () => {
+              this.showKeymapEditor = false;
+              this.showMacroPanel = !this.showMacroPanel;
+            })
+          }
           this.topIconBtn($r('sys.symbol.keyboard'), () => {
             this.showImeBar = !this.showImeBar;
             if (this.showImeBar) {
@@ -357,6 +431,37 @@ struct EmulatorWindowPage {
           .width(this.computeFitWidth())
           .height(this.computeFitHeight())
           .backgroundColor('#000000')
+
+        if (this.keymapProfile.enabled && this.keymapProfile.showHints &&
+            !this.showKeymapEditor && this.keymapProfile.items.length > 0) {
+          KeymapHintLayer({
+            items: this.keymapProfile.items,
+            viewW: this.computeFitWidth(),
+            viewH: this.computeFitHeight(),
+          })
+        }
+
+        if (this.showKeymapEditor) {
+          KeymapEditorOverlay({
+            pkg: '__emulator__',
+            viewW: this.computeFitWidth(),
+            viewH: this.computeFitHeight(),
+            initialProfile: this.keymapProfile,
+            onSave: (p: KeymapProfile) => { this.handleSaveKeymap(p); },
+            onClose: () => { this.showKeymapEditor = false; },
+          })
+        }
+
+        if (this.showMacroPanel) {
+          MacroAutomationOverlay({
+            filesDir: this.getFilesDir(),
+            pkg: '__emulator__',
+            displaySlot: 0,
+            viewW: this.computeFitWidth(),
+            viewH: this.computeFitHeight(),
+            onClose: () => { this.showMacroPanel = false; },
+          })
+        }
 
         if (!this.running) {
           Column({ space: Spacing.MD }) {

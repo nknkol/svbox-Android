@@ -33,6 +33,13 @@ public:
     // Touch: action 0=down, 1=move, 2=up, 3=cancel
     void InjectTouch(int32_t fingerId, int action, float x, float y);
     void InjectTouchForDisplay(int displaySlot, int32_t fingerId, int action, float x, float y);
+    // Normalized [0..1] multi-finger touch injection for PC keymapping & macro automation
+    void InjectNormalizedTouch(int displaySlot, int32_t fingerId, int action, float nx, float ny);
+    // Per-display PC key/mouse mapping runtime (rulesSpec: newline-delimited dpad/tap/rmb entries)
+    void SetKeymapConfig(int displaySlot, bool enabled, const std::string& rulesSpec);
+    bool IsKeymapEnabled(int displaySlot) const;
+    bool HandleKeymapKey(int displaySlot, int32_t ohosKeyCode, bool down);
+    bool HandleKeymapMouse(int displaySlot, int action, int button, float x, float y);
     // Mouse: action 1=press, 2=release, 3=move, 4=cancel; button 1=left, 2=right, 4=middle
     void InjectMouse(int action, int button, float x, float y);
     void InjectMouseForDisplay(int displaySlot, int action, int button, float x, float y);
@@ -126,6 +133,49 @@ private:
     int32_t nextTrackingId_ = 1;
     int32_t slotFinger_[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
     int32_t slotTrack_[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
+
+    struct KeymapDpad {
+        bool present = false;
+        int32_t upKey = 2039;    // W
+        int32_t downKey = 2035;  // S
+        int32_t leftKey = 2017;  // A
+        int32_t rightKey = 2020; // D
+        float cx = 0.17f;
+        float cy = 0.74f;
+        float radius = 0.11f;
+        bool heldUp = false;
+        bool heldDown = false;
+        bool heldLeft = false;
+        bool heldRight = false;
+        bool fingerActive = false;
+    };
+
+    struct KeymapTap {
+        int32_t keyCode = 0;
+        float nx = 0.5f;
+        float ny = 0.5f;
+        int32_t fingerId = 501;
+        bool held = false;
+    };
+
+    struct KeymapRmbMove {
+        bool present = false;
+        float cx = 0.17f;
+        float cy = 0.74f;
+        float radius = 0.11f;
+        bool direct = false;
+        bool held = false;
+    };
+
+    struct KeymapSlotState {
+        bool enabled = false;
+        KeymapDpad dpad;
+        std::vector<KeymapTap> taps;
+        KeymapRmbMove rmb;
+    };
+
+    mutable std::mutex keymapMu_;
+    KeymapSlotState keymaps_[kMaxSecondaryDisplays + 1];
 
     std::mutex gamepadStateMu_;
     int32_t gamepadAbs_[64] = {};

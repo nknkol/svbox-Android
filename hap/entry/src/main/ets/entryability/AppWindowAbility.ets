@@ -1,8 +1,9 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { window } from '@kit.ArkUI';
+import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import native from 'libentry.so';
 import { AndroidAppItem, AppWindowPref, appWindowPrefs, loadCachedAppList } from '../common/AppWindowPrefs';
+import { getDeviceFormFactor } from '../common/DeviceProfile';
 import { syncHostClipboardToAndroid } from '../common/InputBridgeHelper';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
@@ -109,9 +110,11 @@ export default class AppWindowAbility extends UIAbility {
       }
       const pref: AppWindowPref = appWindowPrefs.getPref(this.context.filesDir, this.androidPkg, appMeta, globalHz);
 
-      try {
-        win.resize(pref.winW, pref.winH);
-      } catch (_e) {
+      if (getDeviceFormFactor() !== 'phone') {
+        try {
+          win.resize(pref.winW, pref.winH);
+        } catch (_e) {
+        }
       }
       if (pref.mode === 'fixed_portrait' || pref.mode === 'fixed_landscape') {
         const ratio: number = pref.mode === 'fixed_landscape' ? (1280.0 / 784.0) : (720.0 / 1344.0);
@@ -158,6 +161,10 @@ export default class AppWindowAbility extends UIAbility {
         return;
       }
       if (!this.mainWindow) return;
+      try {
+        this.mainWindow.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
+      } catch (_e) {
+      }
       const rightAvoid: number = applyImmersiveDecor(this.mainWindow, 38, true);
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', rightAvoid);
 
