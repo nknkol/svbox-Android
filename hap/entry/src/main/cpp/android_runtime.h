@@ -142,6 +142,7 @@ private:
     std::string shareHostDir_;
     std::string svboxPath_;
     std::string netSockPath_;
+    std::string procCmdline_;
     std::string audioHalPath_;
     std::string audioSvcPath_;
     std::string cameraSvcPath_;

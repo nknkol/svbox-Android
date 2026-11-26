@@ -382,6 +382,19 @@ void StageSyntheticSysCpu(const std::string& sysCpuDir, int cpuCount, const std:
         WriteFile(cdir + "/cpufreq/cpuinfo_max_freq", maxKhz);
         WriteFile(cdir + "/cpufreq/scaling_max_freq", maxKhz);
         WriteFile(cdir + "/cpufreq/scaling_cur_freq", maxKhz);
+        WriteFile(cdir + "/cpufreq/scaling_governor", "schedutil\n");
+        WriteFile(cdir + "/cpufreq/affected_cpus", idx + "\n");
+        WriteFile(cdir + "/cpufreq/related_cpus", rangeNl);
+        WriteFile(cdir + "/cpufreq/scaling_available_frequencies",
+                  "418000 845000 1248000 1650000 2010000 " + std::string(maxKhz));
+        MkdirP(cdir + "/cpufreq/stats");
+        WriteFile(cdir + "/cpufreq/stats/time_in_state",
+                  "418000 120000\n"
+                  "845000 45000\n"
+                  "1248000 28000\n"
+                  "1650000 19000\n"
+                  "2010000 12000\n" +
+                  std::string(maxKhz).substr(0, std::string(maxKhz).size() - 1) + " 8500\n");
 
         // L1d (64K), L1i (64K), L2 (512K per core), L3 (8192K shared)
         WriteFile(cdir + "/cache/index0/level", "1\n");
@@ -408,6 +421,85 @@ void StageSyntheticSysCpu(const std::string& sysCpuDir, int cpuCount, const std:
         WriteFile(cdir + "/cache/index3/coherency_line_size", "64\n");
         WriteFile(cdir + "/cache/index3/shared_cpu_list", rangeNl);
     }
+}
+
+static void StageSyntheticPowerSupply(const std::string& psDir) {
+    RemoveDirRecursive(psDir);
+    const std::string ac = psDir + "/ac";
+    const std::string bat = psDir + "/battery";
+    MkdirP(ac);
+    MkdirP(bat);
+
+    WriteFile(ac + "/type", "Mains\n");
+    WriteFile(ac + "/online", "1\n");
+
+    WriteFile(bat + "/type", "Battery\n");
+    WriteFile(bat + "/present", "1\n");
+    WriteFile(bat + "/online", "1\n");
+    WriteFile(bat + "/status", "Charging\n");
+    WriteFile(bat + "/health", "Good\n");
+    WriteFile(bat + "/capacity", "88\n");
+    WriteFile(bat + "/capacity_level", "Normal\n");
+    WriteFile(bat + "/voltage_now", "4210000\n");
+    WriteFile(bat + "/voltage_max", "4400000\n");
+    WriteFile(bat + "/voltage_max_design", "4400000\n");
+    WriteFile(bat + "/current_now", "450000\n");
+    WriteFile(bat + "/current_avg", "450000\n");
+    WriteFile(bat + "/current_max", "2000000\n");
+    WriteFile(bat + "/charge_full", "4500000\n");
+    WriteFile(bat + "/charge_full_design", "4500000\n");
+    WriteFile(bat + "/charge_counter", "3960000\n");
+    WriteFile(bat + "/temp", "285\n");
+    WriteFile(bat + "/technology", "Li-ion\n");
+    WriteFile(bat + "/cycle_count", "12\n");
+}
+
+static void StageSyntheticThermal(const std::string& thDir) {
+    RemoveDirRecursive(thDir);
+    const std::string z0 = thDir + "/thermal_zone0";
+    const std::string z1 = thDir + "/thermal_zone1";
+    MkdirP(z0);
+    MkdirP(z1);
+
+    WriteFile(z0 + "/type", "soc_thermal\n");
+    WriteFile(z0 + "/temp", "36500\n");
+    WriteFile(z0 + "/mode", "enabled\n");
+
+    WriteFile(z1 + "/type", "battery\n");
+    WriteFile(z1 + "/temp", "28500\n");
+    WriteFile(z1 + "/mode", "enabled\n");
+}
+
+static std::string LoadOrCreatePersistentMac(const std::string& path, bool lowercase) {
+    std::ifstream in(path);
+    std::string existing;
+    if (in && std::getline(in, existing)) {
+        while (!existing.empty() && (existing.back() == '\n' || existing.back() == '\r'))
+            existing.pop_back();
+        if (existing.size() == 17 && existing[2] == ':' && existing[5] == ':' &&
+            existing[8] == ':' && existing[11] == ':' && existing[14] == ':') {
+            if (lowercase) {
+                for (char& c : existing) {
+                    if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
+                }
+            }
+            return existing;
+        }
+    }
+    uint8_t b[6] = { 0xa4, 0x5e, 0x60, 0x11, 0x22, 0x33 };
+    int ufd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (ufd >= 0) {
+        (void)read(ufd, b + 3, 3);
+        close(ufd);
+    }
+    // Locally administered, unicast MAC (bit1=1, bit0=0)
+    b[0] = static_cast<uint8_t>((b[0] & 0xfe) | 0x02);
+    char mac[24];
+    snprintf(mac, sizeof(mac), lowercase ? "%02x:%02x:%02x:%02x:%02x:%02x"
+                                         : "%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
+    WriteFile(path, std::string(mac) + "\n");
+    return std::string(mac);
 }
 
 struct OwnerHdr {
@@ -1296,6 +1388,10 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "--glue-dir", runBase_ + "/tmp",
         "--owner-db", dataBase_ + "/owner.db",
     });
+    if (!procCmdline_.empty()) {
+        args.push_back("--proc-cmdline");
+        args.push_back(procCmdline_);
+    }
     if (!cpuset.empty()) {
         args.push_back("--cpuset");
         args.push_back(cpuset);
@@ -1336,7 +1432,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", sockDir + ":/dev/socket",
         "-v", runBase_ + "/dev_input:/dev/input",
         "-v", runBase_ + "/dev_bus_usb:/dev/bus/usb",
-        "-v", runBase_ + "/ipc:/ipc",
+        "-v", runBase_ + "/ipc:/ipc:rw,nomnt",
         "-v", dataBase_ + "/data:/data",
         "-v", dataBase_ + "/data/data:/data/user/0",
         "-v", dataBase_ + "/data/user:/data_mirror/data_ce/null",
@@ -1350,6 +1446,8 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/sys_fs_bpf:/sys/fs/bpf",
         "-v", runBase_ + "/sys_power:/sys/power",
         "-v", runBase_ + "/sys_cpu:/sys/devices/system/cpu",
+        "-v", runBase_ + "/sys_power_supply:/sys/class/power_supply",
+        "-v", runBase_ + "/sys_thermal:/sys/class/thermal",
         "-v", runBase_ + "/cpuset:/dev/cpuset",
         "-v", runBase_ + "/stune:/dev/stune",
         "-v", runBase_ + "/mnt:/mnt",
@@ -1377,14 +1475,14 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
     }
     if (!shareHostDir_.empty() && FileExists(shareHostDir_)) {
         mounts.push_back("-v");
-        mounts.push_back(shareHostDir_ + ":/data/media/0/Download/HarmonyShare");
+        mounts.push_back(shareHostDir_ + ":/data/media/0/Download/HarmonyShare:rw,nomnt");
         if (includeStorageSubmounts) {
             mounts.push_back("-v");
-            mounts.push_back(shareHostDir_ + ":/sdcard/Download/HarmonyShare");
+            mounts.push_back(shareHostDir_ + ":/sdcard/Download/HarmonyShare:rw,nomnt");
             mounts.push_back("-v");
-            mounts.push_back(shareHostDir_ + ":/storage/emulated/0/Download/HarmonyShare");
+            mounts.push_back(shareHostDir_ + ":/storage/emulated/0/Download/HarmonyShare:rw,nomnt");
             mounts.push_back("-v");
-            mounts.push_back(shareHostDir_ + ":/storage/self/primary/Download/HarmonyShare");
+            mounts.push_back(shareHostDir_ + ":/storage/self/primary/Download/HarmonyShare:rw,nomnt");
         }
     }
     args.insert(args.end(), mounts.begin(), mounts.end());
@@ -2363,7 +2461,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Rebuild ephemeral overlay upper + injection layer + linkerconfig cleanly on every boot
     // so GPU mode switches never leave stale HALs and rootfs stays strictly read-only.
     // Forget any owner.db entries for ephemeral trees before deleting them on the host.
-    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig", runBase_ + "/sys_cpu" });
+    ForgetOwnerDbTree(dataBase_ + "/owner.db", { rootUpper_, injectLayer_, runBase_ + "/linkerconfig", runBase_ + "/sys_cpu", runBase_ + "/sys_power_supply", runBase_ + "/sys_thermal" });
     RemoveDirRecursive(rootUpper_);
     MkdirP(rootUpper_);
     RemoveDirRecursive(injectLayer_);
@@ -2474,6 +2572,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     const int stagedCpuCount = CountCpusetCores(activeCpusetSnap);
     const std::string stagedCpuRange = (stagedCpuCount <= 1) ? "0" : ("0-" + std::to_string(stagedCpuCount - 1));
     StageSyntheticSysCpu(runBase_ + "/sys_cpu", stagedCpuCount, profileSnap);
+    StageSyntheticPowerSupply(runBase_ + "/sys_power_supply");
+    StageSyntheticThermal(runBase_ + "/sys_thermal");
 
     for (const char* sub : { "", "/foreground", "/background", "/system-background", "/top-app" }) {
         const std::string base = runBase_ + "/cpuset" + sub;
@@ -2532,9 +2632,37 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
     }
     if (effDevice.empty()) effDevice = "svbox14";
+    const std::string buildInc = "11842670";
     const std::string buildFp = effBrand + "/" + effDevice + "/" + effDevice +
-                                ":14/UD2A.240505.001.W1/20240527:" + buildType + "/" + buildTags;
-    const std::string buildDesc = effDevice + "-" + buildType + " 14 UD2A.240505.001.W1 20240527 " + buildTags;
+                                ":14/UD2A.240505.001.W1/" + buildInc + ":" + buildType + "/" + buildTags;
+    const std::string buildDesc = effDevice + "-" + buildType + " 14 UD2A.240505.001.W1 " + buildInc + " " + buildTags;
+
+    const std::string hostHw = ReadHostHardwareName();
+    std::string socManuf = "ARM";
+    std::string socModel = hostHw;
+    {
+        size_t sp = hostHw.find(' ');
+        if (sp != std::string::npos && sp > 0 && sp + 1 < hostHw.size()) {
+            socManuf = hostHw.substr(0, sp);
+            socModel = hostHw.substr(sp + 1);
+        }
+    }
+    std::string hwName;
+    for (char c : socModel) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            hwName.push_back(c);
+        } else if (c >= 'A' && c <= 'Z') {
+            hwName.push_back(static_cast<char>(c - 'A' + 'a'));
+        }
+    }
+    if (hwName.empty()) hwName = effDevice;
+    procCmdline_ = "androidboot.hardware=" + hwName +
+                   " androidboot.verifiedbootstate=green"
+                   " androidboot.vbmeta.device_state=locked"
+                   " androidboot.flash.locked=1"
+                   " console=ttyS0";
+
+    const std::string btMac = LoadOrCreatePersistentMac(dataBase_ + "/bt_mac.txt", true);
 
     std::string deviceProps;
     deviceProps += "ro.product.brand=" + effBrand + "\n";
@@ -2545,6 +2673,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     deviceProps += "ro.build.product=" + effDevice + "\n";
     deviceProps += "ro.build.type=" + buildType + "\n";
     deviceProps += "ro.build.tags=" + buildTags + "\n";
+    deviceProps += "ro.build.user=android-build\n";
+    deviceProps += "ro.build.host=abfarm-release-2004\n";
+    deviceProps += "ro.build.version.incremental=" + buildInc + "\n";
     deviceProps += "ro.build.flavor=" + effDevice + "-" + buildType + "\n";
     deviceProps += "ro.build.description=" + buildDesc + "\n";
     deviceProps += "ro.build.display.id=" + buildDesc + "\n";
@@ -2558,23 +2689,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         deviceProps += "ro.product." + p + ".name=" + effDevice + "\n";
         deviceProps += "ro." + p + ".build.type=" + buildType + "\n";
         deviceProps += "ro." + p + ".build.tags=" + buildTags + "\n";
+        deviceProps += "ro." + p + ".build.version.incremental=" + buildInc + "\n";
         deviceProps += "ro." + p + ".build.fingerprint=" + buildFp + "\n";
-    }
-    const std::string hostHw = ReadHostHardwareName();
-    std::string socManuf = "ARM";
-    std::string socModel = hostHw;
-    {
-        size_t sp = hostHw.find(' ');
-        if (sp != std::string::npos && sp > 0 && sp + 1 < hostHw.size()) {
-            socManuf = hostHw.substr(0, sp);
-            socModel = hostHw.substr(sp + 1);
-        }
     }
     deviceProps += "ro.soc.manufacturer=" + socManuf + "\n";
     deviceProps += "ro.soc.model=" + socModel + "\n";
+    deviceProps += "ro.hardware=" + hwName + "\n";
+    deviceProps += "ro.boot.hardware=" + hwName + "\n";
     deviceProps += "ro.hardware.chipname=" + hostHw + "\n";
     deviceProps += "ro.board.platform=" + socModel + "\n";
     deviceProps += "ro.product.board=" + socModel + "\n";
+    deviceProps += "vendor.bt.rootcanal_mac_address=" + btMac + "\n";
     const std::string overrideProp = runBase_ + "/override.prop";
     std::string gpuProps;
     if (useGfx) {
@@ -2590,7 +2715,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             // drawVk deadlock on gfxstream without /dev/goldfish_sync.
             "debug.hwui.renderer=skiagl\n"
             "debug.renderengine.backend=gles\n"
-            "ro.boot.qemu.gltransport=pipe\n";
+            "ro.boot.qemu.gltransport=pipe\n"
+            "ro.sf.display.width=" + std::to_string(width) + "\n"
+            "ro.sf.display.height=" + std::to_string(height) + "\n"
+            "ro.sf.display.fps=" + std::to_string(targetHz) + "\n";
     } else {
         gpuProps =
             "ro.hardware.egl=angle\n"
@@ -2600,18 +2728,18 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "ro.opengles.version=196610\n"
             "debug.hwui.renderer=skiagl\n"
             "debug.renderengine.backend=gles\n"
-            "ro.boot.use_redroid_stream=1\n";
+            "ro.boot.use_redroid_stream=1\n"
+            "ro.boot.redroid_dpi=" + std::to_string(targetDpi) + "\n"
+            "ro.boot.redroid_width=" + std::to_string(width) + "\n"
+            "ro.boot.redroid_height=" + std::to_string(height) + "\n"
+            "ro.boot.redroid_fps=" + std::to_string(targetHz) + "\n";
     }
     WriteFile(overrideProp,
         gpuProps +
         deviceProps +
         "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
-        "ro.boot.redroid_dpi=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
-        "ro.boot.redroid_width=" + std::to_string(width) + "\n"
-        "ro.boot.redroid_height=" + std::to_string(height) + "\n"
-        "ro.boot.redroid_fps=" + std::to_string(targetHz) + "\n"
         "ro.surface_flinger.use_content_detection_for_refresh_rate=false\n"
         "ro.surface_flinger.set_idle_timer_ms=0\n"
         "ro.surface_flinger.set_touch_timer_ms=0\n"
@@ -2633,7 +2761,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "external_storage.sdcardfs.enabled=false\n"
         "ro.sys.sdcardfs=false\n"
         "ro.secure=" + std::string(allowRoot ? "0" : "1") + "\n"
-        "ro.adb.secure=0\n"
+        "ro.adb.secure=" + std::string(allowRoot ? "0" : "1") + "\n"
+        "persist.sys.usb.config=" + std::string(allowRoot ? "adb" : "none") + "\n"
         "ro.debuggable=" + std::string(allowRoot ? "1" : "0") + "\n"
         "service.adb.root=" + std::string(allowRoot ? "1" : "0") + "\n"
         "service.adb.tcp.port=" + std::to_string(targetAdbPort) + "\n"
@@ -2723,19 +2852,83 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
 
     SetStatus("Starting propd & binder daemons...");
 
-    // 1. Start propd (load all Android 14 partition build.props + override.prop)
-    std::vector<std::string> propArgs = { propd, "--dir", propDir, "--sock", sockDir + "/property_service" };
-    for (const std::string& pf : { rootfs_ + "/system/etc/prop.default",
-                                   rootfs_ + "/default.prop",
-                                   rootfs_ + "/system/build.prop",
-                                   rootfs_ + "/system/system_ext/etc/build.prop",
-                                   rootfs_ + "/system/product/etc/build.prop",
-                                   rootfs_ + "/vendor/build.prop",
-                                   rootfs_ + "/vendor/default.prop",
-                                   rootfs_ + "/vendor/odm/etc/build.prop",
-                                   overrideProp }) {
-        if (FileExists(pf)) propArgs.push_back(pf);
+    // Stage sanitized partition build.prop / default.prop copies into injectLayer_ FIRST
+    // so both propd (getprop) and on-disk partition build.prop files share a single clean source
+    // (never modifying read-only rootfs_).
+    const char* propRelPaths[] = {
+        "system/etc/prop.default",
+        "default.prop",
+        "system/build.prop",
+        "system/system_ext/etc/build.prop",
+        "system/product/etc/build.prop",
+        "vendor/build.prop",
+        "vendor/default.prop",
+        "vendor/odm/etc/build.prop",
+    };
+    {
+        std::vector<std::pair<std::string, std::string>> propOverrides;
+        {
+            std::ifstream ov(overrideProp);
+            std::string line;
+            while (std::getline(ov, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                auto eq = line.find('=');
+                if (eq == std::string::npos || eq == 0) continue;
+                std::string k = line.substr(0, eq);
+                std::string v = line.substr(eq + 1);
+                if (!v.empty() && v.back() == '\r') v.pop_back();
+                bool found = false;
+                for (auto& kv : propOverrides) {
+                    if (kv.first == k) { kv.second = v; found = true; break; }
+                }
+                if (!found) propOverrides.emplace_back(std::move(k), std::move(v));
+            }
+        }
+        for (const char* rel : propRelPaths) {
+            std::string src = rootfs_ + "/" + rel;
+            if (!FileExists(src)) continue;
+            std::string dst = injectLayer_ + "/" + rel;
+            auto slash = dst.rfind('/');
+            if (slash != std::string::npos) MkdirP(dst.substr(0, slash));
+            std::ifstream in(src);
+            std::string outBuf;
+            std::string line;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty() && line[0] == '#') {
+                    if (line.find("redroid") != std::string::npos) continue;
+                } else if (!line.empty()) {
+                    auto eq = line.find('=');
+                    if (eq != std::string::npos && eq > 0) {
+                        std::string k = line.substr(0, eq);
+                        if (k == "ro.boot.use_redroid_c2" || k == "ro.boot.redroid_width" ||
+                            k == "ro.boot.redroid_height" || k == "ro.boot.redroid_fps" ||
+                            k == "ro.boot.redroid_dpi") {
+                            continue;
+                        }
+                        for (const auto& kv : propOverrides) {
+                            if (kv.first == k) {
+                                line = k + "=" + kv.second;
+                                break;
+                            }
+                        }
+                    }
+                }
+                outBuf += line;
+                outBuf.push_back('\n');
+            }
+            WriteFile(dst, outBuf);
+            chmod(dst.c_str(), 0644);
+        }
     }
+
+    // 1. Start propd (load sanitized partition build.props + override.prop)
+    std::vector<std::string> propArgs = { propd, "--dir", propDir, "--sock", sockDir + "/property_service" };
+    for (const char* rel : propRelPaths) {
+        std::string staged = injectLayer_ + "/" + rel;
+        if (FileExists(staged)) propArgs.push_back(staged);
+    }
+    propArgs.push_back(overrideProp);
     pid_t pidPropd = Spawn(propArgs, false, logDir + "/propd.log");
 
     // 2. Start userspace Binder routers & generic virtual network stack (svbox-net)
@@ -2781,66 +2974,24 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     // Stage all Android-compat injected HALs/services/configs into ephemeral injectLayer_
     // (mounted as svbox --lower #1 above strictly read-only rootfs_ as --lower #2).
     {
-        // Stage consistent partition build.prop / default.prop copies into injectLayer_
-        // by applying override.prop key=value overrides so on-disk prop files agree with
-        // getprop (never modifying read-only rootfs_).
-        std::vector<std::pair<std::string, std::string>> propOverrides;
-        {
-            std::ifstream ov(overrideProp);
-            std::string line;
-            while (std::getline(ov, line)) {
-                if (line.empty() || line[0] == '#') continue;
-                auto eq = line.find('=');
-                if (eq == std::string::npos || eq == 0) continue;
-                std::string k = line.substr(0, eq);
-                std::string v = line.substr(eq + 1);
-                if (!v.empty() && v.back() == '\r') v.pop_back();
-                bool found = false;
-                for (auto& kv : propOverrides) {
-                    if (kv.first == k) { kv.second = v; found = true; break; }
-                }
-                if (!found) propOverrides.emplace_back(std::move(k), std::move(v));
-            }
+        // Populate sysfs mountpoint skeleton so `ls /sys` and `ls /sys/class` enumerate cleanly.
+        for (const char* sysSub : {
+                 "/sys/class/power_supply", "/sys/class/thermal", "/sys/class/net",
+                 "/sys/devices/system/cpu", "/sys/fs/cgroup", "/sys/fs/bpf", "/sys/power" }) {
+            MkdirP(injectLayer_ + sysSub);
         }
-        const char* propRelPaths[] = {
-            "system/etc/prop.default",
-            "default.prop",
-            "system/build.prop",
-            "system/system_ext/etc/build.prop",
-            "system/product/etc/build.prop",
-            "vendor/build.prop",
-            "vendor/default.prop",
-            "vendor/odm/etc/build.prop",
-        };
-        for (const char* rel : propRelPaths) {
-            std::string src = rootfs_ + "/" + rel;
-            if (!FileExists(src)) continue;
-            std::string dst = injectLayer_ + "/" + rel;
-            auto slash = dst.rfind('/');
-            if (slash != std::string::npos) MkdirP(dst.substr(0, slash));
-            std::ifstream in(src);
-            std::string outBuf;
-            std::string line;
-            while (std::getline(in, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (!line.empty() && line[0] != '#') {
-                    auto eq = line.find('=');
-                    if (eq != std::string::npos && eq > 0) {
-                        std::string k = line.substr(0, eq);
-                        for (const auto& kv : propOverrides) {
-                            if (kv.first == k) {
-                                line = k + "=" + kv.second;
-                                break;
-                            }
-                        }
-                    }
-                }
-                outBuf += line;
-                outBuf.push_back('\n');
-            }
-            WriteFile(dst, outBuf);
-            chmod(dst.c_str(), 0644);
-        }
+
+        // Cleanly mark Bluetooth unavailable because stock rootfs14 bluetooth@1.1-service.sim
+        // has an upstream Redroid14 Address::FromString ABI mismatch that unconditionally SIGABRTs
+        // inside initialize_impl(), causing repeated com.android.bluetooth boot crash loops.
+        MkdirP(injectLayer_ + "/vendor/etc/permissions");
+        WriteFile(injectLayer_ + "/vendor/etc/permissions/redroid-removed-permissions.xml",
+                  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                  "<permissions>\n"
+                  "    <unavailable-feature name=\"android.hardware.bluetooth\" />\n"
+                  "    <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n"
+                  "</permissions>\n");
+        chmod((injectLayer_ + "/vendor/etc/permissions/redroid-removed-permissions.xml").c_str(), 0644);
 
         MkdirP(injectLayer_ + "/system/usr/idc");
         const std::string idcDst = injectLayer_ + "/system/usr/idc/svbox-touchscreen.idc";
@@ -3156,8 +3307,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             const std::string wvFlags = dataBase_ + "/data/local/tmp/webview-command-line";
             unlink(wvFlags.c_str());
         }
-        // Native Android 14 64-bit adbd on TCP 127.0.0.1:5555
-        if (FileExists(rootfs_ + "/system/apex/com.android.adbd/bin/adbd")) {
+        // Native Android 14 64-bit adbd on TCP 127.0.0.1:5555 (only when root/debug is enabled)
+        if (allowRoot && FileExists(rootfs_ + "/system/apex/com.android.adbd/bin/adbd")) {
             int adbdFd = MakeListenUnix(sockDir + "/adbd", SOCK_SEQPACKET, 0666);
             if (adbdFd >= 0) {
                 std::lock_guard<std::mutex> lk(procMu_);
@@ -3190,6 +3341,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
         launchPaced("idmap2d", { "-e", sfLdPath, "system/bin/idmap2d" });
+        if (FileExists(rootfs_ + "/system/bin/gpuservice")) {
+            launchPaced("gpuservice", { "-e", sfLdPath, "system/bin/gpuservice" });
+        }
         if (FileExists(rootfs_ + "/system/bin/keystore2")) {
             launchPaced("keystore2", { "-e", sfLdPath, "system/bin/keystore2", "/data/misc/keystore" });
         }
@@ -3209,7 +3363,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         if (FileExists(rootfs_ + "/vendor/bin/hw/android.hardware.thermal@2.0-service.mock")) {
             launchPaced("thermal", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.thermal@2.0-service.mock" });
         }
-        launchPaced("bt", { "-e", sfLdPath, "vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim" });
+        // Note: stock vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim has an upstream
+        // compile-time ABI bug in initialize_impl() (optional<Address> offset 16 vs 32) causing
+        // unconditional SIGABRT; Bluetooth feature is cleanly declared unavailable above.
         launchPaced("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
         if (!SleepCancelableMs(40)) return;
 
@@ -3258,12 +3414,23 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             }
         }
         const std::string wmSockCopy = ipcDir + "/wm_agent.sock";
-        std::thread([this, targetHz, hasWmAgent, wmSockCopy, logDir]() {
+        std::thread([this, targetHz, allowRoot, hasWmAgent, wmSockCopy, logDir]() {
             // Wait ~8s for system_server + PackageManager + DisplayManager to come online, then start wm_agent
             for (int i = 0; i < 16 && running_.load(); ++i) {
                 if (!SleepCancelableMs(500)) return;
             }
             if (!running_.load()) return;
+
+            if (!allowRoot && running_.load()) {
+                std::vector<std::string> setArgv = BaseSvboxArgs();
+                setArgv.push_back("--");
+                setArgv.push_back("system/bin/sh");
+                setArgv.push_back("-c");
+                setArgv.push_back(
+                    "settings put global adb_enabled 0; "
+                    "settings put global development_settings_enabled 0");
+                Spawn(setArgv, true);
+            }
 
             if (hasWmAgent) {
                 std::vector<std::string> wmArgv = BaseSvboxArgs();

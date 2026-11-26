@@ -421,6 +421,8 @@ int main(int argc, char **argv)
 
     /* Defaults before loading partition props and override.prop */
     set_property("ro.hardware.egl", "swiftshader");
+    set_property("ro.boot.hardware", "redroid");
+    set_property("ro.hardware", "redroid");
     set_property("ro.debuggable", "1");
     set_property("ro.secure", "0");
 
@@ -436,8 +438,6 @@ int main(int argc, char **argv)
     set_property("ro.product.cpu.abilist32", "");
     set_property("ro.dalvik.vm.native.bridge", "0");
     set_property("ro.crypto.state", "unsupported");
-    set_property("ro.boot.hardware", "redroid");
-    set_property("ro.hardware", "redroid");
     set_property("sys.boot_completed", "0");
 
     if (!sock_path)

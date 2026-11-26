@@ -1742,7 +1742,12 @@ static void handle_conn_event(struct conn_entry *ce)
             send_reply(ce->fd, VDEV_OP_OPEN, 0, -ENOMEM, NULL, 0, NULL, 0);
             break;
         }
-        int mfd = (int)syscall(SYS_memfd_create, "svbox-binder", MFD_CLOEXEC);
+        req.guest_path[sizeof(req.guest_path) - 1] = '\0';
+        const char *gbase = strrchr(req.guest_path, '/');
+        gbase = (gbase && gbase[1]) ? (gbase + 1) : "binder";
+        char mname[48];
+        snprintf(mname, sizeof(mname), "vdev-%s", gbase);
+        int mfd = (int)syscall(SYS_memfd_create, mname, MFD_CLOEXEC);
         if (mfd < 0 || ftruncate(mfd, PROC_MEM_SIZE) != 0) {
             if (mfd >= 0) close(mfd);
             send_reply(ce->fd, VDEV_OP_OPEN, 0, -ENOMEM, NULL, 0, NULL, 0);

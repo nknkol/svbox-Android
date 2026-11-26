@@ -73,14 +73,14 @@ public:
     hwc2_device_t base{};
 
     RanchuHwc2Device() {
-        width_ = readIntProp("ro.boot.redroid_width", 720);
-        height_ = readIntProp("ro.boot.redroid_height", 1280);
-        int reqFps = readIntProp("ro.boot.redroid_fps", 60);
+        width_ = readIntProp("ro.sf.display.width", readIntProp("ro.boot.redroid_width", 720));
+        height_ = readIntProp("ro.sf.display.height", readIntProp("ro.boot.redroid_height", 1280));
+        int reqFps = readIntProp("ro.sf.display.fps", readIntProp("ro.boot.redroid_fps", 60));
         hwc2_config_t initCfg = configForFps(reqFps);
         activeConfig_.store(initCfg);
         fps_.store(kConfigFps[initCfg]);
         vsyncPeriodNs_.store(kConfigVsyncNs[initCfg]);
-        dpi_ = readIntProp("ro.boot.redroid_dpi", readIntProp("ro.sf.lcd_density", 320));
+        dpi_ = readIntProp("ro.sf.lcd_density", readIntProp("ro.boot.redroid_dpi", 320));
 
         ALOGI("RanchuHwc2Device init: %dx%d @ %dHz (cfg=%u, %d dpi, vsyncPeriod=%lld ns, modes=60/90/120Hz)",
               width_, height_, fps_.load(), initCfg, dpi_,
