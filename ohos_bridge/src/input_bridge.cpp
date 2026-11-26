@@ -841,6 +841,10 @@ void InputBridge::InjectTouchForDisplay(int displaySlot, int32_t fingerId, int a
     int32_t* slotFinger = slotFinger_;
     int32_t* slotTrack = slotTrack_;
     int32_t* nextTid = &nextTrackingId_;
+    bool* mouseLeftDownPtr = &mouseLeftDown_;
+    int64_t* lastMouseDownUsPtr = &lastMouseDownUs_;
+    int* lastMouseAxPtr = &lastMouseAx_;
+    int* lastMouseAyPtr = &lastMouseAy_;
     int ax = 0;
     int ay = 0;
 
@@ -855,15 +859,27 @@ void InputBridge::InjectTouchForDisplay(int displaySlot, int32_t fingerId, int a
         slotFinger = st.slotFinger;
         slotTrack = st.slotTrack;
         nextTid = &st.nextTrackingId;
+        mouseLeftDownPtr = &st.mouseLeftDown;
+        lastMouseDownUsPtr = &st.lastMouseDownUs;
+        lastMouseAxPtr = &st.lastMouseAx;
+        lastMouseAyPtr = &st.lastMouseAy;
         ax = MapSecondaryCoord(x, st.surfaceW.load());
         ay = MapSecondaryCoord(y, st.surfaceH.load());
     }
 
     struct timeval tv = NowMonotonicTv();
+    int64_t nowUs = static_cast<int64_t>(tv.tv_sec) * 1000000LL + static_cast<int64_t>(tv.tv_usec);
     std::vector<struct input_event> evs;
     evs.reserve(10);
 
     std::lock_guard<std::mutex> lk(*stateMu);
+    // Drop synthetic touch DOWN duplicated alongside an active mouse click at the same coordinate
+    // so Chromium/WebView does not misclassify a single mouse click as a 2-finger pinch gesture.
+    if (fingerId != 9000 && action == 0 && *mouseLeftDownPtr &&
+        (nowUs - *lastMouseDownUsPtr) >= 0 && (nowUs - *lastMouseDownUsPtr) < 40000 &&
+        std::abs(ax - *lastMouseAxPtr) <= 6 && std::abs(ay - *lastMouseAyPtr) <= 6) {
+        return;
+    }
     int slot = -1;
     int activeBefore = 0;
     for (int i = 0; i < 10; ++i) {
@@ -933,11 +949,23 @@ void InputBridge::InjectMouseForDisplay(int displaySlot, int action, int button,
     }
     std::mutex* stateMu = (displaySlot == 0) ? &touchStateMu_ : &secondaryTouchState_[displaySlot - 1].mu;
     bool* leftDown = (displaySlot == 0) ? &mouseLeftDown_ : &secondaryTouchState_[displaySlot - 1].mouseLeftDown;
+    int64_t* lastDownUs = (displaySlot == 0) ? &lastMouseDownUs_ : &secondaryTouchState_[displaySlot - 1].lastMouseDownUs;
+    int* lastAx = (displaySlot == 0) ? &lastMouseAx_ : &secondaryTouchState_[displaySlot - 1].lastMouseAx;
+    int* lastAy = (displaySlot == 0) ? &lastMouseAy_ : &secondaryTouchState_[displaySlot - 1].lastMouseAy;
 
     if (action == 1 && button == 1) {
+        struct timeval tv = NowMonotonicTv();
+        int64_t nowUs = static_cast<int64_t>(tv.tv_sec) * 1000000LL + static_cast<int64_t>(tv.tv_usec);
+        int ax = (displaySlot == 0) ? MapCoordX(x)
+                                    : MapSecondaryCoord(x, secondaryTouchState_[displaySlot - 1].surfaceW.load());
+        int ay = (displaySlot == 0) ? MapCoordY(y)
+                                    : MapSecondaryCoord(y, secondaryTouchState_[displaySlot - 1].surfaceH.load());
         {
             std::lock_guard<std::mutex> lk(*stateMu);
             *leftDown = true;
+            *lastDownUs = nowUs;
+            *lastAx = ax;
+            *lastAy = ay;
         }
         InjectTouchForDisplay(displaySlot, kMouseFingerId, 0, x, y);
     } else if (action == 3) {

@@ -23,6 +23,15 @@ export const DEVICE_MODEL_PRESETS: DeviceModelPreset[] = [
   { label: 'ROG Phone 8', brand: 'asus', model: 'ASUS_AI2401' },
 ];
 
+export const DISK_SIZE_OPTIONS_GB: number[] = [8, 16, 32, 64, 128];
+
+export function normalizeDiskLimitGb(gb: number | undefined): number {
+  if (gb === 8 || gb === 16 || gb === 32 || gb === 64 || gb === 128) {
+    return gb;
+  }
+  return 64;
+}
+
 export interface DeviceInstance {
   id: string;
   index: number;
@@ -41,6 +50,7 @@ export interface DeviceInstance {
   profile: string;         // 'Performance' | 'Balanced' | 'Eco'
   cpuCores: number;        // 2 | 4 | 6 | 8
   memLimitMb: number;      // 2048 | 4096 | 6144 | 8192
+  diskLimitGb: number;     // 8 | 16 | 32 | 64 | 128
   scenario: string;        // 'normal' | 'extreme' | 'performance'
   compactDisk: boolean;
   enableAudio: boolean;
@@ -65,6 +75,7 @@ export interface CreateInstanceOptions {
   gpuMode: string;
   refreshRate: number;
   runMode: string;
+  diskLimitGb?: number;
 }
 
 export interface GlobalSettings {
@@ -113,6 +124,7 @@ export function cloneInstanceRecord(src: DeviceInstance): DeviceInstance {
     profile: src.profile,
     cpuCores: src.cpuCores,
     memLimitMb: src.memLimitMb,
+    diskLimitGb: normalizeDiskLimitGb(src.diskLimitGb),
     scenario: src.scenario,
     compactDisk: src.compactDisk,
     enableAudio: src.enableAudio,
@@ -198,6 +210,7 @@ class InstanceManagerStore {
       profile: legacy.profile,
       cpuCores: profileToCpuCores(legacy.profile),
       memLimitMb: 4096,
+      diskLimitGb: 64,
       scenario: 'normal',
       compactDisk: false,
       enableAudio: true,
@@ -353,6 +366,7 @@ class InstanceManagerStore {
         profile: profile,
         cpuCores: cpuCores,
         memLimitMb: memMb,
+        diskLimitGb: normalizeDiskLimitGb(opts.diskLimitGb),
         scenario: opts.scenario,
         compactDisk: opts.compactDisk,
         enableAudio: true,

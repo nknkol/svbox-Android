@@ -29,7 +29,8 @@ public:
 
     void SetResourceConfig(const std::string& profile,
                            const std::string& customCpuset,
-                           uint32_t memLimitMb);
+                           uint32_t memLimitMb,
+                           uint32_t diskLimitGb = 0);
     void SetInstanceConfig(const std::string& instanceId,
                            const std::string& dataSubdir,
                            int32_t customDpi,
@@ -76,10 +77,12 @@ public:
     std::string Profile() const;
     std::string ActiveCpuset() const;
     uint32_t MemLimitMb() const { return memLimitMb_.load(); }
+    uint32_t DiskLimitGb() const { return diskLimitGb_.load(); }
     SchedQos::Telemetry GetTelemetry();
 
 private:
     AndroidRuntime() = default;
+    void FlushGuestStateBeforeStop();
     void BootWorker(std::string mode, int32_t width, int32_t height);
     void LmkdLoop(std::string sockPath);
     void LogdwLoop(std::string sockPath, std::string outPath);
@@ -117,7 +120,10 @@ private:
     int32_t activeNice_ = 0x7fffffff;
     std::string activeSched_;
     std::atomic<uint32_t> memLimitMb_{4096};
-    std::atomic<uint32_t> diskLimitMb_{32768};
+    std::atomic<uint32_t> diskLimitGb_{64};
+    std::atomic<uint32_t> diskLimitMb_{59100};
+    std::atomic<uint32_t> rootDiskMb_{1900};
+    std::atomic<uint32_t> diskUsedMb_{0};
     std::atomic<int32_t> refreshRate_{60};
     std::atomic<int32_t> displayW_{720};
     std::atomic<int32_t> displayH_{1280};

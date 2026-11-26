@@ -80,6 +80,9 @@ private:
         std::atomic<int32_t> surfaceW{720};
         std::atomic<int32_t> surfaceH{1280};
         bool mouseLeftDown = false;
+        int64_t lastMouseDownUs = 0;
+        int lastMouseAx = -1;
+        int lastMouseAy = -1;
         int32_t nextTrackingId = 1;
         int32_t slotFinger[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
         int32_t slotTrack[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
@@ -117,6 +120,9 @@ private:
 
     std::mutex touchStateMu_;
     bool mouseLeftDown_ = false;
+    int64_t lastMouseDownUs_ = 0;
+    int lastMouseAx_ = -1;
+    int lastMouseAy_ = -1;
     int32_t nextTrackingId_ = 1;
     int32_t slotFinger_[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
     int32_t slotTrack_[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };

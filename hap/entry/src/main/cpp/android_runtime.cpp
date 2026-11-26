@@ -1029,14 +1029,70 @@ std::string AndroidRuntime::ActiveCpuset() const {
     return activeCpuset_;
 }
 
+static uint32_t NormalizeDiskTierGb(uint32_t gb) {
+    if (gb == 8 || gb == 16 || gb == 32 || gb == 64 || gb == 128) return gb;
+    return 64;
+}
+
+static uint32_t TierGbToDataDiskMb(uint32_t gb) {
+    // Android StorageManagerService rounds (statfs("/system").total + statfs("/data").total)
+    // up to the next decimal power-of-2 GB (8/16/32/64/128 GB). With root_disk_mb = 1900 MiB
+    // (~1.992 GB), these MiB caps sit just under each decimal GB boundary so Android reports
+    // exact total capacity and realistic ~2 GB System overhead.
+    switch (NormalizeDiskTierGb(gb)) {
+        case 8:   return 5720;   // 1.992 + 5.998 = 7.990 GB -> 8 GB
+        case 16:  return 13350;  // 1.992 + 13.998 = 15.991 GB -> 16 GB
+        case 32:  return 28600;  // 1.992 + 29.989 = 31.982 GB -> 32 GB
+        case 128: return 120150; // 1.992 + 125.986 = 127.979 GB -> 128 GB
+        case 64:
+        default:  return 59100;  // 1.992 + 61.971 = 63.963 GB -> 64 GB
+    }
+}
+
+static uint64_t SumDirBytesQuick(const std::string& root) {
+    uint64_t total = 0;
+    std::vector<std::string> stack;
+    stack.push_back(root);
+    while (!stack.empty()) {
+        std::string cur = std::move(stack.back());
+        stack.pop_back();
+        DIR* dp = opendir(cur.c_str());
+        if (!dp) continue;
+        struct dirent* de = nullptr;
+        while ((de = readdir(dp)) != nullptr) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+                continue;
+            }
+            std::string child = cur + "/" + de->d_name;
+            struct stat st = {};
+            if (lstat(child.c_str(), &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                stack.push_back(std::move(child));
+            } else if (S_ISREG(st.st_mode)) {
+                total += static_cast<uint64_t>(st.st_size);
+            }
+        }
+        closedir(dp);
+    }
+    return total;
+}
+
 void AndroidRuntime::SetResourceConfig(const std::string& profile,
                                        const std::string& customCpuset,
-                                       uint32_t memLimitMb) {
+                                       uint32_t memLimitMb,
+                                       uint32_t diskLimitGb) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!profile.empty()) profile_ = profile;
     customCpuset_ = customCpuset;
     if (memLimitMb >= 512 && memLimitMb <= 32768) {
         memLimitMb_.store(memLimitMb);
+    }
+    if (diskLimitGb > 0) {
+        uint32_t tier = NormalizeDiskTierGb(diskLimitGb);
+        diskLimitGb_.store(tier);
+        diskLimitMb_.store(TierGbToDataDiskMb(tier));
+        rootDiskMb_.store(1900);
     }
 }
 
@@ -1382,6 +1438,8 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
     }
     uint32_t memMb = memLimitMb_.load();
     uint32_t diskMb = diskLimitMb_.load();
+    uint32_t rootDiskMb = rootDiskMb_.load();
+    uint32_t diskUsedMb = diskUsedMb_.load();
 
     std::vector<std::string> args = {
         svboxPath_,
@@ -1424,9 +1482,17 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         args.push_back("--mem-mb");
         args.push_back(std::to_string(memMb));
     }
+    if (rootDiskMb > 0) {
+        args.push_back("--root-disk-mb");
+        args.push_back(std::to_string(rootDiskMb));
+    }
     if (diskMb > 0) {
         args.push_back("--disk-mb");
         args.push_back(std::to_string(diskMb));
+    }
+    if (diskUsedMb > 0) {
+        args.push_back("--disk-used-mb");
+        args.push_back(std::to_string(diskUsedMb));
     }
     if (niceVal != 0x7fffffff) {
         args.push_back("--nice");
@@ -2512,6 +2578,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/data/misc/keystore",
         "/data/misc/gatekeeper", "/data/misc/installd", "/data/misc/user/0",
         "/data/misc/media", "/data/misc/credstore", "/data/misc/ethernet",
+        "/data/misc/shared_relro",
         "/data/misc/bluetooth", "/data/misc/bluetooth/logs", "/data/misc/bluedroid",
         "/data/misc_ce/0", "/data/misc_de/0", "/data/vendor_ce/0", "/data/vendor_de/0",
         "/data/media/0", "/data/media/0/Download", "/data/media/0/Download/HarmonyShare",
@@ -2529,8 +2596,27 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     for (const char* sub : dataDirs) {
         MkdirP(dataBase_ + sub);
     }
+    chmod((dataBase_ + "/data/misc/shared_relro").c_str(), 01777);
     if (!shareHostDir_.empty()) {
         MkdirP(shareHostDir_);
+    }
+
+    // Measure actual /data usage on host so svbox --disk-used-mb reflects real storage consumption
+    // and supports lossless tier resizing across 8/16/32/64/128 GB without formatting userdata.
+    {
+        uint32_t tierGb = NormalizeDiskTierGb(diskLimitGb_.load());
+        uint32_t dataCapMb = TierGbToDataDiskMb(tierGb);
+        diskLimitMb_.store(dataCapMb);
+        rootDiskMb_.store(1900);
+        uint64_t usedBytes = SumDirBytesQuick(dataBase_ + "/data");
+        uint32_t usedMb = static_cast<uint32_t>(usedBytes / (1024ULL * 1024ULL));
+        // Always leave at least 256 MiB logical headroom so Android never fails boot on a tight tier.
+        if (dataCapMb > 256 && usedMb + 256 > dataCapMb) {
+            usedMb = dataCapMb - 256;
+        }
+        diskUsedMb_.store(usedMb);
+        OH_LOG_INFO(LOG_APP, "Storage tier=%uGB (root=1900MiB, data=%uMiB, used=%uMiB)",
+                    tierGb, dataCapMb, usedMb);
     }
 
     EnsureOwnerDb(dataBase_ + "/owner.db");
@@ -2653,8 +2739,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     }
     const std::string buildType = allowRoot ? "userdebug" : "user";
     const std::string buildTags = allowRoot ? "test-keys" : "release-keys";
-    const std::string effBrand = devBrandSnap.empty() ? "Android" : devBrandSnap;
-    const std::string effModel = devModelSnap.empty() ? "SVBox14" : devModelSnap;
+    const std::string effBrand = devBrandSnap.empty() ? "HUAWEI" : devBrandSnap;
+    const std::string effModel = devModelSnap.empty() ? "ALN-AL00" : devModelSnap;
     std::string effDevice;
     for (char c : effModel) {
         if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
@@ -2663,7 +2749,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             effDevice.push_back(static_cast<char>(c - 'A' + 'a'));
         }
     }
-    if (effDevice.empty()) effDevice = "svbox14";
+    if (effDevice.empty()) effDevice = "aln";
     const std::string buildInc = "11842670";
     const std::string buildFp = effBrand + "/" + effDevice + "/" + effDevice +
                                 ":14/UD2A.240505.001.W1/" + buildInc + ":" + buildType + "/" + buildTags;
@@ -2954,8 +3040,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
     }
 
-    // 1. Start propd (load sanitized partition build.props + override.prop)
-    std::vector<std::string> propArgs = { propd, "--dir", propDir, "--sock", sockDir + "/property_service" };
+    // 1. Start propd (load sanitized partition build.props + persisted persist.* + override.prop)
+    std::vector<std::string> propArgs = {
+        propd, "--dir", propDir, "--sock", sockDir + "/property_service",
+        "--persist", dataBase_ + "/persist.prop"
+    };
     for (const char* rel : propRelPaths) {
         std::string staged = injectLayer_ + "/" + rel;
         if (FileExists(staged)) propArgs.push_back(staged);
@@ -3531,7 +3620,69 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     logLine("AndroidRuntime started (mode=" + mode + ", procs=" + std::to_string(procCount) + ")");
 }
 
+void AndroidRuntime::FlushGuestStateBeforeStop() {
+    if (!running_.load()) return;
+    const std::string binderSock = runBase_ + "/sockets/binder.sock";
+    if (svboxPath_.empty() || runBase_.empty() || !FileExists(binderSock)) return;
+
+    // Wake paused processes first so system_server can handle synchronous flush IPCs.
+    if (paused_.load()) {
+        std::lock_guard<std::mutex> lk(procMu_);
+        for (pid_t p : pids_) {
+            if (p > 0) {
+                kill(-p, SIGCONT);
+                kill(p, SIGCONT);
+            }
+        }
+    }
+
+    // Flush Android AppOps (which otherwise delays writing /data/system/appops.xml by 10s,
+    // losing "Allow installing unknown apps" / OP_REQUEST_INSTALL_PACKAGES across reboots)
+    // and sync dirty buffers to host storage within a strict 1.5s budget.
+    std::vector<std::string> argv = BaseSvboxArgs();
+    argv.push_back("--");
+    argv.push_back("system/bin/sh");
+    argv.push_back("-c");
+    argv.push_back("/system/bin/cmd appops write-settings >/dev/null 2>&1; /system/bin/sync");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (auto& s : argv) cargv.push_back(s.data());
+        cargv.push_back(nullptr);
+        execv(cargv[0], cargv.data());
+        _exit(127);
+    }
+    if (pid < 0) return;
+
+    int st = 0;
+    bool done = false;
+    for (int waitedMs = 0; waitedMs < 1500; waitedMs += 25) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid || r < 0) {
+            done = true;
+            break;
+        }
+        usleep(25000);
+    }
+    if (!done) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+    }
+}
+
 std::string AndroidRuntime::Stop() {
+    FlushGuestStateBeforeStop();
     running_.store(false);
     paused_.store(false);
     wmAgentReady_.store(false);
@@ -3554,7 +3705,18 @@ std::string AndroidRuntime::Stop() {
             }
         }
         if (!pidsCopy.empty()) {
-            usleep(60000);
+            for (int waited = 0; waited < 250; waited += 25) {
+                bool anyAlive = false;
+                for (pid_t p : pidsCopy) {
+                    if (p <= 0) continue;
+                    int st = 0;
+                    if (waitpid(p, &st, WNOHANG) == 0) {
+                        anyAlive = true;
+                    }
+                }
+                if (!anyAlive) break;
+                usleep(25000);
+            }
         }
         for (auto it = pidsCopy.rbegin(); it != pidsCopy.rend(); ++it) {
             if (*it > 0) {

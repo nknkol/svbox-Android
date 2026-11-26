@@ -148,6 +148,22 @@ void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
     if (OH_NativeXComponent_GetTouchEvent(component, window, &ev) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
         return;
     }
+    // On HarmonyOS PC, ArkUI delivers mouse clicks to BOTH DispatchMouseEventCB and
+    // DispatchTouchEventCB (with SOURCE_TYPE_MOUSE / TOOL_TYPE_MOUSE). Drop mouse-originated
+    // touch events here so Chromium/WebView sees a clean single-pointer tap instead of a
+    // simultaneous 2-finger pinch that cancels clicks.
+    OH_NativeXComponent_EventSourceType srcType = OH_NATIVEXCOMPONENT_SOURCE_TYPE_UNKNOWN;
+    if (OH_NativeXComponent_GetTouchEventSourceType(component, ev.id, &srcType) ==
+            OH_NATIVEXCOMPONENT_RESULT_SUCCESS &&
+        srcType == OH_NATIVEXCOMPONENT_SOURCE_TYPE_MOUSE) {
+        return;
+    }
+    OH_NativeXComponent_TouchPointToolType toolType = OH_NATIVEXCOMPONENT_TOOL_TYPE_UNKNOWN;
+    if (OH_NativeXComponent_GetTouchPointToolType(component, 0, &toolType) ==
+            OH_NATIVEXCOMPONENT_RESULT_SUCCESS &&
+        toolType == OH_NATIVEXCOMPONENT_TOOL_TYPE_MOUSE) {
+        return;
+    }
     int action = 1;
     switch (ev.type) {
         case OH_NATIVEXCOMPONENT_DOWN: action = 0; break;
@@ -277,13 +293,17 @@ napi_value SendScrollNapi(napi_env env, napi_callback_info info) {
 }
 
 napi_value SetResourceConfigNapi(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3] = {};
+    size_t argc = 4;
+    napi_value args[4] = {};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     std::string profile = argc > 0 ? GetStringArg(env, args[0]) : "perf";
     std::string cpuset = argc > 1 ? GetStringArg(env, args[1]) : "";
     int32_t memMb = argc > 2 ? GetInt32Arg(env, args[2], 4096) : 4096;
-    AndroidRuntime::Instance().SetResourceConfig(profile, cpuset, static_cast<uint32_t>(memMb > 0 ? memMb : 4096));
+    int32_t diskGb = argc > 3 ? GetInt32Arg(env, args[3], 0) : 0;
+    AndroidRuntime::Instance().SetResourceConfig(
+        profile, cpuset,
+        static_cast<uint32_t>(memMb > 0 ? memMb : 4096),
+        static_cast<uint32_t>(diskGb > 0 ? diskGb : 0));
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;

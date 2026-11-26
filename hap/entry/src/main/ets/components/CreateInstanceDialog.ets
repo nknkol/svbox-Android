@@ -7,7 +7,7 @@ import {
   Radius,
   Spacing
 } from '../common/DesignTokens';
-import { CreateInstanceOptions } from '../model/InstanceModel';
+import { CreateInstanceOptions, DISK_SIZE_OPTIONS_GB } from '../model/InstanceModel';
 
 @Component
 export struct CreateInstanceSheet {
@@ -21,6 +21,7 @@ export struct CreateInstanceSheet {
   @State private gpuMode: string = 'vulkan';
   @State private refreshRate: number = 120;
   @State private runMode: string = 'emulator';
+  @State private diskLimitGb: number = 64;
   @State private compactDisk: boolean = false;
   @State private namePrefix: string = '';
 
@@ -437,6 +438,24 @@ export struct CreateInstanceSheet {
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
+
+            Row({ space: Spacing.MD }) {
+              Text('存储空间')
+                .fontSize(FontSize.BODY_MD)
+                .fontColor($r('sys.color.font_secondary'))
+                .width(64)
+              Flex({
+                wrap: FlexWrap.Wrap,
+                space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+              }) {
+                ForEach(DISK_SIZE_OPTIONS_GB, (gb: number) => {
+                  this.segmentChip(`${gb} GB`, this.diskLimitGb === gb, () => { this.diskLimitGb = gb; })
+                }, (gb: number) => `create_disk_${gb}`)
+              }
+              .layoutWeight(1)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
           }
           .width('100%')
           .padding(Spacing.LG)
@@ -521,6 +540,7 @@ export struct CreateInstanceSheet {
               gpuMode: this.gpuMode,
               refreshRate: this.refreshRate,
               runMode: this.runMode,
+              diskLimitGb: this.diskLimitGb,
             });
           })
       }

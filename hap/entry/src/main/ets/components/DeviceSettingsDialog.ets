@@ -20,9 +20,11 @@ import {
   DEVICE_MODEL_PRESETS,
   DeviceInstance,
   DeviceModelPreset,
+  DISK_SIZE_OPTIONS_GB,
   formatDiskSize,
   formatGpuModeLabel,
   formatSyscallModeLabel,
+  normalizeDiskLimitGb,
   normalizeSyscallMode,
   profileToCpuCores
 } from '../model/InstanceModel';
@@ -65,6 +67,7 @@ export struct DeviceSettingsSheet {
   @State private draftProfile: string = 'Balanced';
   @State private draftCpuCores: number = 4;
   @State private draftMemMb: number = 4096;
+  @State private draftDiskLimitGb: number = 64;
   @State private draftGpuMode: string = 'vulkan';
   @State private draftSyscallMode: string = 'adaptive';
   @State private draftRefreshRate: number = 120;
@@ -105,6 +108,7 @@ export struct DeviceSettingsSheet {
       this.draftProfile = this.instance.profile;
       this.draftCpuCores = this.instance.cpuCores;
       this.draftMemMb = this.instance.memLimitMb;
+      this.draftDiskLimitGb = normalizeDiskLimitGb(this.instance.diskLimitGb);
       this.draftGpuMode = this.instance.gpuMode;
       this.draftSyscallMode = normalizeSyscallMode(this.instance.syscallMode);
       this.draftRefreshRate = this.instance.refreshRate;
@@ -176,6 +180,7 @@ export struct DeviceSettingsSheet {
       this.draftProfile = 'Balanced';
       this.draftCpuCores = 4;
       this.draftMemMb = 4096;
+      this.draftDiskLimitGb = 64;
       this.draftGpuMode = 'vulkan';
       this.draftSyscallMode = 'adaptive';
       this.draftRefreshRate = 120;
@@ -206,6 +211,7 @@ export struct DeviceSettingsSheet {
     next.profile = this.draftProfile;
     next.cpuCores = this.draftCpuCores;
     next.memLimitMb = this.draftMemMb;
+    next.diskLimitGb = normalizeDiskLimitGb(this.draftDiskLimitGb);
     next.gpuMode = this.draftGpuMode;
     next.syscallMode = normalizeSyscallMode(this.draftSyscallMode);
     next.refreshRate = this.draftRefreshRate;
@@ -611,6 +617,13 @@ export struct DeviceSettingsSheet {
     .width('100%')
   }
 
+  private isDiskTierAllowed(gb: number): boolean {
+    const usedGb: number = this.diskUsageMb / 1024.0;
+    // System occupies ~2 GB; keep at least 0.5 GB free headroom above actual userdata usage.
+    const usableDataGb: number = gb - 2.0;
+    return usedGb <= 0.1 || usableDataGb >= usedGb + 0.5;
+  }
+
   @Builder
   private diskTabBody() {
     Column({ space: Spacing.MD }) {
@@ -628,12 +641,79 @@ export struct DeviceSettingsSheet {
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
-          Text(formatDiskSize(this.diskUsageMb))
-            .fontSize(FontSize.TITLE_LG)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('sys.color.font_emphasize'))
+          Column({ space: 2 }) {
+            Text(`${formatDiskSize(this.diskUsageMb)} / ${this.draftDiskLimitGb} GB`)
+              .fontSize(FontSize.TITLE_MD)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('sys.color.font_emphasize'))
+            Text(`虚拟可用上限约 ${Math.max(1, this.draftDiskLimitGb - 2)} GB`)
+              .fontSize(FontSize.MICRO)
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .alignItems(HorizontalAlign.End)
         }
         .width('100%')
+
+        Divider().color($r('sys.color.comp_divider')).opacity(0.35)
+
+        Column({ space: Spacing.SM }) {
+          Row({ space: Spacing.SM }) {
+            Text('存储空间容量')
+              .fontSize(FontSize.BODY_MD)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_primary'))
+            Text('支持无损扩容')
+              .fontSize(FontSize.MICRO)
+              .fontColor($r('sys.color.font_emphasize'))
+              .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+              .borderRadius(Radius.BADGE)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+
+          Flex({
+            wrap: FlexWrap.Wrap,
+            space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
+          }) {
+            ForEach(DISK_SIZE_OPTIONS_GB, (gb: number) => {
+              Button({ type: ButtonType.Normal }) {
+                Text(`${gb} GB`)
+                  .fontSize(FontSize.CAPTION)
+                  .fontWeight(this.draftDiskLimitGb === gb ? FontWeight.Medium : FontWeight.Normal)
+                  .fontColor(this.draftDiskLimitGb === gb ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
+              }
+              .height(ControlSize.BTN_SM)
+              .padding({ left: Spacing.MD, right: Spacing.MD })
+              .borderRadius(Radius.CAPSULE)
+              .backgroundColor(
+                this.draftDiskLimitGb === gb
+                  ? $r('sys.color.brand')
+                  : $r('sys.color.comp_background_tertiary')
+              )
+              .opacity(this.isDiskTierAllowed(gb) ? 1.0 : 0.45)
+              .hoverEffect(HoverEffect.Highlight)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+              .onClick(() => {
+                if (!this.isDiskTierAllowed(gb)) {
+                  const needGb: number = Math.ceil(this.diskUsageMb / 1024.0 + 2.5);
+                  this.onToast(`当前已用 ${formatDiskSize(this.diskUsageMb)}，请选择 ${needGb} GB 以上容量`);
+                  return;
+                }
+                this.animateOption(() => {
+                  this.draftDiskLimitGb = gb;
+                });
+              })
+            }, (gb: number) => `disk_tier_${gb}`)
+          }
+          .width('100%')
+
+          Text('无损调整目录式虚拟卷上限，保留全部应用与数据，不格式化存储（重启设备生效）。8 GB 中系统约占 2 GB，可用约 6 GB；日常推荐 32 GB / 64 GB。')
+            .fontSize(FontSize.MICRO)
+            .fontColor($r('sys.color.font_tertiary'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
 
         Divider().color($r('sys.color.comp_divider')).opacity(0.35)
 

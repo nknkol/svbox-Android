@@ -63,6 +63,82 @@ struct prop_info {
 static uint8_t *g_serial_area = NULL;
 static uint8_t *g_default_area = NULL;
 static bool g_verbose = false;
+static const char *g_persist_path = NULL;
+
+struct persist_kv {
+    char *name;
+    char *value;
+};
+static struct persist_kv *g_persist = NULL;
+static size_t g_persist_count = 0;
+static size_t g_persist_cap = 0;
+
+static void persist_record_mem(const char *name, const char *value)
+{
+    if (!name || strncmp(name, "persist.", 8) != 0 || !value)
+        return;
+    for (size_t i = 0; i < g_persist_count; i++) {
+        if (strcmp(g_persist[i].name, name) == 0) {
+            char *nv = strdup(value);
+            if (nv) {
+                free(g_persist[i].value);
+                g_persist[i].value = nv;
+            }
+            return;
+        }
+    }
+    if (g_persist_count == g_persist_cap) {
+        size_t ncap = g_persist_cap ? g_persist_cap * 2 : 32;
+        struct persist_kv *na = (struct persist_kv *)realloc(g_persist, ncap * sizeof(*na));
+        if (!na) return;
+        g_persist = na;
+        g_persist_cap = ncap;
+    }
+    char *nn = strdup(name);
+    char *nv = strdup(value);
+    if (!nn || !nv) {
+        free(nn);
+        free(nv);
+        return;
+    }
+    g_persist[g_persist_count].name = nn;
+    g_persist[g_persist_count].value = nv;
+    g_persist_count++;
+}
+
+static void persist_flush_disk(void)
+{
+    if (!g_persist_path || !g_persist_path[0])
+        return;
+    char tmp_path[528];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_persist_path);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(tmp_path);
+        return;
+    }
+    for (size_t i = 0; i < g_persist_count; i++) {
+        const char *k = g_persist[i].name;
+        const char *v = g_persist[i].value;
+        if (!k || !v) continue;
+        fputs(k, f);
+        fputc('=', f);
+        for (const char *p = v; *p; p++) {
+            if (*p != '\n' && *p != '\r')
+                fputc(*p, f);
+        }
+        fputc('\n', f);
+    }
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp_path, g_persist_path) != 0)
+        unlink(tmp_path);
+}
 
 static uint32_t align4(uint32_t n) { return (n + 3u) & ~3u; }
 
@@ -307,7 +383,7 @@ static int write_property_info_file(const char *path)
     return wn == (ssize_t)pos ? 0 : -1;
 }
 
-static void load_prop_file(const char *path)
+static void load_prop_file(const char *path, bool record_persist)
 {
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -330,6 +406,8 @@ static void load_prop_file(const char *path)
             *--kend = '\0';
         if (*s) {
             set_property(s, val);
+            if (record_persist && strncmp(s, "persist.", 8) == 0)
+                persist_record_mem(s, val);
             count++;
         }
     }
@@ -368,8 +446,12 @@ static void handle_prop_client(int cfd)
                 if (vlen == 0 || read_exact(cfd, val, vlen) == 0) {
                     name[nlen] = '\0';
                     val[vlen] = '\0';
-                    if (set_property(name, val) != 0)
+                    if (set_property(name, val) != 0) {
                         resp = 0x0804; /* error */
+                    } else if (strncmp(name, "persist.", 8) == 0) {
+                        persist_record_mem(name, val);
+                        persist_flush_disk();
+                    }
                 }
             }
         }
@@ -379,7 +461,10 @@ static void handle_prop_client(int cfd)
         if (read_exact(cfd, name, 32) == 0 && read_exact(cfd, val, 92) == 0) {
             name[31] = '\0';
             val[91] = '\0';
-            set_property(name, val);
+            if (set_property(name, val) == 0 && strncmp(name, "persist.", 8) == 0) {
+                persist_record_mem(name, val);
+                persist_flush_disk();
+            }
         }
     }
     close(cfd);
@@ -399,12 +484,14 @@ int main(int argc, char **argv)
             prop_dir = argv[++i];
         } else if (strcmp(argv[i], "--sock") == 0 && i + 1 < argc) {
             sock_path = argv[++i];
+        } else if (strcmp(argv[i], "--persist") == 0 && i + 1 < argc) {
+            g_persist_path = argv[++i];
         } else if (nfiles < 32) {
             prop_files[nfiles++] = argv[i];
         }
     }
     if (!prop_dir) {
-        fprintf(stderr, "Usage: %s [-v] --dir <__properties__-dir> [--sock <property_service.sock>] [file.prop ...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-v] --dir <__properties__-dir> [--sock <property_service.sock>] [--persist <persist.prop>] [file.prop ...]\n", argv[0]);
         return 1;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -421,13 +508,20 @@ int main(int argc, char **argv)
 
     /* Defaults before loading partition props and override.prop */
     set_property("ro.hardware.egl", "swiftshader");
-    set_property("ro.boot.hardware", "redroid");
-    set_property("ro.hardware", "redroid");
+    set_property("ro.boot.hardware", "arm64");
+    set_property("ro.hardware", "arm64");
     set_property("ro.debuggable", "1");
     set_property("ro.secure", "0");
 
-    for (int i = 0; i < nfiles; i++)
-        load_prop_file(prop_files[i]);
+    /* Load partition build.prop files first, then saved user persist.* props,
+     * then the final override.prop so container invariants remain enforced. */
+    int pre_count = (nfiles > 1) ? (nfiles - 1) : 0;
+    for (int i = 0; i < pre_count; i++)
+        load_prop_file(prop_files[i], false);
+    if (g_persist_path && g_persist_path[0])
+        load_prop_file(g_persist_path, true);
+    for (int i = pre_count; i < nfiles; i++)
+        load_prop_file(prop_files[i], false);
 
     /* Essential container overrides for Android on svbox */
     set_property("ro.property_service.version", "2");

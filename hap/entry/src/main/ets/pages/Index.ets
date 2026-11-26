@@ -240,6 +240,12 @@ struct Index {
         AppStorage.setOrCreate<string>('requestedSyscallMode', '');
         dirty = true;
       }
+      const reqDiskGb: number | undefined = AppStorage.get<number>('requestedDiskLimitGb');
+      if (reqDiskGb === 8 || reqDiskGb === 16 || reqDiskGb === 32 || reqDiskGb === 64 || reqDiskGb === 128) {
+        primary.diskLimitGb = reqDiskGb;
+        AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
+        dirty = true;
+      }
       if (dirty) {
         instanceManager.updateInstance(filesDir, primary);
         this.reloadInstances(false);
@@ -312,6 +318,11 @@ struct Index {
               reqSyscall === 'hybrid' || reqSyscall === 'inline') {
             target.syscallMode = reqSyscall;
             AppStorage.setOrCreate<string>('requestedSyscallMode', '');
+          }
+          const reqDiskGb: number | undefined = AppStorage.get<number>('requestedDiskLimitGb');
+          if (reqDiskGb === 8 || reqDiskGb === 16 || reqDiskGb === 32 || reqDiskGb === 64 || reqDiskGb === 128) {
+            target.diskLimitGb = reqDiskGb;
+            AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
           }
           instanceManager.updateInstance(this.getSandboxFilesDir(), target);
           this.reloadInstances(false);
@@ -498,7 +509,7 @@ struct Index {
         inst.deviceModel,
         inst.adbPort
       );
-      native.setResourceConfig(inst.profile, '', inst.memLimitMb);
+      native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb);
       native.setGpuMode(inst.gpuMode);
       native.setSyscallMode(inst.syscallMode || 'adaptive');
       native.setRefreshRate(inst.refreshRate);
@@ -882,16 +893,23 @@ struct Index {
       isInstanceRunning: this.editingInstance ? this.isInstanceRunning(this.editingInstance) : false,
       compactLayout: this.winWidthVp < 680,
       onSave: (updated: DeviceInstance) => {
+        const prevDiskGb: number = this.editingInstance ? this.editingInstance.diskLimitGb : updated.diskLimitGb;
         this.showDeviceSettingsSheet = false;
         instanceManager.updateInstance(this.getSandboxFilesDir(), updated);
         this.reloadInstances(true);
-        if (this.isInstanceRunning(updated)) {
+        const runningNow: boolean = this.isInstanceRunning(updated);
+        if (runningNow) {
           try {
             native.setRefreshRate(updated.refreshRate);
+            native.setResourceConfig(updated.profile, '', updated.memLimitMb, updated.diskLimitGb);
           } catch (_e) {
           }
         }
-        this.showToast(`已保存「${updated.name}」设置`);
+        if (runningNow && updated.diskLimitGb !== prevDiskGb) {
+          this.showToast(`已保存存储容量（${updated.diskLimitGb} GB），重启设备后无损生效`);
+        } else {
+          this.showToast(`已保存「${updated.name}」设置`);
+        }
       },
       onCancel: () => {
         this.showDeviceSettingsSheet = false;

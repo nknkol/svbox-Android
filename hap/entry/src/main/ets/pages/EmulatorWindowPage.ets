@@ -102,7 +102,7 @@ struct EmulatorWindowPage {
           inst.id, inst.dataSubdir, inst.dpi, inst.enableAudio,
           inst.enableRoot, inst.deviceBrand, inst.deviceModel, inst.adbPort
         );
-        native.setResourceConfig(inst.profile, '', inst.memLimitMb);
+        native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb);
         native.setGpuMode(inst.gpuMode);
         native.setSyscallMode(inst.syscallMode || 'adaptive');
         native.setRefreshRate(inst.refreshRate);

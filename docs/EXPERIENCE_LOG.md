@@ -1082,6 +1082,20 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - **性能微基准（中位数，3 轮）**：`svbox` 核心 syscall 无回退且小幅优化（`stat` `20,795 -> 17,701 ns` -14.9%、`pread_4k` `1,793 -> 1,511 ns` -15.7%、`mmap_64k` `3,251 -> 2,785 ns` -14.3%）；procfs/statfs 显著加速（`proc_status` `76,743 -> 51,151 ns` -33.3%、`proc_maps` `73,388 -> 57,852 ns` -21.2%、`proc_cgroup` `85,573 -> 51,304 ns` -40.0%、`proc_stat` `519,082 -> 363,326 ns` -30.0%、`statfs_sys` `12,998 -> 10,173 ns` -21.7%）；Android 14 开机 ~13s、SurfaceFlinger 维持 **120.00 Hz**（Maleoon 916 Vulkan/GLES）、在线服务 **235**。
   - **应用回归**：Microsoft Edge（主进程 + `zygote` + `sandboxed_process0`）与《王者荣耀》（主进程 + `xg_vip_service`）均正常启动在线、**0 `Fatal signal` / 0 `SIGTRAP` / 0 `SIGSYS` / 0 `aw_browser_terminator`**，`/proc/net/dev` 实时递增至 `eth0 rx=462,208 B / tx=91,727 B`；`rootfs/` 与 `rootfs14/` 零改动。
 
+### 2026-11-26 存储容量虚高与无损扩容、设置持久化及第三方浏览器（Edge / UC）修复
+- **存储虚占 94 GB（系统 82 GB）与 8/16/32/64/128 GB 无损扩容**：
+  - 根因：`svbox --disk-mb 32768` 对 `/` 和 `/data` 同时汇报 32 GiB（34.36 GB），Android `StorageManagerService` 求和得 `68.7 GB > 64 GB` 向上取整为 `128 GB`，再减去 `/data` 可用 `34.36 GB`，算出虚高的 `已使用 94 GB / 系统 82 GB`。
+  - 修复：Layer 1 `svbox`（commit `4d6e592`，ABI 32）新增通用 `--root-disk-mb` 与 `--disk-used-mb`，在 `vfs_ops.c` 按挂载体源是否位于 `root`/`lower` 区分 rootfs（报满）与外部数据卷（扣减实际占用）；Layer 2 按十进制 GB 档位映射（`root=1900 MiB`，`8/16/32/64/128 GB` 对应 `5720/13350/28600/59100/120150 MiB`）并在启动时扫描 `userdata/data` 实占，UI（设备设置→磁盘、新建设备弹窗）开放五档选择与无损扩容。真机验证：`64 GB` 档报 `已使用 18 GB / 共 64 GB（游戏 7.1 GB，系统 6.6 GB）`，无损切换至 `128 GB` 后零数据丢失且立即报 `共 128 GB`。
+- **系统设置 /「允许安装未知应用」重启失效**：
+  - 根因：Android 14 `AppOpsService` 延迟 10 秒才写 `/data/system/appops.xml`，而 `AndroidRuntime::Stop()` 仅等待 60ms 即 `SIGKILL`；且 `svbox-propd` 未将运行时 `persist.*` 落盘。
+  - 修复：`AndroidRuntime::Stop()` 停止前执行 `FlushGuestStateBeforeStop()`（最多 1.5s 预算，先唤醒暂停进程再同步执行 `cmd appops write-settings; sync`）并将 `SIGTERM` 宽限提升至 250ms；`svbox-propd` 新增 `--persist <dataBase_/persist.prop>` 原子落盘并在 `override.prop` 之前加载。真机验证：修改 `REQUEST_INSTALL_PACKAGES=allow`、`settings put global`、`setprop persist.sys.*` 后 2 秒内强制重启，三项全部保留。
+- **UC 浏览器弹窗「安装失败」并自杀**：
+  - 根因：默认机型回退为 `SVBox14`/`svbox14`，含 `vbox` 子串触发 UC U4 内核 `112:COMPATIABLE_NOT_SUPPORT_ARCH: vbox` 检查。
+  - 修复：默认机型回退改为干净真实 ARM64 标识（`HUAWEI` / `ALN-AL00` / `aln`），并预创建 `/data/misc/shared_relro`（`01777`）消除 `WebViewLoader` 报错。真机验证：UC 浏览器 9 进程稳定在线、U4 内核成功初始化并正常加载页面。
+- **Microsoft Edge 卡在隐私确认页无法点击网页**：
+  - 根因：HarmonyOS PC 上 `OH_NativeXComponent` 对鼠标点击会同时触发 `DispatchMouseEventCB` 与 `DispatchTouchEventCB`，双指同时落点导致 Chromium/Blink `WebView` 将单击误判为双指手势并吞掉点击。
+  - 修复：`DispatchTouchEventCB` 过滤 `OH_NATIVEXCOMPONENT_SOURCE_TYPE_MOUSE` / `OH_NATIVEXCOMPONENT_TOOL_TYPE_MOUSE`，同时在 `InputBridge` 增加 40ms/6px 同坐标鼠触去重兜底。真机验证：Edge 顺利通过隐私确认并流畅打开 `https://www.baidu.com`。
+
 
 
 

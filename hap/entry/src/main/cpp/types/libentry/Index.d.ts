@@ -51,7 +51,7 @@ export const stopContainer: () => string;
 export const sendNavKey: (key: string) => boolean;
 export const sendScroll: (x: number, y: number, deltaY: number) => boolean;
 export const sendDisplayScroll: (slot: number, x: number, y: number, deltaY: number) => boolean;
-export const setResourceConfig: (profile: string, cpuset: string, memMb: number) => boolean;
+export const setResourceConfig: (profile: string, cpuset: string, memMb: number, diskLimitGb?: number) => boolean;
 export const setInstanceConfig: (
   instanceId: string,
   dataSubdir: string,
