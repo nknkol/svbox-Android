@@ -1,4 +1,5 @@
 import { common, Want } from '@kit.AbilityKit';
+import { fileIo, picker } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { LengthUnit } from '@kit.ArkUI';
 import native, { RuntimeStatus } from 'libentry.so';
@@ -8,7 +9,10 @@ import {
   appWindowPrefs,
   computeShortcutId,
   findPresetByKey,
-  ResolutionPresetItem
+  getCachedIconsDir,
+  loadCachedAppList,
+  ResolutionPresetItem,
+  saveCachedAppList
 } from '../common/AppWindowPrefs';
 import {
   pinAndroidAppToDesktop,
@@ -82,6 +86,7 @@ struct Index {
   @State private running: boolean = false;
   @State private paused: boolean = false;
   @State private wmAgentReady: boolean = false;
+  @State private installingApk: boolean = false;
   @State private activeInstanceId: string = 'inst_0';
   @State private refreshRate: number = 120;
   @State private fps: number = 0;
@@ -202,6 +207,7 @@ struct Index {
     this.refreshPinnedShortcuts();
 
     const primary: DeviceInstance | undefined = this.getInstanceById('inst_0') ?? this.instances[0];
+    this.loadOfflineAppsForInstance(primary);
     if (primary) {
       let dirty: boolean = false;
       const rawGpu: string | undefined = AppStorage.get<string>('gpuMode');
@@ -382,21 +388,110 @@ struct Index {
     }
   }
 
+  private loadOfflineAppsForInstance(inst: DeviceInstance | undefined): void {
+    const filesDir: string = this.getSandboxFilesDir();
+    const subdir: string = inst ? inst.dataSubdir : 'userdata14';
+    const cachedDir: string = getCachedIconsDir(filesDir, subdir);
+    if (this.iconsDir.length === 0) {
+      this.iconsDir = cachedDir;
+    }
+    const cached: AndroidAppItem[] = loadCachedAppList(filesDir, subdir);
+    if (cached.length > 0) {
+      this.appList = cached;
+      AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', cached);
+    }
+  }
+
   private async refreshApps(forceExtractIcons: boolean): Promise<void> {
     if (!this.wmAgentReady || this.loadingApps) return;
     this.loadingApps = true;
     try {
-      this.iconsDir = native.getIconsDir();
+      const filesDir: string = this.getSandboxFilesDir();
+      const activeInst: DeviceInstance | undefined =
+        this.getInstanceById(this.activeInstanceId) ?? this.getInstanceById('inst_0') ?? this.instances[0];
+      const runtimeIcons: string = native.getIconsDir();
+      this.iconsDir = runtimeIcons.length > 0
+        ? runtimeIcons
+        : getCachedIconsDir(filesDir, activeInst ? activeInst.dataSubdir : 'userdata14');
       const raw: string = await native.wmRpcAsync(forceExtractIcons ? 'LIST_APPS 1' : 'LIST_APPS 0');
       const rep: ListAppsReply = JSON.parse(raw) as ListAppsReply;
       if (rep.ok && rep.apps) {
         this.appList = rep.apps;
         AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', rep.apps);
+        saveCachedAppList(filesDir, activeInst ? activeInst.dataSubdir : 'userdata14', rep.apps);
       }
     } catch (err) {
       hilog.warn(0x0000, TAG, 'refreshApps error: %{public}s', String(err));
     } finally {
       this.loadingApps = false;
+    }
+  }
+
+  private async pickAndInstallOfflineApk(): Promise<void> {
+    if (this.installingApk) return;
+    if (!this.running) {
+      this.showToast('请先启动目标 Android 设备，再安装本地 APK');
+      return;
+    }
+    const activeInst: DeviceInstance | undefined =
+      this.getInstanceById(this.activeInstanceId) ?? this.getInstanceById('inst_0') ?? this.instances[0];
+    const filesDir: string = this.getSandboxFilesDir();
+    const subdir: string = activeInst ? activeInst.dataSubdir : 'userdata14';
+
+    try {
+      const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const docPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const opts: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      opts.maxSelectNumber = 1;
+      opts.fileSuffixFilters = ['Android 安装包|.apk'];
+      const uris: string[] = await docPicker.select(opts);
+      if (!uris || uris.length === 0 || !uris[0]) {
+        return;
+      }
+      const srcUri: string = uris[0];
+      this.installingApk = true;
+      this.showToast('正在拷贝并安装本地 APK...');
+
+      const tmpDir: string = `${filesDir}/${subdir}/data/local/tmp`;
+      try {
+        fileIo.mkdirSync(tmpDir, true);
+      } catch (_mk) {
+      }
+      const stageName: string = `_offline_${Date.now()}.apk`;
+      const hostStagePath: string = `${tmpDir}/${stageName}`;
+      const guestStagePath: string = `/data/local/tmp/${stageName}`;
+
+      const inFile: fileIo.File = fileIo.openSync(srcUri, fileIo.OpenMode.READ_ONLY);
+      const outFile: fileIo.File = fileIo.openSync(
+        hostStagePath,
+        fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY
+      );
+      try {
+        const chunk: ArrayBuffer = new ArrayBuffer(256 * 1024);
+        let nread: number = fileIo.readSync(inFile.fd, chunk);
+        while (nread > 0) {
+          fileIo.writeSync(outFile.fd, chunk, { length: nread });
+          nread = fileIo.readSync(inFile.fd, chunk);
+        }
+      } finally {
+        fileIo.closeSync(outFile);
+        fileIo.closeSync(inFile);
+      }
+
+      const res: string = await native.installLocalApkAsync(guestStagePath);
+      if (res === 'OK') {
+        this.showToast('离线 APK 安装成功，正在刷新应用列表...');
+        if (this.wmAgentReady) {
+          await this.refreshApps(true);
+        }
+      } else {
+        this.showToast(`安装失败：${res}`);
+      }
+    } catch (err) {
+      hilog.error(0x0000, TAG, 'pickAndInstallOfflineApk error: %{public}s', String(err));
+      this.showToast(`离线安装异常：${String(err)}`);
+    } finally {
+      this.installingApk = false;
     }
   }
 
@@ -431,6 +526,36 @@ struct Index {
 
   private async openAndroidAppWindow(pkg: string, comp: string, label: string, moveTaskId: number): Promise<void> {
     try {
+      // Single-container multi-window: clicking any offline cached app auto-boots the primary container silently.
+      if (!this.running) {
+        const primary: DeviceInstance | undefined =
+          this.getInstanceById(this.activeInstanceId) ?? this.getInstanceById('inst_0') ?? this.instances[0];
+        if (primary) {
+          this.activeInstanceId = primary.id;
+          AppStorage.setOrCreate<number>('refreshRate', primary.refreshRate);
+          native.setInstanceConfig(
+            primary.id, primary.dataSubdir, primary.dpi, primary.enableAudio,
+            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort
+          );
+          native.setResourceConfig(
+            primary.profile, '', primary.memLimitMb, primary.diskLimitGb, primary.cpuCores
+          );
+          native.setGpuMode(primary.gpuMode);
+          native.setSyscallMode(primary.syscallMode || 'adaptive');
+          native.setRefreshRate(primary.refreshRate);
+          this.statusText = native.startContainer(
+            this.getSandboxTempDir(),
+            this.svboxPath,
+            this.androidDir,
+            'full',
+            primary.width,
+            primary.height
+          );
+          native.setDisplayVisible(0, false);
+          this.running = true;
+          instanceManager.markLastRun(this.getSandboxFilesDir(), primary.id);
+        }
+      }
       const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const want: Want = {
         bundleName: 'org.svbox.android',
@@ -509,7 +634,7 @@ struct Index {
         inst.deviceModel,
         inst.adbPort
       );
-      native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb);
+      native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb, inst.cpuCores);
       native.setGpuMode(inst.gpuMode);
       native.setSyscallMode(inst.syscallMode || 'adaptive');
       native.setRefreshRate(inst.refreshRate);
@@ -546,8 +671,9 @@ struct Index {
         this.wmAgentReady = false;
       });
       this.appsFetchedOnce = false;
-      this.appList = [];
-      AppStorage.setOrCreate<AndroidAppItem[]>('androidApps', []);
+      const activeInst: DeviceInstance | undefined =
+        this.getInstanceById(this.activeInstanceId) ?? this.getInstanceById('inst_0') ?? this.instances[0];
+      this.loadOfflineAppsForInstance(activeInst);
       this.showToast('设备已关闭');
     } catch (e) {
       this.showToast(`停止失败：${String(e)}`);
@@ -901,7 +1027,7 @@ struct Index {
         if (runningNow) {
           try {
             native.setRefreshRate(updated.refreshRate);
-            native.setResourceConfig(updated.profile, '', updated.memLimitMb, updated.diskLimitGb);
+            native.setResourceConfig(updated.profile, '', updated.memLimitMb, updated.diskLimitGb, updated.cpuCores);
           } catch (_e) {
           }
         }
@@ -1958,6 +2084,30 @@ struct Index {
 
           Button({ type: ButtonType.Capsule }) {
             Row({ space: Spacing.XS + 2 }) {
+              SymbolGlyph($r('sys.symbol.plus_square'))
+                .fontSize(IconSize.SM)
+                .fontColor([this.running ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_tertiary')])
+              if (this.bp !== 'sm') {
+                Text(this.installingApk ? '安装中...' : '安装 APK')
+                  .fontSize(FontSize.CAPTION)
+                  .fontColor(this.running ? $r('sys.color.font_emphasize') : $r('sys.color.font_tertiary'))
+              }
+            }
+          }
+          .height(ControlSize.BTN_MD)
+          .padding({ left: Spacing.MD, right: Spacing.MD })
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .border({ width: 0.6, color: $r('sys.color.comp_divider') })
+          .enabled(this.running && !this.installingApk)
+          .opacity(this.running ? 1.0 : 0.55)
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+          .onClick(() => {
+            this.pickAndInstallOfflineApk();
+          })
+
+          Button({ type: ButtonType.Capsule }) {
+            Row({ space: Spacing.XS + 2 }) {
               SymbolGlyph($r('sys.symbol.arrow_clockwise'))
                 .fontSize(IconSize.SM)
                 .fontColor([$r('sys.color.icon_primary')])
@@ -1982,7 +2132,33 @@ struct Index {
       }
       .width('100%')
 
-      if (!this.wmAgentReady) {
+      if (!this.wmAgentReady && this.appList.length > 0) {
+        Row({ space: Spacing.SM }) {
+          if (this.running) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color($r('sys.color.brand'))
+            Text('Android 14 正在启动，即将同步最新应用列表...')
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_emphasize'))
+          } else {
+            SymbolGlyph($r('sys.symbol.info_circle'))
+              .fontSize(IconSize.SM)
+              .fontColor([$r('sys.color.icon_emphasize')])
+            Text('离线应用列表（单容器自由多窗）：点击任意应用图标即可自动在后台启动设备并打开窗口')
+              .fontSize(FontSize.CAPTION)
+              .fontColor($r('sys.color.font_emphasize'))
+              .layoutWeight(1)
+          }
+        }
+        .width('100%')
+        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.SM, bottom: Spacing.SM })
+        .borderRadius(Radius.MD)
+        .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+      }
+
+      if (!this.wmAgentReady && this.appList.length === 0) {
         Column({ space: Spacing.MD }) {
           if (this.running) {
             LoadingProgress()
@@ -1996,11 +2172,11 @@ struct Index {
             SymbolGlyph($r('sys.symbol.square_grid_2x2'))
               .fontSize(IconSize.XL)
               .fontColor([$r('sys.color.icon_tertiary')])
-            Text('当前没有运行中的 Android 设备')
+            Text('尚未缓存离线应用列表')
               .fontSize(FontSize.TITLE_SM)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
-            Text('启动任意设备后，即可在此以独立鸿蒙窗口直接运行所有 Android 应用')
+            Text('首次启动设备完成应用同步后，关机状态下也可直接在此点击应用自动开机并打开独立窗口')
               .fontSize(FontSize.CAPTION)
               .fontColor($r('sys.color.font_tertiary'))
             Button('返回设备列表启动', { type: ButtonType.Capsule })

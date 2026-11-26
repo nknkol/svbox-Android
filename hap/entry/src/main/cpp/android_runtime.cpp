@@ -1081,7 +1081,8 @@ static uint64_t SumDirBytesQuick(const std::string& root) {
 void AndroidRuntime::SetResourceConfig(const std::string& profile,
                                        const std::string& customCpuset,
                                        uint32_t memLimitMb,
-                                       uint32_t diskLimitGb) {
+                                       uint32_t diskLimitGb,
+                                       uint32_t cpuCores) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!profile.empty()) profile_ = profile;
     customCpuset_ = customCpuset;
@@ -1093,6 +1094,9 @@ void AndroidRuntime::SetResourceConfig(const std::string& profile,
         diskLimitGb_.store(tier);
         diskLimitMb_.store(TierGbToDataDiskMb(tier));
         rootDiskMb_.store(1900);
+    }
+    if (cpuCores <= 64) {
+        targetCpuCores_.store(cpuCores);
     }
 }
 
@@ -1523,6 +1527,7 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         "-v", runBase_ + "/dev_input:/dev/input",
         "-v", runBase_ + "/dev_bus_usb:/dev/bus/usb",
         "-v", runBase_ + "/ipc:/ipc:rw,nomnt",
+        "-v", dataBase_ + "/icons:/ipc/icons:rw,nomnt",
         "-v", dataBase_ + "/data:/data",
         "-v", dataBase_ + "/data/data:/data/user/0",
         "-v", dataBase_ + "/data/user:/data_mirror/data_ce/null",
@@ -1892,7 +1897,10 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     std::string chosenGpu;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        activeCpuset_ = SchedQos::ResolveCpuset(profile_, customCpuset_, &activeNice_, &activeSched_);
+        activeCpuset_ = SchedQos::ResolveCpuset(
+            profile_, customCpuset_,
+            static_cast<int32_t>(targetCpuCores_.load()),
+            &activeNice_, &activeSched_);
         activeGpuMode_ = gpuMode_;
         activeSyscallMode_ = syscallMode_;
         chosenGpu = activeGpuMode_;
@@ -2905,10 +2913,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         unlink((sockDir + "/input_touch_" + std::to_string(i) + ".sock").c_str());
     }
     MkdirP(ipcDir + "/icons");
+    MkdirP(dataBase_ + "/icons");
     {
         std::lock_guard<std::mutex> lk(mu_);
         wmSockPath_ = ipcDir + "/wm_agent.sock";
-        iconsHostDir_ = ipcDir + "/icons";
+        iconsHostDir_ = dataBase_ + "/icons";
     }
     wmAgentReady_.store(false);
 
@@ -3791,6 +3800,75 @@ bool AndroidRuntime::RunGuestCmd(const std::string& shCmd, const std::string& ou
         }
     }).detach();
     return true;
+}
+
+std::string AndroidRuntime::InstallApkSync(const std::string& guestApkPath) {
+    if (!running_.load()) return "ERROR: 容器未运行，请先启动设备";
+    if (guestApkPath.rfind("/data/local/tmp/", 0) != 0 ||
+        guestApkPath.find("..") != std::string::npos ||
+        guestApkPath.size() < 20) {
+        return "ERROR: 无效的临时 APK 路径";
+    }
+    const std::string hostApkPath = dataBase_ + guestApkPath;
+    if (!FileExists(hostApkPath)) {
+        return "ERROR: 找不到已暂存的 APK 文件";
+    }
+    chmod(hostApkPath.c_str(), 0644);
+
+    std::vector<std::string> argv = BaseSvboxArgs();
+    argv.push_back("--");
+    argv.push_back("system/bin/pm");
+    argv.push_back("install");
+    argv.push_back("-r");
+    argv.push_back(guestApkPath);
+
+    int pipefd[2] = { -1, -1 };
+    if (pipe(pipefd) != 0) {
+        unlink(hostApkPath.c_str());
+        return "ERROR: pipe failed";
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (auto& s : argv) cargv.push_back(s.data());
+        cargv.push_back(nullptr);
+        execv(cargv[0], cargv.data());
+        _exit(127);
+    }
+    close(pipefd[1]);
+    std::string output;
+    if (pid > 0) {
+        char buf[512];
+        ssize_t n = 0;
+        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+            if (output.size() < 4096) {
+                output.append(buf, static_cast<size_t>(n));
+            }
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+    }
+    close(pipefd[0]);
+    unlink(hostApkPath.c_str());
+
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r' || output.back() == ' ')) {
+        output.pop_back();
+    }
+    if (output.find("Success") != std::string::npos) {
+        return "OK";
+    }
+    return output.empty() ? "ERROR: pm install 返回空结果" : ("ERROR: " + output);
 }
 
 bool AndroidRuntime::DumpProcs(const std::string& outPath) {

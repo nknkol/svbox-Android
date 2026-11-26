@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,8 +70,10 @@ const HiDebugApi& GetHiDebugApi() {
 }
 
 std::mutex g_topoMu;
+std::condition_variable g_topoCv;
 CoreTopology g_topo;
 bool g_probeStarted = false;
+bool g_probeDone = false;
 
 std::string FormatCpuList(const std::vector<int32_t>& cpus) {
     if (cpus.empty()) return "";
@@ -121,26 +124,54 @@ bool TryReadSysCapacity(int cpu, int& outCap) {
     char path[128];
     snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
     std::ifstream f(path);
-    if (!f) return false;
-    int val = 0;
-    if (f >> val && val > 0) {
-        outCap = val;
-        return true;
+    if (f) {
+        int val = 0;
+        if (f >> val && val > 0) {
+            outCap = val;
+            return true;
+        }
+    }
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+    std::ifstream ff(path);
+    if (ff) {
+        int khz = 0;
+        if (ff >> khz && khz > 0) {
+            outCap = khz;
+            return true;
+        }
     }
     return false;
+}
+
+std::vector<int32_t> QueryAllowedCpus() {
+    std::vector<int32_t> allowed;
+    cpu_set_t orig;
+    CPU_ZERO(&orig);
+    if (sched_getaffinity(0, sizeof(orig), &orig) == 0) {
+        for (int c = 0; c < CPU_SETSIZE && c < 64; ++c) {
+            if (CPU_ISSET(c, &orig)) allowed.push_back(c);
+        }
+    }
+    if (allowed.empty()) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n <= 0) n = 4;
+        if (n > 64) n = 64;
+        for (int c = 0; c < n; ++c) allowed.push_back(c);
+    }
+    return allowed;
 }
 
 void RunProbeWorker() {
     cpu_set_t orig;
     CPU_ZERO(&orig);
-    if (sched_getaffinity(0, sizeof(orig), &orig) != 0) {
+    bool hasOrig = (sched_getaffinity(0, sizeof(orig), &orig) == 0);
+    std::vector<int32_t> allowed = QueryAllowedCpus();
+    if (allowed.empty()) {
+        std::lock_guard<std::mutex> lk(g_topoMu);
+        g_probeDone = true;
+        g_topoCv.notify_all();
         return;
     }
-    std::vector<int32_t> allowed;
-    for (int c = 0; c < CPU_SETSIZE && c < 64; ++c) {
-        if (CPU_ISSET(c, &orig)) allowed.push_back(c);
-    }
-    if (allowed.empty()) return;
 
     struct CoreScore {
         int32_t cpu;
@@ -164,7 +195,9 @@ void RunProbeWorker() {
         for (int32_t c : allowed) {
             scores.push_back({ c, MeasureCoreThroughput(c) });
         }
-        sched_setaffinity(0, sizeof(orig), &orig);
+        if (hasOrig) {
+            sched_setaffinity(0, sizeof(orig), &orig);
+        }
     }
 
     double maxScore = 0.0, minScore = 1e18;
@@ -185,12 +218,20 @@ void RunProbeWorker() {
             else topo.bigCores.push_back(allowed[i]);
         }
     } else {
-        for (const auto& s : scores) {
+        // Sort scores descending so highest-capacity cores are picked first inside each tier.
+        std::vector<CoreScore> byDesc = scores;
+        std::sort(byDesc.begin(), byDesc.end(), [](const CoreScore& a, const CoreScore& b) {
+            if (a.score != b.score) return a.score > b.score;
+            return a.cpu > b.cpu;
+        });
+        for (const auto& s : byDesc) {
             double ratio = s.score / maxScore;
-            if (ratio >= 0.93) topo.bigCores.push_back(s.cpu);
-            else if (ratio >= 0.78) topo.mediumCores.push_back(s.cpu);
+            if (ratio >= 0.90) topo.bigCores.push_back(s.cpu);
+            else if (ratio >= 0.65) topo.mediumCores.push_back(s.cpu);
             else topo.littleCores.push_back(s.cpu);
         }
+        // Keep littleCores ascending (lowest-power first) and mediumCores descending (stronger mid first).
+        std::reverse(topo.littleCores.begin(), topo.littleCores.end());
         if (topo.littleCores.empty() && !topo.mediumCores.empty()) {
             topo.littleCores = topo.mediumCores;
         }
@@ -218,11 +259,26 @@ void RunProbeWorker() {
     {
         std::lock_guard<std::mutex> lk(g_topoMu);
         g_topo = std::move(topo);
+        g_probeDone = true;
     }
+    g_topoCv.notify_all();
 }
 
-uint64_t ReadProcRssKb(pid_t pid) {
+uint64_t ReadProcPssKb(pid_t pid) {
     char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/smaps_rollup", static_cast<int>(pid));
+    std::ifstream rf(path);
+    if (rf) {
+        std::string line;
+        while (std::getline(rf, line)) {
+            if (line.rfind("Pss:", 0) == 0) {
+                uint64_t kb = 0;
+                if (sscanf(line.c_str() + 4, "%llu", reinterpret_cast<unsigned long long*>(&kb)) == 1) {
+                    return kb;
+                }
+            }
+        }
+    }
     snprintf(path, sizeof(path), "/proc/%d/statm", static_cast<int>(pid));
     std::ifstream f(path);
     if (!f) return 0;
@@ -254,6 +310,14 @@ void StartCoreTopologyProbeAsync() {
     std::thread(RunProbeWorker).detach();
 }
 
+void EnsureCoreTopologyProbed(int maxWaitMs) {
+    StartCoreTopologyProbeAsync();
+    std::unique_lock<std::mutex> lk(g_topoMu);
+    if (g_probeDone) return;
+    g_topoCv.wait_for(lk, std::chrono::milliseconds(maxWaitMs > 0 ? maxWaitMs : 600),
+                      []() { return g_probeDone; });
+}
+
 CoreTopology GetCoreTopology() {
     std::lock_guard<std::mutex> lk(g_topoMu);
     return g_topo;
@@ -261,6 +325,7 @@ CoreTopology GetCoreTopology() {
 
 std::string ResolveCpuset(const std::string& profile,
                           const std::string& customCpuset,
+                          int32_t targetCores,
                           int32_t* outNice,
                           std::string* outSched) {
     if (outNice) *outNice = 0x7fffffff;
@@ -268,38 +333,85 @@ std::string ResolveCpuset(const std::string& profile,
     if (!customCpuset.empty()) {
         return customCpuset;
     }
+
+    EnsureCoreTopologyProbed(600);
+
     std::string p;
     p.reserve(profile.size());
     for (unsigned char ch : profile) {
         p.push_back(static_cast<char>(ch >= 'A' && ch <= 'Z' ? (ch - 'A' + 'a') : ch));
     }
+
     CoreTopology topo = GetCoreTopology();
+    std::vector<int32_t> allowed = QueryAllowedCpus();
+    int32_t total = topo.probed && topo.totalCores > 0
+                        ? topo.totalCores
+                        : static_cast<int32_t>(allowed.size());
+    if (total <= 0) total = 4;
+
+    // Always reserve headroom for host UI/GPU compositor on multi-core devices.
+    int32_t hostReserve = (total >= 12) ? 2 : ((total >= 6) ? 1 : 0);
+    int32_t maxGuest = std::max<int32_t>(1, total - hostReserve);
+
+    int32_t want = targetCores;
+    if (want <= 0) {
+        if (p == "eco") {
+            want = std::min<int32_t>(maxGuest, std::max<int32_t>(2, total / 4));
+        } else if (p == "balanced") {
+            want = std::min<int32_t>(maxGuest, (total >= 16) ? 6 : std::max<int32_t>(2, total / 2));
+        } else {
+            want = std::min<int32_t>(maxGuest, (total >= 16) ? 8 : ((total >= 10) ? 6 : maxGuest));
+        }
+    }
+    want = std::clamp<int32_t>(want, 1, maxGuest);
+
     if (p == "eco") {
         if (outNice) *outNice = 10;
         if (outSched) *outSched = "batch";
-        if (topo.probed && !topo.littleCores.empty()) {
-            return FormatCpuList(topo.littleCores);
+    }
+
+    std::vector<int32_t> ranked;
+    ranked.reserve(static_cast<size_t>(total));
+    auto appendUnique = [&](const std::vector<int32_t>& src) {
+        for (int32_t c : src) {
+            if (std::find(ranked.begin(), ranked.end(), c) == ranked.end()) {
+                ranked.push_back(c);
+            }
         }
-        return "0-3";
-    }
-    if (p == "balanced") {
-        if (topo.probed && !topo.mediumCores.empty()) {
-            std::vector<int32_t> pick = topo.mediumCores;
-            if (pick.size() > 6) pick.resize(6);
-            return FormatCpuList(pick);
+    };
+
+    if (topo.probed && (!topo.bigCores.empty() || !topo.mediumCores.empty() || !topo.littleCores.empty())) {
+        if (p == "eco") {
+            appendUnique(topo.littleCores);
+            appendUnique(topo.mediumCores);
+            appendUnique(topo.bigCores);
+        } else if (p == "balanced") {
+            appendUnique(topo.mediumCores);
+            appendUnique(topo.bigCores);
+            appendUnique(topo.littleCores);
+        } else {
+            appendUnique(topo.bigCores);
+            appendUnique(topo.mediumCores);
+            appendUnique(topo.littleCores);
         }
-        return "4-9";
-    }
-    if (p == "perf" || p == "performance" || p.empty()) {
-        if (topo.probed && !topo.bigCores.empty()) {
-            return FormatCpuList(topo.bigCores);
+    } else {
+        // Dynamic fallback based on real allowed CPUs (high-index cores are typically big cores on ARM64).
+        if (p == "eco") {
+            appendUnique(allowed);
+        } else {
+            std::vector<int32_t> rev(allowed.rbegin(), allowed.rend());
+            appendUnique(rev);
         }
-        return "12-19";
     }
-    if (topo.probed && !topo.bigCores.empty()) {
-        return FormatCpuList(topo.bigCores);
+    appendUnique(allowed);
+
+    if (static_cast<int32_t>(ranked.size()) > want) {
+        ranked.resize(static_cast<size_t>(want));
     }
-    return "12-19";
+    std::string result = FormatCpuList(ranked);
+    OB_LOG_INFO("SvboxQos", "ResolveCpuset(profile=%s, target=%d, host=%dc) -> %s",
+                p.c_str(), targetCores, total, result.c_str());
+    return result;
 }
 
 Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
@@ -310,7 +422,8 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
     if (hd.getNativeMem) {
         HiDebugNativeMemInfoCompat nmem = {};
         hd.getNativeMem(&nmem, false);
-        t.hostNativeRssMb = static_cast<uint32_t>(nmem.rss / 1024u);
+        uint32_t hostKb = nmem.pss > 0 ? nmem.pss : nmem.rss;
+        t.hostNativeRssMb = static_cast<uint32_t>(hostKb / 1024u);
     }
     if (hd.getGfxMem) {
         uint32_t gfxKb = 0;
@@ -334,7 +447,7 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
             snprintf(ppath, sizeof(ppath), "/proc/%d", static_cast<int>(p));
             struct stat st = {};
             if (stat(ppath, &st) == 0 && st.st_uid == myUid) {
-                uint64_t kb = ReadProcRssKb(p);
+                uint64_t kb = ReadProcPssKb(p);
                 if (kb > 0) {
                     totalKb += kb;
                     count++;
@@ -345,7 +458,7 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
     } else {
         for (pid_t p : rootPids) {
             if (p > 0) {
-                totalKb += ReadProcRssKb(p);
+                totalKb += ReadProcPssKb(p);
                 count++;
             }
         }

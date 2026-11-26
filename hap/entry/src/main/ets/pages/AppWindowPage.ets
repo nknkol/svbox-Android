@@ -9,8 +9,10 @@ import {
   computeAdaptiveDpi,
   computeDpiForSize,
   findPresetByKey,
+  getCachedIconsDir,
   ResolutionPresetItem
 } from '../common/AppWindowPrefs';
+import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
   applyMissionIconAndQuickBar,
   argbToHex,
@@ -127,7 +129,12 @@ struct AppWindowPage {
   }
 
   private refreshIconUri(): void {
-    const iconsDir: string = native.getIconsDir();
+    const filesDir: string = this.sandboxFilesDir.length > 0
+      ? this.sandboxFilesDir : '/data/storage/el2/base/haps/entry/files';
+    const primary: DeviceInstance | undefined = instanceManager.getById(filesDir, 'inst_0') ?? instanceManager.getAll(filesDir)[0];
+    const fallbackIconsDir: string = getCachedIconsDir(filesDir, primary ? primary.dataSubdir : 'userdata14');
+    const runtimeIconsDir: string = native.getIconsDir();
+    const iconsDir: string = runtimeIconsDir.length > 0 ? runtimeIconsDir : fallbackIconsDir;
     if (iconsDir.length > 0 && this.androidPkg.length > 0) {
       this.iconUri = `file://${iconsDir}/${this.androidPkg}.png`;
       if (!this.iconApplied && !this.iconSetupStarted) {
@@ -160,17 +167,36 @@ struct AppWindowPage {
     } catch (_e) {
     }
 
-    // Direct cold-launch from HarmonyOS desktop shortcut even if EntryAbility isn't running yet
+    // Direct cold-launch from HarmonyOS desktop shortcut or offline app list click
     const st: RuntimeStatus = native.getStatus();
     if (!st.running) {
       this.bannerText = `正在启动 Android 14 并打开「${this.androidLabel}」...`;
       const tempDir: string = this.sandboxTempDir.length > 0
         ? this.sandboxTempDir
         : '/data/storage/el2/base/haps/entry/temp';
+      const filesDir: string = this.sandboxFilesDir.length > 0
+        ? this.sandboxFilesDir
+        : '/data/storage/el2/base/haps/entry/files';
+      const primary: DeviceInstance | undefined =
+        instanceManager.getById(filesDir, 'inst_0') ?? instanceManager.getAll(filesDir)[0];
       try {
-        native.setGpuMode('vulkan');
-        native.setRefreshRate(this.curHz);
-        native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', 720, 1280);
+        if (primary) {
+          native.setInstanceConfig(
+            primary.id, primary.dataSubdir, primary.dpi, primary.enableAudio,
+            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort
+          );
+          native.setResourceConfig(
+            primary.profile, '', primary.memLimitMb, primary.diskLimitGb, primary.cpuCores
+          );
+          native.setGpuMode(primary.gpuMode);
+          native.setSyscallMode(primary.syscallMode || 'adaptive');
+          native.setRefreshRate(primary.refreshRate);
+          native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', primary.width, primary.height);
+        } else {
+          native.setGpuMode('vulkan');
+          native.setRefreshRate(this.curHz);
+          native.startContainer(tempDir, this.svboxPath, this.androidDir, 'full', 720, 1280);
+        }
         native.setDisplayVisible(0, false);
       } catch (_e) {
       }

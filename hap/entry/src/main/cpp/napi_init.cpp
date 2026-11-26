@@ -293,17 +293,19 @@ napi_value SendScrollNapi(napi_env env, napi_callback_info info) {
 }
 
 napi_value SetResourceConfigNapi(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value args[4] = {};
+    size_t argc = 5;
+    napi_value args[5] = {};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     std::string profile = argc > 0 ? GetStringArg(env, args[0]) : "perf";
     std::string cpuset = argc > 1 ? GetStringArg(env, args[1]) : "";
     int32_t memMb = argc > 2 ? GetInt32Arg(env, args[2], 4096) : 4096;
     int32_t diskGb = argc > 3 ? GetInt32Arg(env, args[3], 0) : 0;
+    int32_t cpuCores = argc > 4 ? GetInt32Arg(env, args[4], 0) : 0;
     AndroidRuntime::Instance().SetResourceConfig(
         profile, cpuset,
         static_cast<uint32_t>(memMb > 0 ? memMb : 4096),
-        static_cast<uint32_t>(diskGb > 0 ? diskGb : 0));
+        static_cast<uint32_t>(diskGb > 0 ? diskGb : 0),
+        static_cast<uint32_t>(cpuCores > 0 ? cpuCores : 0));
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
@@ -1133,8 +1135,11 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setI32("refreshRate", rt.RefreshRate());
     setDouble("cpuPercent", tel.systemCpuPercent);
     setI32("memMb", static_cast<int32_t>(tel.containerRssMb));
+    setI32("hostMemMb", static_cast<int32_t>(tel.hostNativeRssMb));
+    setI32("gfxMemMb", static_cast<int32_t>(tel.graphicsMemMb));
     setI32("memLimitMb", static_cast<int32_t>(rt.MemLimitMb()));
     setI32("activeProcs", static_cast<int32_t>(tel.activeProcs));
+    setI32("hostCpuCores", topo.totalCores);
     setStr("profile", rt.Profile());
     setStr("gpuMode", rt.GpuMode());
     setStr("syscallMode", rt.SyscallMode());
@@ -1145,6 +1150,43 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setStr("activeInstanceId", rt.ActiveInstanceId());
     setStr("shareDir", rt.ShareHostDir());
     return obj;
+}
+
+struct InstallApkAsyncCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string guestApkPath;
+    std::string result;
+};
+
+napi_value InstallLocalApkAsyncNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    auto* ctx = new InstallApkAsyncCtx();
+    ctx->guestApkPath = argc > 0 ? GetStringArg(env, args[0]) : "";
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resName = nullptr;
+    napi_create_string_utf8(env, "svbox_install_apk", NAPI_AUTO_LENGTH, &resName);
+    napi_create_async_work(
+        env, nullptr, resName,
+        [](napi_env, void* data) {
+            auto* c = static_cast<InstallApkAsyncCtx*>(data);
+            c->result = AndroidRuntime::Instance().InstallApkSync(c->guestApkPath);
+        },
+        [](napi_env env, napi_status, void* data) {
+            auto* c = static_cast<InstallApkAsyncCtx*>(data);
+            napi_value val = nullptr;
+            napi_create_string_utf8(env, c->result.c_str(), NAPI_AUTO_LENGTH, &val);
+            napi_resolve_deferred(env, c->deferred, val);
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 napi_value Init(napi_env env, napi_value exports) {
@@ -1186,6 +1228,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "runGuestCmd", nullptr, RunGuestCmdNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "installLocalApkAsync", nullptr, InstallLocalApkAsyncNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "dumpProcs", nullptr, DumpProcsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectTap", nullptr, InjectTapNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectGamepadButton", nullptr, InjectGamepadButtonNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

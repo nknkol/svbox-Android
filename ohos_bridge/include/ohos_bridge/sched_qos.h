@@ -40,10 +40,12 @@ struct Telemetry {
 
 bool SetCurrentThreadQoS(Level level, const char* label);
 void StartCoreTopologyProbeAsync();
+void EnsureCoreTopologyProbed(int maxWaitMs = 600);
 CoreTopology GetCoreTopology();
 
 std::string ResolveCpuset(const std::string& profile,
                           const std::string& customCpuset,
+                          int32_t targetCores,
                           int32_t* outNice,
                           std::string* outSched);
 

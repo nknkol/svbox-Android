@@ -13,8 +13,11 @@ export interface RuntimeStatus {
   refreshRate: number;
   cpuPercent: number;
   memMb: number;
+  hostMemMb?: number;
+  gfxMemMb?: number;
   memLimitMb: number;
   activeProcs: number;
+  hostCpuCores?: number;
   profile: string;
   gpuMode: string;
   syscallMode: string;
@@ -51,7 +54,13 @@ export const stopContainer: () => string;
 export const sendNavKey: (key: string) => boolean;
 export const sendScroll: (x: number, y: number, deltaY: number) => boolean;
 export const sendDisplayScroll: (slot: number, x: number, y: number, deltaY: number) => boolean;
-export const setResourceConfig: (profile: string, cpuset: string, memMb: number, diskLimitGb?: number) => boolean;
+export const setResourceConfig: (
+  profile: string,
+  cpuset: string,
+  memMb: number,
+  diskLimitGb?: number,
+  cpuCores?: number
+) => boolean;
 export const setInstanceConfig: (
   instanceId: string,
   dataSubdir: string,
@@ -89,6 +98,7 @@ export const setVisible: (visible: boolean) => boolean;
 export const setDisplayVisible: (slot: number, visible: boolean) => boolean;
 export const saveRawSnapshot: (path: string, width: number, height: number, pixels: ArrayBuffer) => boolean;
 export const runGuestCmd: (cmd: string, outPath: string) => boolean;
+export const installLocalApkAsync: (guestApkPath: string) => Promise<string>;
 export const dumpProcs: (outPath: string) => boolean;
 export const injectTap: (x: number, y: number) => boolean;
 export const isWmAgentReady: () => boolean;

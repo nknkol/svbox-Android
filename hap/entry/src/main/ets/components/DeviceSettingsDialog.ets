@@ -53,6 +53,88 @@ const NAV_ITEM_H: number = 38;
 const NAV_ITEM_GAP: number = 4;
 
 @Component
+struct SettingsOptionPill {
+  @Prop label: string = '';
+  @Prop active: boolean = false;
+  onTap: () => void = (): void => {};
+
+  build() {
+    Button({ type: ButtonType.Normal }) {
+      Text(this.label)
+        .fontSize(FontSize.CAPTION)
+        .fontWeight(this.active ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
+    }
+    .height(ControlSize.BTN_SM)
+    .padding({ left: Spacing.MD, right: Spacing.MD })
+    .borderRadius(Radius.CAPSULE)
+    .backgroundColor(this.active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+    .onClick(() => {
+      this.onTap();
+    })
+  }
+}
+
+@Component
+struct SettingsToggleRow {
+  @Prop title: string = '';
+  @Prop desc: string = '';
+  @Prop checked: boolean = false;
+  onToggle: (v: boolean) => void = (_v: boolean): void => {};
+
+  build() {
+    Row({ space: Spacing.MD }) {
+      Column({ space: Spacing.XS }) {
+        Text(this.title)
+          .fontSize(FontSize.BODY_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_primary'))
+        Text(this.desc)
+          .fontSize(FontSize.MICRO)
+          .fontColor($r('sys.color.font_tertiary'))
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Toggle({ type: ToggleType.Switch, isOn: this.checked })
+        .selectedColor($r('sys.color.brand'))
+        .onChange((v: boolean) => {
+          this.onToggle(v);
+        })
+    }
+    .width('100%')
+    .padding({ top: Spacing.XS, bottom: Spacing.XS })
+  }
+}
+
+@Component
+struct SettingsDiagRow {
+  @Prop label: string = '';
+  @Prop textVal: string = '';
+
+  build() {
+    Row({ space: Spacing.MD }) {
+      Text(this.label)
+        .fontSize(FontSize.CAPTION)
+        .fontColor($r('sys.color.font_secondary'))
+        .width(116)
+      Text(this.textVal)
+        .fontSize(FontSize.CAPTION)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'))
+        .layoutWeight(1)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .padding({ top: Spacing.XS, bottom: Spacing.XS })
+  }
+}
+
+@Component
 export struct DeviceSettingsSheet {
   instance: DeviceInstance | undefined = undefined;
   filesDir: string = '';
@@ -234,49 +316,6 @@ export struct DeviceSettingsSheet {
   }
 
   @Builder
-  private optionPill(label: string, active: boolean, onTap: () => void) {
-    Button({ type: ButtonType.Normal }) {
-      Text(label)
-        .fontSize(FontSize.CAPTION)
-        .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
-    }
-    .height(ControlSize.BTN_SM)
-    .padding({ left: Spacing.MD, right: Spacing.MD })
-    .borderRadius(Radius.CAPSULE)
-    .backgroundColor(active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
-    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-    .hoverEffect(HoverEffect.Highlight)
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-    .onClick(() => {
-      this.animateOption(onTap);
-    })
-  }
-
-  @Builder
-  private toggleRow(title: string, desc: string, checked: boolean, onToggle: (v: boolean) => void) {
-    Row({ space: Spacing.MD }) {
-      Column({ space: Spacing.XS }) {
-        Text(title)
-          .fontSize(FontSize.BODY_LG)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('sys.color.font_primary'))
-        Text(desc)
-          .fontSize(FontSize.MICRO)
-          .fontColor($r('sys.color.font_tertiary'))
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-
-      Toggle({ type: ToggleType.Switch, isOn: checked })
-        .selectedColor($r('sys.color.brand'))
-        .onChange(onToggle)
-    }
-    .width('100%')
-    .padding({ top: Spacing.XS, bottom: Spacing.XS })
-  }
-
-  @Builder
   private perfTabBody() {
     Column({ space: Spacing.MD }) {
       if (this.isInstanceRunning) {
@@ -304,17 +343,35 @@ export struct DeviceSettingsSheet {
           wrap: FlexWrap.Wrap,
           space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
         }) {
-          this.optionPill('性能模式', this.draftProfile === 'Performance', () => {
-            this.draftProfile = 'Performance';
-            this.draftCpuCores = profileToCpuCores('Performance');
+          SettingsOptionPill({
+            label: '性能模式',
+            active: this.draftProfile === 'Performance',
+            onTap: () => {
+              this.animateOption(() => {
+                this.draftProfile = 'Performance';
+                this.draftCpuCores = profileToCpuCores('Performance');
+              });
+            }
           })
-          this.optionPill('均衡模式（推荐）', this.draftProfile === 'Balanced', () => {
-            this.draftProfile = 'Balanced';
-            this.draftCpuCores = profileToCpuCores('Balanced');
+          SettingsOptionPill({
+            label: '均衡模式（推荐）',
+            active: this.draftProfile === 'Balanced',
+            onTap: () => {
+              this.animateOption(() => {
+                this.draftProfile = 'Balanced';
+                this.draftCpuCores = profileToCpuCores('Balanced');
+              });
+            }
           })
-          this.optionPill('节能模式', this.draftProfile === 'Eco', () => {
-            this.draftProfile = 'Eco';
-            this.draftCpuCores = profileToCpuCores('Eco');
+          SettingsOptionPill({
+            label: '节能模式',
+            active: this.draftProfile === 'Eco',
+            onTap: () => {
+              this.animateOption(() => {
+                this.draftProfile = 'Eco';
+                this.draftCpuCores = profileToCpuCores('Eco');
+              });
+            }
           })
         }
         .width('100%')
@@ -341,27 +398,39 @@ export struct DeviceSettingsSheet {
             wrap: FlexWrap.Wrap,
             space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
           }) {
-            this.optionPill('2 核', this.draftCpuCores === 2, () => {
-              this.draftCpuCores = 2;
-              this.draftProfile = cpuCoresToProfile(2);
+            SettingsOptionPill({
+              label: '2 核',
+              active: this.draftCpuCores === 2,
+              onTap: () => { this.animateOption(() => { this.draftCpuCores = 2; }); }
             })
-            this.optionPill('4 核', this.draftCpuCores === 4, () => {
-              this.draftCpuCores = 4;
-              this.draftProfile = cpuCoresToProfile(4);
+            SettingsOptionPill({
+              label: '4 核',
+              active: this.draftCpuCores === 4,
+              onTap: () => { this.animateOption(() => { this.draftCpuCores = 4; }); }
             })
-            this.optionPill('6 核', this.draftCpuCores === 6, () => {
-              this.draftCpuCores = 6;
-              this.draftProfile = cpuCoresToProfile(6);
+            SettingsOptionPill({
+              label: '6 核',
+              active: this.draftCpuCores === 6,
+              onTap: () => { this.animateOption(() => { this.draftCpuCores = 6; }); }
             })
-            this.optionPill('8 核', this.draftCpuCores === 8, () => {
-              this.draftCpuCores = 8;
-              this.draftProfile = cpuCoresToProfile(8);
+            SettingsOptionPill({
+              label: '8 核',
+              active: this.draftCpuCores === 8,
+              onTap: () => { this.animateOption(() => { this.draftCpuCores = 8; }); }
             })
           }
           .layoutWeight(1)
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
+
+        Text(
+          this.diagStatus && this.diagStatus.topology.length > 0
+            ? `宿主实测拓扑：${this.diagStatus.topology}（按性能模式自动优先绑定大/中/小核，并为宿主保留核心余量）`
+            : '按宿主机真实 CPU 大小核拓扑动态绑定核心，自动适配手机、平板与 PC'
+        )
+          .fontSize(FontSize.MICRO)
+          .fontColor($r('sys.color.font_tertiary'))
 
         Row({ space: Spacing.MD }) {
           Text('内存上限')
@@ -372,10 +441,26 @@ export struct DeviceSettingsSheet {
             wrap: FlexWrap.Wrap,
             space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
           }) {
-            this.optionPill('2 GB', this.draftMemMb === 2048, () => { this.draftMemMb = 2048; })
-            this.optionPill('4 GB', this.draftMemMb === 4096, () => { this.draftMemMb = 4096; })
-            this.optionPill('6 GB', this.draftMemMb === 6144, () => { this.draftMemMb = 6144; })
-            this.optionPill('8 GB', this.draftMemMb === 8192, () => { this.draftMemMb = 8192; })
+            SettingsOptionPill({
+              label: '2 GB',
+              active: this.draftMemMb === 2048,
+              onTap: () => { this.animateOption(() => { this.draftMemMb = 2048; }); }
+            })
+            SettingsOptionPill({
+              label: '4 GB',
+              active: this.draftMemMb === 4096,
+              onTap: () => { this.animateOption(() => { this.draftMemMb = 4096; }); }
+            })
+            SettingsOptionPill({
+              label: '6 GB',
+              active: this.draftMemMb === 6144,
+              onTap: () => { this.animateOption(() => { this.draftMemMb = 6144; }); }
+            })
+            SettingsOptionPill({
+              label: '8 GB',
+              active: this.draftMemMb === 8192,
+              onTap: () => { this.animateOption(() => { this.draftMemMb = 8192; }); }
+            })
           }
           .layoutWeight(1)
         }
@@ -404,9 +489,21 @@ export struct DeviceSettingsSheet {
             wrap: FlexWrap.Wrap,
             space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
           }) {
-            this.optionPill('Vulkan（推荐）', this.draftGpuMode === 'vulkan', () => { this.draftGpuMode = 'vulkan'; })
-            this.optionPill('OpenGL ES', this.draftGpuMode === 'gles', () => { this.draftGpuMode = 'gles'; })
-            this.optionPill('CPU 软渲', this.draftGpuMode === 'swiftshader', () => { this.draftGpuMode = 'swiftshader'; })
+            SettingsOptionPill({
+              label: 'Vulkan（推荐）',
+              active: this.draftGpuMode === 'vulkan',
+              onTap: () => { this.animateOption(() => { this.draftGpuMode = 'vulkan'; }); }
+            })
+            SettingsOptionPill({
+              label: 'OpenGL ES',
+              active: this.draftGpuMode === 'gles',
+              onTap: () => { this.animateOption(() => { this.draftGpuMode = 'gles'; }); }
+            })
+            SettingsOptionPill({
+              label: 'CPU 软渲',
+              active: this.draftGpuMode === 'swiftshader',
+              onTap: () => { this.animateOption(() => { this.draftGpuMode = 'swiftshader'; }); }
+            })
           }
           .layoutWeight(1)
         }
@@ -425,7 +522,11 @@ export struct DeviceSettingsSheet {
             ForEach(
               REFRESH_RATES,
               (hz: number) => {
-                this.optionPill(`${hz} Hz`, this.draftRefreshRate === hz, () => { this.draftRefreshRate = hz; })
+                SettingsOptionPill({
+                  label: `${hz} Hz`,
+                  active: this.draftRefreshRate === hz,
+                  onTap: () => { this.animateOption(() => { this.draftRefreshRate = hz; }); }
+                })
               },
               (hz: number): string => String(hz)
             )
@@ -456,17 +557,25 @@ export struct DeviceSettingsSheet {
           wrap: FlexWrap.Wrap,
           space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
         }) {
-          this.optionPill('自适应（推荐）', this.draftSyscallMode === 'adaptive', () => {
-            this.draftSyscallMode = 'adaptive';
+          SettingsOptionPill({
+            label: '自适应（推荐）',
+            active: this.draftSyscallMode === 'adaptive',
+            onTap: () => { this.animateOption(() => { this.draftSyscallMode = 'adaptive'; }); }
           })
-          this.optionPill('纯净模式', this.draftSyscallMode === 'pure_seccomp', () => {
-            this.draftSyscallMode = 'pure_seccomp';
+          SettingsOptionPill({
+            label: '纯净模式',
+            active: this.draftSyscallMode === 'pure_seccomp',
+            onTap: () => { this.animateOption(() => { this.draftSyscallMode = 'pure_seccomp'; }); }
           })
-          this.optionPill('混合模式', this.draftSyscallMode === 'hybrid', () => {
-            this.draftSyscallMode = 'hybrid';
+          SettingsOptionPill({
+            label: '混合模式',
+            active: this.draftSyscallMode === 'hybrid',
+            onTap: () => { this.animateOption(() => { this.draftSyscallMode = 'hybrid'; }); }
           })
-          this.optionPill('原版内联', this.draftSyscallMode === 'inline', () => {
-            this.draftSyscallMode = 'inline';
+          SettingsOptionPill({
+            label: '原版内联',
+            active: this.draftSyscallMode === 'inline',
+            onTap: () => { this.animateOption(() => { this.draftSyscallMode = 'inline'; }); }
           })
         }
         .width('100%')
@@ -502,13 +611,21 @@ export struct DeviceSettingsSheet {
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
         Row({ space: Spacing.SM }) {
-          this.optionPill('传统模拟器窗口', this.draftRunMode === 'emulator', () => { this.draftRunMode = 'emulator'; })
-          this.optionPill('自由多窗口模式', this.draftRunMode === 'multiwindow', () => { this.draftRunMode = 'multiwindow'; })
+          SettingsOptionPill({
+            label: '传统模拟器窗口',
+            active: this.draftRunMode === 'emulator',
+            onTap: () => { this.animateOption(() => { this.draftRunMode = 'emulator'; }); }
+          })
+          SettingsOptionPill({
+            label: '自由多窗口模式',
+            active: this.draftRunMode === 'multiwindow',
+            onTap: () => { this.animateOption(() => { this.draftRunMode = 'multiwindow'; }); }
+          })
         }
         Text(
           this.draftRunMode === 'emulator'
             ? '启动后直接打开独立完整 Android 桌面模拟器窗口，并支持随时将前台应用拆出'
-            : '容器后台运行，通过「应用」中心以独立鸿蒙原生窗口启动各个 Android 应用'
+            : '容器后台运行（单容器模式），通过「应用」中心以独立鸿蒙原生窗口启动各个 Android 应用'
         )
           .fontSize(FontSize.MICRO)
           .fontColor($r('sys.color.font_tertiary'))
@@ -533,12 +650,18 @@ export struct DeviceSettingsSheet {
           ForEach(
             RESOLUTION_PRESETS,
             (item: ResolutionPresetItem) => {
-              this.optionPill(item.label, this.draftResKey === item.key, () => {
-                this.draftResKey = item.key;
-                this.draftWidth = item.w;
-                this.draftHeight = item.h;
-                this.draftDpi = computeDpiForSize(item.w, item.h);
-                this.draftDeviceType = item.w > item.h ? 'tablet' : 'phone';
+              SettingsOptionPill({
+                label: item.label,
+                active: this.draftResKey === item.key,
+                onTap: () => {
+                  this.animateOption(() => {
+                    this.draftResKey = item.key;
+                    this.draftWidth = item.w;
+                    this.draftHeight = item.h;
+                    this.draftDpi = computeDpiForSize(item.w, item.h);
+                    this.draftDeviceType = item.w > item.h ? 'tablet' : 'phone';
+                  });
+                }
               })
             },
             (item: ResolutionPresetItem): string => item.key
@@ -559,10 +682,26 @@ export struct DeviceSettingsSheet {
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
         Row({ space: Spacing.SM }) {
-          this.optionPill('240 DPI', this.draftDpi === 240, () => { this.draftDpi = 240; })
-          this.optionPill('280 DPI', this.draftDpi === 280, () => { this.draftDpi = 280; })
-          this.optionPill('320 DPI', this.draftDpi === 320, () => { this.draftDpi = 320; })
-          this.optionPill('420 DPI', this.draftDpi === 420, () => { this.draftDpi = 420; })
+          SettingsOptionPill({
+            label: '240 DPI',
+            active: this.draftDpi === 240,
+            onTap: () => { this.animateOption(() => { this.draftDpi = 240; }); }
+          })
+          SettingsOptionPill({
+            label: '280 DPI',
+            active: this.draftDpi === 280,
+            onTap: () => { this.animateOption(() => { this.draftDpi = 280; }); }
+          })
+          SettingsOptionPill({
+            label: '320 DPI',
+            active: this.draftDpi === 320,
+            onTap: () => { this.animateOption(() => { this.draftDpi = 320; }); }
+          })
+          SettingsOptionPill({
+            label: '420 DPI',
+            active: this.draftDpi === 420,
+            onTap: () => { this.animateOption(() => { this.draftDpi = 420; }); }
+          })
         }
         Text(`当前画布：${this.draftWidth} × ${this.draftHeight} · ${this.draftDpi} DPI`)
           .fontSize(FontSize.MICRO)
@@ -582,12 +721,12 @@ export struct DeviceSettingsSheet {
   private audioTabBody() {
     Column({ space: Spacing.MD }) {
       Column() {
-        this.toggleRow(
-          '启用 OHAudio 宿主音频桥接',
-          '将 Android 14 音频流低延迟直通至鸿蒙 PC 默认输出设备',
-          this.draftEnableAudio,
-          (v: boolean) => { this.draftEnableAudio = v; }
-        )
+        SettingsToggleRow({
+          title: '启用 OHAudio 宿主音频桥接',
+          desc: '将 Android 14 音频流低延迟直通至鸿蒙 PC 默认输出设备',
+          checked: this.draftEnableAudio,
+          onToggle: (v: boolean) => { this.draftEnableAudio = v; }
+        })
       }
       .width('100%')
       .padding(Spacing.LG)
@@ -810,12 +949,12 @@ export struct DeviceSettingsSheet {
       .alignItems(HorizontalAlign.Start)
 
       Column() {
-        this.toggleRow(
-          '精简磁盘缓存模式',
-          '限制系统临时缓存增长，适合多实例长期保存',
-          this.draftCompactDisk,
-          (v: boolean) => { this.draftCompactDisk = v; }
-        )
+        SettingsToggleRow({
+          title: '精简磁盘缓存模式',
+          desc: '限制系统临时缓存增长，适合多实例长期保存',
+          checked: this.draftCompactDisk,
+          onToggle: (v: boolean) => { this.draftCompactDisk = v; }
+        })
       }
       .width('100%')
       .padding(Spacing.LG)
@@ -859,10 +998,26 @@ export struct DeviceSettingsSheet {
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
         Row({ space: Spacing.SM }) {
-          this.optionPill('5555（默认）', this.draftAdbPort === 5555, () => { this.draftAdbPort = 5555; })
-          this.optionPill('5557', this.draftAdbPort === 5557, () => { this.draftAdbPort = 5557; })
-          this.optionPill('5559', this.draftAdbPort === 5559, () => { this.draftAdbPort = 5559; })
-          this.optionPill('16384', this.draftAdbPort === 16384, () => { this.draftAdbPort = 16384; })
+          SettingsOptionPill({
+            label: '5555（默认）',
+            active: this.draftAdbPort === 5555,
+            onTap: () => { this.animateOption(() => { this.draftAdbPort = 5555; }); }
+          })
+          SettingsOptionPill({
+            label: '5557',
+            active: this.draftAdbPort === 5557,
+            onTap: () => { this.animateOption(() => { this.draftAdbPort = 5557; }); }
+          })
+          SettingsOptionPill({
+            label: '5559',
+            active: this.draftAdbPort === 5559,
+            onTap: () => { this.animateOption(() => { this.draftAdbPort = 5559; }); }
+          })
+          SettingsOptionPill({
+            label: '16384',
+            active: this.draftAdbPort === 16384,
+            onTap: () => { this.animateOption(() => { this.draftAdbPort = 16384; }); }
+          })
         }
         Text(`连接命令：adb connect 127.0.0.1:${this.draftAdbPort}`)
           .fontSize(FontSize.CAPTION)
@@ -894,14 +1049,16 @@ export struct DeviceSettingsSheet {
           ForEach(
             DEVICE_MODEL_PRESETS,
             (preset: DeviceModelPreset) => {
-              this.optionPill(
-                preset.label,
-                this.draftBrand === preset.brand && this.draftModel === preset.model,
-                () => {
-                  this.draftBrand = preset.brand;
-                  this.draftModel = preset.model;
+              SettingsOptionPill({
+                label: preset.label,
+                active: this.draftBrand === preset.brand && this.draftModel === preset.model,
+                onTap: () => {
+                  this.animateOption(() => {
+                    this.draftBrand = preset.brand;
+                    this.draftModel = preset.model;
+                  });
                 }
-              )
+              })
             },
             (preset: DeviceModelPreset): string => preset.label
           )
@@ -1004,33 +1161,33 @@ export struct DeviceSettingsSheet {
   private otherTabBody() {
     Column({ space: Spacing.MD }) {
       Column({ space: Spacing.SM }) {
-        this.toggleRow(
-          '开启 ADB Root 权限',
-          '允许通过 adb shell 以 root 身份调试容器环境',
-          this.draftEnableRoot,
-          (v: boolean) => { this.draftEnableRoot = v; }
-        )
+        SettingsToggleRow({
+          title: '开启 ADB Root 权限',
+          desc: '允许通过 adb shell 以 root 身份调试容器环境',
+          checked: this.draftEnableRoot,
+          onToggle: (v: boolean) => { this.draftEnableRoot = v; }
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.35)
-        this.toggleRow(
-          '后台保活运行',
-          '最小化窗口时保持 Android 实例与推送连接持续在线',
-          this.draftKeepAlive,
-          (v: boolean) => { this.draftKeepAlive = v; }
-        )
+        SettingsToggleRow({
+          title: '后台保活运行',
+          desc: '最小化窗口时保持 Android 实例与推送连接持续在线',
+          checked: this.draftKeepAlive,
+          onToggle: (v: boolean) => { this.draftKeepAlive = v; }
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.35)
-        this.toggleRow(
-          '运行时自动连接游戏手柄',
-          '检测到鸿蒙 GameControllerKit / USB 手柄时自动透传至设备',
-          this.draftAutoGamepad,
-          (v: boolean) => { this.draftAutoGamepad = v; }
-        )
+        SettingsToggleRow({
+          title: '运行时自动连接游戏手柄',
+          desc: '检测到鸿蒙 GameControllerKit / USB 手柄时自动透传至设备',
+          checked: this.draftAutoGamepad,
+          onToggle: (v: boolean) => { this.draftAutoGamepad = v; }
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.35)
-        this.toggleRow(
-          '设备运行时防止电脑休眠',
-          '适合挂机下载或长时间调试任务',
-          this.draftPreventSleep,
-          (v: boolean) => { this.draftPreventSleep = v; }
-        )
+        SettingsToggleRow({
+          title: '设备运行时防止电脑休眠',
+          desc: '适合挂机下载或长时间调试任务',
+          checked: this.draftPreventSleep,
+          onToggle: (v: boolean) => { this.draftPreventSleep = v; }
+        })
       }
       .width('100%')
       .padding(Spacing.LG)
@@ -1039,25 +1196,6 @@ export struct DeviceSettingsSheet {
       .border({ width: 0.6, color: $r('sys.color.comp_divider') })
     }
     .width('100%')
-  }
-
-  @Builder
-  private diagRow(label: string, textVal: string) {
-    Row({ space: Spacing.MD }) {
-      Text(label)
-        .fontSize(FontSize.CAPTION)
-        .fontColor($r('sys.color.font_secondary'))
-        .width(116)
-      Text(textVal)
-        .fontSize(FontSize.CAPTION)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('sys.color.font_primary'))
-        .layoutWeight(1)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-    }
-    .width('100%')
-    .padding({ top: Spacing.XS, bottom: Spacing.XS })
   }
 
   @Builder
@@ -1084,22 +1222,55 @@ export struct DeviceSettingsSheet {
       .width('100%')
 
       Column({ space: Spacing.XS }) {
-        this.diagRow('容器状态', this.diagStatus && this.diagStatus.running ? `运行中 (${this.diagStatus.statusText})` : '未开机')
+        SettingsDiagRow({
+          label: '容器状态',
+          textVal: this.diagStatus && this.diagStatus.running ? `运行中 (${this.diagStatus.statusText})` : '未开机'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('渲染后端', this.diagStatus ? `${formatGpuModeLabel(this.diagStatus.gpuMode)} · ${this.diagStatus.gpuRenderer}` : 'Maleoon Vulkan')
-        this.diagRow('系统调用模式', this.diagStatus ? `${formatSyscallModeLabel(this.diagStatus.syscallMode)} (${this.diagStatus.syscallMode})` : '自适应')
+        SettingsDiagRow({
+          label: '渲染后端',
+          textVal: this.diagStatus ? `${formatGpuModeLabel(this.diagStatus.gpuMode)} · ${this.diagStatus.gpuRenderer}` : 'Maleoon Vulkan'
+        })
+        SettingsDiagRow({
+          label: '系统调用模式',
+          textVal: this.diagStatus ? `${formatSyscallModeLabel(this.diagStatus.syscallMode)} (${this.diagStatus.syscallMode})` : '自适应'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('显示画布', this.diagStatus ? `${this.diagStatus.width}×${this.diagStatus.height} @ ${this.diagStatus.fps}/${this.diagStatus.refreshRate}Hz` : '-')
+        SettingsDiagRow({
+          label: '显示画布',
+          textVal: this.diagStatus ? `${this.diagStatus.width}×${this.diagStatus.height} @ ${this.diagStatus.fps}/${this.diagStatus.refreshRate}Hz` : '-'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('宿主 CPU 拓扑', this.diagStatus && this.diagStatus.topology.length > 0 ? this.diagStatus.topology : 'ARM64 多核')
+        SettingsDiagRow({
+          label: '宿主 CPU 拓扑',
+          textVal: this.diagStatus && this.diagStatus.topology.length > 0 ? this.diagStatus.topology : 'ARM64 多核'
+        })
+        SettingsDiagRow({
+          label: '容器绑定核心',
+          textVal: this.diagStatus && this.diagStatus.cpuset.length > 0 ? this.diagStatus.cpuset : '-'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('CPU / 内存占用', this.diagStatus ? `CPU ${Math.round(this.diagStatus.cpuPercent)}% · ${this.diagStatus.memMb} / ${this.diagStatus.memLimitMb} MB` : '-')
+        SettingsDiagRow({
+          label: '真实内存 (PSS)',
+          textVal: this.diagStatus
+            ? `容器 ${this.diagStatus.memMb} MB (上限 ${this.diagStatus.memLimitMb} MB) · 宿主 ${this.diagStatus.hostMemMb ?? 0} MB / 显存 ${this.diagStatus.gfxMemMb ?? 0} MB`
+            : '-'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('活跃进程数', this.diagStatus ? `${this.diagStatus.activeProcs} 个容器进程` : '0')
+        SettingsDiagRow({
+          label: '活跃进程数',
+          textVal: this.diagStatus ? `${this.diagStatus.activeProcs} 个容器进程 · CPU ${Math.round(this.diagStatus.cpuPercent)}%` : '0'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('窗口代理 WM Agent', this.diagStatus && this.diagStatus.wmAgentReady ? '已连接（支持自由多窗）' : '未就绪')
+        SettingsDiagRow({
+          label: '窗口代理 WM Agent',
+          textVal: this.diagStatus && this.diagStatus.wmAgentReady ? '已连接（支持自由多窗）' : '未就绪'
+        })
         Divider().color($r('sys.color.comp_divider')).opacity(0.3)
-        this.diagRow('当前实例磁盘', formatDiskSize(this.diskUsageMb))
+        SettingsDiagRow({
+          label: '当前实例磁盘',
+          textVal: `${formatDiskSize(this.diskUsageMb)} / ${this.draftDiskLimitGb} GB`
+        })
       }
       .width('100%')
       .padding(Spacing.LG)

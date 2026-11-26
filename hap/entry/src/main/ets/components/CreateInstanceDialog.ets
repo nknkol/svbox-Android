@@ -10,6 +10,32 @@ import {
 import { CreateInstanceOptions, DISK_SIZE_OPTIONS_GB } from '../model/InstanceModel';
 
 @Component
+struct CreateSegmentChip {
+  @Prop label: string = '';
+  @Prop active: boolean = false;
+  onTap: () => void = (): void => {};
+
+  build() {
+    Button({ type: ButtonType.Normal }) {
+      Text(this.label)
+        .fontSize(FontSize.CAPTION)
+        .fontWeight(this.active ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
+    }
+    .height(ControlSize.BTN_SM)
+    .padding({ left: Spacing.MD, right: Spacing.MD })
+    .borderRadius(Radius.CAPSULE)
+    .backgroundColor(this.active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
+    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
+    .hoverEffect(HoverEffect.Highlight)
+    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+    .onClick(() => {
+      this.onTap();
+    })
+  }
+}
+
+@Component
 export struct CreateInstanceSheet {
   compactLayout: boolean = false;
   onConfirm: (opts: CreateInstanceOptions) => void = (): void => {};
@@ -150,26 +176,6 @@ export struct CreateInstanceSheet {
       this.animateSelection(() => {
         this.scenario = key;
       });
-    })
-  }
-
-  @Builder
-  private segmentChip(label: string, active: boolean, onTap: () => void) {
-    Button({ type: ButtonType.Normal }) {
-      Text(label)
-        .fontSize(FontSize.CAPTION)
-        .fontWeight(active ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(active ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
-    }
-    .height(ControlSize.BTN_SM)
-    .padding({ left: Spacing.MD, right: Spacing.MD })
-    .borderRadius(Radius.CAPSULE)
-    .backgroundColor(active ? $r('sys.color.brand') : $r('sys.color.comp_background_tertiary'))
-    .animation({ duration: Motion.DUR_MICRO, curve: Motion.STD_CURVE })
-    .hoverEffect(HoverEffect.Highlight)
-    .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
-    .onClick(() => {
-      this.animateSelection(onTap);
     })
   }
 
@@ -395,9 +401,21 @@ export struct CreateInstanceSheet {
                 wrap: FlexWrap.Wrap,
                 space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
               }) {
-                this.segmentChip('Vulkan 加速', this.gpuMode === 'vulkan', () => { this.gpuMode = 'vulkan'; })
-                this.segmentChip('OpenGL ES', this.gpuMode === 'gles', () => { this.gpuMode = 'gles'; })
-                this.segmentChip('CPU 软渲', this.gpuMode === 'swiftshader', () => { this.gpuMode = 'swiftshader'; })
+                CreateSegmentChip({
+                  label: 'Vulkan 加速',
+                  active: this.gpuMode === 'vulkan',
+                  onTap: () => { this.animateSelection(() => { this.gpuMode = 'vulkan'; }); }
+                })
+                CreateSegmentChip({
+                  label: 'OpenGL ES',
+                  active: this.gpuMode === 'gles',
+                  onTap: () => { this.animateSelection(() => { this.gpuMode = 'gles'; }); }
+                })
+                CreateSegmentChip({
+                  label: 'CPU 软渲',
+                  active: this.gpuMode === 'swiftshader',
+                  onTap: () => { this.animateSelection(() => { this.gpuMode = 'swiftshader'; }); }
+                })
               }
               .layoutWeight(1)
             }
@@ -413,9 +431,21 @@ export struct CreateInstanceSheet {
                 wrap: FlexWrap.Wrap,
                 space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
               }) {
-                this.segmentChip('60 Hz', this.refreshRate === 60, () => { this.refreshRate = 60; })
-                this.segmentChip('90 Hz', this.refreshRate === 90, () => { this.refreshRate = 90; })
-                this.segmentChip('120 Hz', this.refreshRate === 120, () => { this.refreshRate = 120; })
+                CreateSegmentChip({
+                  label: '60 Hz',
+                  active: this.refreshRate === 60,
+                  onTap: () => { this.animateSelection(() => { this.refreshRate = 60; }); }
+                })
+                CreateSegmentChip({
+                  label: '90 Hz',
+                  active: this.refreshRate === 90,
+                  onTap: () => { this.animateSelection(() => { this.refreshRate = 90; }); }
+                })
+                CreateSegmentChip({
+                  label: '120 Hz',
+                  active: this.refreshRate === 120,
+                  onTap: () => { this.animateSelection(() => { this.refreshRate = 120; }); }
+                })
               }
               .layoutWeight(1)
             }
@@ -431,8 +461,16 @@ export struct CreateInstanceSheet {
                 wrap: FlexWrap.Wrap,
                 space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
               }) {
-                this.segmentChip('传统模拟器', this.runMode === 'emulator', () => { this.runMode = 'emulator'; })
-                this.segmentChip('自由多窗', this.runMode === 'multiwindow', () => { this.runMode = 'multiwindow'; })
+                CreateSegmentChip({
+                  label: '传统模拟器',
+                  active: this.runMode === 'emulator',
+                  onTap: () => { this.animateSelection(() => { this.runMode = 'emulator'; }); }
+                })
+                CreateSegmentChip({
+                  label: '自由多窗',
+                  active: this.runMode === 'multiwindow',
+                  onTap: () => { this.animateSelection(() => { this.runMode = 'multiwindow'; }); }
+                })
               }
               .layoutWeight(1)
             }
@@ -449,7 +487,11 @@ export struct CreateInstanceSheet {
                 space: { main: { value: Spacing.SM, unit: LengthUnit.VP }, cross: { value: Spacing.SM, unit: LengthUnit.VP } }
               }) {
                 ForEach(DISK_SIZE_OPTIONS_GB, (gb: number) => {
-                  this.segmentChip(`${gb} GB`, this.diskLimitGb === gb, () => { this.diskLimitGb = gb; })
+                  CreateSegmentChip({
+                    label: `${gb} GB`,
+                    active: this.diskLimitGb === gb,
+                    onTap: () => { this.animateSelection(() => { this.diskLimitGb = gb; }); }
+                  })
                 }, (gb: number) => `create_disk_${gb}`)
               }
               .layoutWeight(1)

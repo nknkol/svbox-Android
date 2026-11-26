@@ -30,7 +30,8 @@ public:
     void SetResourceConfig(const std::string& profile,
                            const std::string& customCpuset,
                            uint32_t memLimitMb,
-                           uint32_t diskLimitGb = 0);
+                           uint32_t diskLimitGb = 0,
+                           uint32_t cpuCores = 0);
     void SetInstanceConfig(const std::string& instanceId,
                            const std::string& dataSubdir,
                            int32_t customDpi,
@@ -59,6 +60,7 @@ public:
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
     bool RunGuestCmd(const std::string& shCmd, const std::string& outPath);
+    std::string InstallApkSync(const std::string& guestApkPath);
     bool DumpProcs(const std::string& outPath);
 
     // Multi-window / WM Agent RPC & slot management
@@ -120,6 +122,7 @@ private:
     int32_t activeNice_ = 0x7fffffff;
     std::string activeSched_;
     std::atomic<uint32_t> memLimitMb_{4096};
+    std::atomic<uint32_t> targetCpuCores_{0};
     std::atomic<uint32_t> diskLimitGb_{64};
     std::atomic<uint32_t> diskLimitMb_{59100};
     std::atomic<uint32_t> rootDiskMb_{1900};

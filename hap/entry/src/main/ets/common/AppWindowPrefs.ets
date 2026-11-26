@@ -283,3 +283,48 @@ class InstanceConfigStore {
 }
 
 export const instanceConfigStore: InstanceConfigStore = new InstanceConfigStore();
+
+export function getCachedIconsDir(filesDir: string, dataSubdir: string): string {
+  const base: string = filesDir.length > 0 ? filesDir : '/data/storage/el2/base/haps/entry/files';
+  const sub: string = dataSubdir.length > 0 ? dataSubdir : 'userdata14';
+  return `${base}/${sub}/icons`;
+}
+
+export function loadCachedAppList(filesDir: string, dataSubdir: string): AndroidAppItem[] {
+  try {
+    const base: string = filesDir.length > 0 ? filesDir : '/data/storage/el2/base/haps/entry/files';
+    const sub: string = dataSubdir.length > 0 ? dataSubdir : 'userdata14';
+    const path: string = `${base}/${sub}/apps_cache.json`;
+    if (!fileIo.accessSync(path)) return [];
+    const stat: fileIo.Stat = fileIo.statSync(path);
+    if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) return [];
+    const f: fileIo.File = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+    const ab: ArrayBuffer = new ArrayBuffer(stat.size);
+    fileIo.readSync(f.fd, ab);
+    fileIo.closeSync(f);
+    const parsed: AndroidAppItem[] = JSON.parse(buffer.from(ab).toString('utf-8')) as AndroidAppItem[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+export function saveCachedAppList(filesDir: string, dataSubdir: string, apps: AndroidAppItem[]): void {
+  try {
+    const base: string = filesDir.length > 0 ? filesDir : '/data/storage/el2/base/haps/entry/files';
+    const sub: string = dataSubdir.length > 0 ? dataSubdir : 'userdata14';
+    const dir: string = `${base}/${sub}`;
+    try {
+      fileIo.mkdirSync(dir, true);
+    } catch (_mk) {
+    }
+    const path: string = `${dir}/apps_cache.json`;
+    const f: fileIo.File = fileIo.openSync(
+      path,
+      fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY
+    );
+    fileIo.writeSync(f.fd, JSON.stringify(apps));
+    fileIo.closeSync(f);
+  } catch (_e) {
+  }
+}
