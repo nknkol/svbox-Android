@@ -253,6 +253,12 @@ struct Index {
         AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
         dirty = true;
       }
+      const reqGms: string | undefined = AppStorage.get<string>('requestedEnableGms');
+      if (reqGms === 'true' || reqGms === 'false') {
+        primary.enableGms = (reqGms === 'true');
+        AppStorage.setOrCreate<string>('requestedEnableGms', '');
+        dirty = true;
+      }
       if (dirty) {
         instanceManager.updateInstance(filesDir, primary);
         this.reloadInstances(false);
@@ -330,6 +336,11 @@ struct Index {
           if (reqDiskGb === 8 || reqDiskGb === 16 || reqDiskGb === 32 || reqDiskGb === 64 || reqDiskGb === 128) {
             target.diskLimitGb = reqDiskGb;
             AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
+          }
+          const reqGms: string | undefined = AppStorage.get<string>('requestedEnableGms');
+          if (reqGms === 'true' || reqGms === 'false') {
+            target.enableGms = (reqGms === 'true');
+            AppStorage.setOrCreate<string>('requestedEnableGms', '');
           }
           instanceManager.updateInstance(this.getSandboxFilesDir(), target);
           this.reloadInstances(false);
@@ -541,7 +552,7 @@ struct Index {
           AppStorage.setOrCreate<number>('refreshRate', primary.refreshRate);
           native.setInstanceConfig(
             primary.id, primary.dataSubdir, primary.dpi, primary.enableAudio,
-            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort
+            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort, primary.enableGms
           );
           native.setResourceConfig(
             primary.profile, '', primary.memLimitMb, primary.diskLimitGb, primary.cpuCores
@@ -638,7 +649,8 @@ struct Index {
         inst.enableRoot,
         inst.deviceBrand,
         inst.deviceModel,
-        inst.adbPort
+        inst.adbPort,
+        inst.enableGms
       );
       native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb, inst.cpuCores);
       native.setGpuMode(inst.gpuMode);

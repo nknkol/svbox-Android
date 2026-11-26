@@ -1,6 +1,8 @@
 # Android rootfs & images (downloaded externally, never committed)
 rootfs/
 rootfs14/
+gms_cache/
+gms_layer14/
 *.tar
 *.tar.gz
 *.img

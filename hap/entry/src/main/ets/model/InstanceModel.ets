@@ -55,6 +55,7 @@ export interface DeviceInstance {
   compactDisk: boolean;
   enableAudio: boolean;
   enableRoot: boolean;
+  enableGms: boolean;
   keepAlive: boolean;
   preventSleep: boolean;
   autoGamepad: boolean;
@@ -129,6 +130,7 @@ export function cloneInstanceRecord(src: DeviceInstance): DeviceInstance {
     compactDisk: src.compactDisk,
     enableAudio: src.enableAudio,
     enableRoot: src.enableRoot,
+    enableGms: src.enableGms === true,
     keepAlive: src.keepAlive,
     preventSleep: src.preventSleep,
     autoGamepad: src.autoGamepad,
@@ -215,6 +217,7 @@ class InstanceManagerStore {
       compactDisk: false,
       enableAudio: true,
       enableRoot: true,
+      enableGms: false,
       keepAlive: true,
       preventSleep: false,
       autoGamepad: true,
@@ -371,6 +374,7 @@ class InstanceManagerStore {
         compactDisk: opts.compactDisk,
         enableAudio: true,
         enableRoot: true,
+        enableGms: false,
         keepAlive: true,
         preventSleep: false,
         autoGamepad: true,

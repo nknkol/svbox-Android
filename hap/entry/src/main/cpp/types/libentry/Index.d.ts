@@ -3,6 +3,8 @@ export interface RuntimeStatus {
   paused: boolean;
   connected: boolean;
   wmAgentReady: boolean;
+  gmsAvailable?: boolean;
+  gmsEnabled?: boolean;
   vsyncActive: boolean;
   inputReady: boolean;
   audioActive: boolean;
@@ -69,7 +71,8 @@ export const setInstanceConfig: (
   enableRoot: boolean,
   brand: string,
   model: string,
-  adbPort: number
+  adbPort: number,
+  enableGms?: boolean
 ) => boolean;
 export const getActiveInstanceId: () => string;
 export const getInstanceDiskMb: (filesDir: string, dataSubdir: string) => number;

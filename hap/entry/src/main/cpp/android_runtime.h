@@ -39,7 +39,8 @@ public:
                            bool enableRoot,
                            const std::string& brand,
                            const std::string& model,
-                           int32_t adbPort);
+                           int32_t adbPort,
+                           bool enableGms = false);
     std::string ActiveInstanceId() const;
     std::string DataSubdir() const;
     std::string ShareHostDir() const;
@@ -80,6 +81,8 @@ public:
     std::string ActiveCpuset() const;
     uint32_t MemLimitMb() const { return memLimitMb_.load(); }
     uint32_t DiskLimitGb() const { return diskLimitGb_.load(); }
+    bool IsGmsEnabled() const { return enableGms_.load(); }
+    bool IsGmsAvailable() const;
     SchedQos::Telemetry GetTelemetry();
 
 private:
@@ -116,6 +119,7 @@ private:
     std::atomic<int32_t> customDpi_{0};
     std::atomic<bool> enableAudio_{true};
     std::atomic<bool> enableRoot_{true};
+    std::atomic<bool> enableGms_{false};
     std::atomic<int32_t> adbPort_{5555};
     std::string customCpuset_;
     std::string activeCpuset_;
@@ -148,6 +152,7 @@ private:
     std::string dataBase_;
     std::string rootUpper_;
     std::string injectLayer_;
+    std::string gmsLayerDir_;
     std::string shareHostDir_;
     std::string svboxPath_;
     std::string netSockPath_;

@@ -1449,12 +1449,18 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         svboxPath_,
         "--root", rootUpper_,
         "--lower", injectLayer_,
+    };
+    if (enableGms_.load() && !gmsLayerDir_.empty()) {
+        args.push_back("--lower");
+        args.push_back(gmsLayerDir_);
+    }
+    args.insert(args.end(), {
         "--lower", rootfs_,
         "-u", "0:0",
         "--cap-add", "ALL",
         "--seccomp-backstop",
         "--trap-sigsys",
-    };
+    });
     if (syscallMode == "pure_seccomp") {
         args.push_back("--no-inline-patch");
     } else if (syscallMode != "inline") {
@@ -1763,7 +1769,8 @@ void AndroidRuntime::SetInstanceConfig(const std::string& instanceId,
                                        bool enableRoot,
                                        const std::string& brand,
                                        const std::string& model,
-                                       int32_t adbPort) {
+                                       int32_t adbPort,
+                                       bool enableGms) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!instanceId.empty()) {
         activeInstanceId_ = instanceId;
@@ -1777,9 +1784,22 @@ void AndroidRuntime::SetInstanceConfig(const std::string& instanceId,
     customDpi_.store(customDpi >= 120 && customDpi <= 640 ? customDpi : 0);
     enableAudio_.store(enableAudio);
     enableRoot_.store(enableRoot);
+    enableGms_.store(enableGms);
     deviceBrand_ = brand;
     deviceModel_ = model;
     adbPort_.store((adbPort >= 1024 && adbPort <= 65535) ? adbPort : 5555);
+}
+
+bool AndroidRuntime::IsGmsAvailable() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!gmsLayerDir_.empty() && FileExists(gmsLayerDir_ + "/system/priv-app/GmsCore/GmsCore.apk")) {
+        return true;
+    }
+    if (!sandboxFiles_.empty() && FileExists(sandboxFiles_ + "/gms_layer14/system/priv-app/GmsCore/GmsCore.apk")) {
+        return true;
+    }
+    std::string base = androidDir_.empty() ? "/storage/Users/currentUser/Workspace/svbox-Android" : androidDir_;
+    return FileExists(base + "/gms_layer14/system/priv-app/GmsCore/GmsCore.apk");
 }
 
 std::string AndroidRuntime::ActiveInstanceId() const {
@@ -1890,6 +1910,12 @@ std::string AndroidRuntime::Start(const std::string& sandboxTempDir,
     gpuGuestDir_ = gpuGuestDir;
     androidDir_ = androidDir;
     rootfs_ = rootfs;
+    gmsLayerDir_.clear();
+    if (FileExists(sandboxFiles + "/gms_layer14/system/priv-app/GmsCore/GmsCore.apk")) {
+        gmsLayerDir_ = sandboxFiles + "/gms_layer14";
+    } else if (FileExists(androidDir + "/gms_layer14/system/priv-app/GmsCore/GmsCore.apk")) {
+        gmsLayerDir_ = androidDir + "/gms_layer14";
+    }
     displayW_.store(width);
     displayH_.store(height);
 
@@ -2860,9 +2886,19 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "ro.boot.redroid_height=" + std::to_string(height) + "\n"
             "ro.boot.redroid_fps=" + std::to_string(targetHz) + "\n";
     }
+    const bool gmsActive = enableGms_.load() && !gmsLayerDir_.empty();
+    std::string gmsProps;
+    if (gmsActive) {
+        gmsProps =
+            "ro.control_privapp_permissions=log\n"
+            "ro.setupwizard.mode=DISABLED\n"
+            "ro.com.google.gmsversion=14_202405\n"
+            "ro.com.google.clientidbase=android-google\n";
+    }
     WriteFile(overrideProp,
         gpuProps +
         deviceProps +
+        gmsProps +
         "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
@@ -3567,22 +3603,36 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             }
         }
         const std::string wmSockCopy = ipcDir + "/wm_agent.sock";
-        std::thread([this, targetHz, allowRoot, hasWmAgent, wmSockCopy, logDir]() {
+        const bool gmsActive = enableGms_ && !gmsLayerDir_.empty();
+        std::thread([this, targetHz, allowRoot, hasWmAgent, gmsActive, wmSockCopy, logDir]() {
             // Wait ~8s for system_server + PackageManager + DisplayManager to come online, then start wm_agent
             for (int i = 0; i < 16 && running_.load(); ++i) {
                 if (!SleepCancelableMs(500)) return;
             }
             if (!running_.load()) return;
 
-            if (!allowRoot && running_.load()) {
-                std::vector<std::string> setArgv = BaseSvboxArgs();
-                setArgv.push_back("--");
-                setArgv.push_back("system/bin/sh");
-                setArgv.push_back("-c");
-                setArgv.push_back(
-                    "settings put global adb_enabled 0; "
-                    "settings put global development_settings_enabled 0");
-                Spawn(setArgv, true);
+            if (running_.load()) {
+                std::string initCmd;
+                if (!allowRoot) {
+                    initCmd += "settings put global adb_enabled 0; "
+                               "settings put global development_settings_enabled 0; ";
+                }
+                if (gmsActive) {
+                    initCmd += "pm enable com.android.vending >/dev/null 2>&1 || true; ";
+                } else {
+                    // If Play Store previously self-updated into /data/app while GMS was ON,
+                    // disable the orphaned update cleanly when booting in pure-AOSP mode.
+                    initCmd += "(pm list packages -e | grep -q '^package:com.android.vending$' && "
+                               "pm disable-user --user 0 com.android.vending >/dev/null 2>&1) || true; ";
+                }
+                if (!initCmd.empty()) {
+                    std::vector<std::string> setArgv = BaseSvboxArgs();
+                    setArgv.push_back("--");
+                    setArgv.push_back("system/bin/sh");
+                    setArgv.push_back("-c");
+                    setArgv.push_back(initCmd);
+                    Spawn(setArgv, true);
+                }
             }
 
             if (hasWmAgent) {

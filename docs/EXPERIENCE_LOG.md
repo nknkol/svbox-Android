@@ -1096,6 +1096,20 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - 根因：HarmonyOS PC 上 `OH_NativeXComponent` 对鼠标点击会同时触发 `DispatchMouseEventCB` 与 `DispatchTouchEventCB`，双指同时落点导致 Chromium/Blink `WebView` 将单击误判为双指手势并吞掉点击。
   - 修复：`DispatchTouchEventCB` 过滤 `OH_NATIVEXCOMPONENT_SOURCE_TYPE_MOUSE` / `OH_NATIVEXCOMPONENT_TOOL_TYPE_MOUSE`，同时在 `InputBridge` 增加 40ms/6px 同坐标鼠触去重兜底。真机验证：Edge 顺利通过隐私确认并流畅打开 `https://www.baidu.com`。
 
+### 2026-11-26 阶段 1–3：核心基础修复、输入桥接与自由多窗重构、GMS 只读叠加层
+- **阶段 1（commit `810326e`）**：
+  - 修复 `DeviceSettingsDialog.ets` 与 `CreateInstanceDialog.ets` 因 `@Builder` 按值传参导致选项点击不切换状态的问题（重构为响应式 `@Component` + `@Prop`）。
+  - 取消 `"12-19"` 20 核硬编码，改为运行时探测宿主机 `cpu_capacity` / `cpuinfo_max_freq` / ALU 拓扑，按 `性能模式 × cpuCores` 动态绑定核心（为 6/8/12 核移动设备做好准备）。
+  - 内存统计由虚高的 RSS 求和改为真实物理内存 **PSS**（`/proc/<pid>/smaps_rollup` + HiDebug `nmem.pss`）。
+  - 新增应用列表离线缓存（`apps_cache.json` + 持久化 `dataBase_/icons`）与点击自动启动单容器，新增本地 APK 离线选择器安装（`picker.DocumentViewPicker` + `installLocalApkAsync`）。
+- **阶段 2（commit `a3c5d88`）**：
+  - `SvboxWmAgent` 切换为 `SHELL_UID`（`-u 2000:2000`，`com.android.shell`，对齐 scrcpy），实现中文输入法文本桥接（`INPUT_TEXT`、`SEND_KEY_COMBO`）与双向剪贴板同步（`SET_CLIPBOARD`/`GET_CLIPBOARD`/`CLIPBOARD_CHANGED` + 鸿蒙零 ACL `PasteButton`），实机验证中文 UTF-8 双向往返与 `Denying clipboard access = 0`。
+  - 自由多窗重构为**支持模式**（`adaptive`，`resetAspectRatio()` + 100% 实时跟手拉伸 + 80ms 防抖单飞 `RESIZE_DISPLAY`，修复 `tickStatus` 回写旧尺寸）与**兼容模式**（`fixed_portrait`/`fixed_landscape`，使用单窗隔离 API `win.setContentAspectRatio(ratio, false, true)` 锁定比例不污染主控台）。
+- **阶段 3（可开关 GMS 测试叠加层）**：
+  - 基于开源 `MindTheGapps-14.0.0-arm64` 通过 `scripts/prepare_gms_layer.py` 组装精简只读层 `gms_layer14/`（24 文件，215.3 MiB；剔除 SetupWizard/Velvet 等容器冲突组件，并将 `product`/`system_ext` 映射至 `system/` 避免被 bind-mount 遮蔽），零修改 `rootfs14/`。
+  - 全链路贯通 `enableGms` 开关（C++ `--lower gms_layer14` + `override.prop` / NAPI / UI「设备设置→其他」/ `--ps enableGms`），并在关闭 GMS 时自动停用可能残留于 `/data/app` 的 Play Store 自更新包避免后台崩溃。
+  - 真机验证：`com.google.android.gms`、`com.google.android.gsf`、`com.android.vending` 等 7 个包与 6 个核心进程稳定运行，零 FATAL/privapp 异常，Google Play 商店成功打开并自动更新至 `54.4.11`，点击登录直达 Google 账号登录页（`MinuteMaidActivity`）。
+
 
 
 

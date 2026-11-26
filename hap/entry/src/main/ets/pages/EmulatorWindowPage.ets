@@ -107,7 +107,7 @@ struct EmulatorWindowPage {
       try {
         native.setInstanceConfig(
           inst.id, inst.dataSubdir, inst.dpi, inst.enableAudio,
-          inst.enableRoot, inst.deviceBrand, inst.deviceModel, inst.adbPort
+          inst.enableRoot, inst.deviceBrand, inst.deviceModel, inst.adbPort, inst.enableGms
         );
         native.setResourceConfig(inst.profile, '', inst.memLimitMb, inst.diskLimitGb, inst.cpuCores);
         native.setGpuMode(inst.gpuMode);

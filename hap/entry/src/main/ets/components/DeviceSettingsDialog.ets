@@ -161,6 +161,7 @@ export struct DeviceSettingsSheet {
   @State private draftDpi: number = 320;
   @State private draftEnableAudio: boolean = true;
   @State private draftEnableRoot: boolean = true;
+  @State private draftEnableGms: boolean = false;
   @State private draftKeepAlive: boolean = true;
   @State private draftPreventSleep: boolean = false;
   @State private draftAutoGamepad: boolean = true;
@@ -202,6 +203,7 @@ export struct DeviceSettingsSheet {
       this.draftDpi = this.instance.dpi;
       this.draftEnableAudio = this.instance.enableAudio;
       this.draftEnableRoot = this.instance.enableRoot;
+      this.draftEnableGms = this.instance.enableGms === true;
       this.draftKeepAlive = this.instance.keepAlive;
       this.draftPreventSleep = this.instance.preventSleep;
       this.draftAutoGamepad = this.instance.autoGamepad;
@@ -274,6 +276,7 @@ export struct DeviceSettingsSheet {
       this.draftDpi = 320;
       this.draftEnableAudio = true;
       this.draftEnableRoot = true;
+      this.draftEnableGms = false;
       this.draftKeepAlive = true;
       this.draftPreventSleep = false;
       this.draftAutoGamepad = true;
@@ -305,6 +308,7 @@ export struct DeviceSettingsSheet {
     next.dpi = this.draftDpi;
     next.enableAudio = this.draftEnableAudio;
     next.enableRoot = this.draftEnableRoot;
+    next.enableGms = this.draftEnableGms;
     next.keepAlive = this.draftKeepAlive;
     next.preventSleep = this.draftPreventSleep;
     next.autoGamepad = this.draftAutoGamepad;
@@ -1161,6 +1165,15 @@ export struct DeviceSettingsSheet {
   private otherTabBody() {
     Column({ space: Spacing.MD }) {
       Column({ space: Spacing.SM }) {
+        SettingsToggleRow({
+          title: '启用 Google 服务框架（GMS / Google Play）',
+          desc: this.diagStatus && this.diagStatus.gmsAvailable
+            ? '以只读 Overlay 层叠加 GMS Core 与 Play 商店（不修改 rootfs14，重启设备生效）'
+            : '未检测到 gms_layer14 扩展层，请先运行 scripts/prepare_gms_layer.py 准备镜像层',
+          checked: this.draftEnableGms,
+          onToggle: (v: boolean) => { this.draftEnableGms = v; }
+        })
+        Divider().color($r('sys.color.comp_divider')).opacity(0.35)
         SettingsToggleRow({
           title: '开启 ADB Root 权限',
           desc: '允许通过 adb shell 以 root 身份调试容器环境',

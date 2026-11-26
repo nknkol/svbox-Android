@@ -26,6 +26,7 @@ export default class EntryAbility extends UIAbility {
     const rawRoot: Object | undefined = want.parameters ? want.parameters['enableRoot'] : undefined;
     const rawSyscall: Object | undefined = want.parameters ? want.parameters['syscallMode'] : undefined;
     const rawDiskGb: Object | undefined = want.parameters ? want.parameters['diskLimitGb'] : undefined;
+    const rawGms: Object | undefined = want.parameters ? want.parameters['enableGms'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
     const uiModeStr: string = typeof rawUiMode === 'string' ? rawUiMode : '';
     const gpuStr: string = typeof rawGpu === 'string' ? rawGpu : '';
@@ -40,6 +41,7 @@ export default class EntryAbility extends UIAbility {
     const rootStr: string = typeof rawRoot === 'string' ? rawRoot : (typeof rawRoot === 'boolean' ? String(rawRoot) : '');
     const syscallStr: string = typeof rawSyscall === 'string' ? rawSyscall : '';
     const diskGbStr: string = typeof rawDiskGb === 'string' ? rawDiskGb : (typeof rawDiskGb === 'number' ? String(rawDiskGb) : '');
+    const gmsStr: string = typeof rawGms === 'string' ? rawGms : (typeof rawGms === 'boolean' ? String(rawGms) : '');
 
     if (setHzStr.length > 0 && autoStr.length === 0) {
       const hz: number = Number(setHzStr);
@@ -95,6 +97,9 @@ export default class EntryAbility extends UIAbility {
       if (gb === 8 || gb === 16 || gb === 32 || gb === 64 || gb === 128) {
         AppStorage.setOrCreate<number>('requestedDiskLimitGb', gb);
       }
+    }
+    if (gmsStr === 'true' || gmsStr === 'false') {
+      AppStorage.setOrCreate<string>('requestedEnableGms', gmsStr);
     }
     if (resStr.length > 0) {
       AppStorage.setOrCreate<string>('resolution', resStr);

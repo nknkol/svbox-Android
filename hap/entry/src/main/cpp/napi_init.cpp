@@ -800,8 +800,8 @@ int RunTarCmd(const std::vector<std::string>& args) {
 }
 
 napi_value SetInstanceConfigNapi(napi_env env, napi_callback_info info) {
-    size_t argc = 8;
-    napi_value args[8] = {};
+    size_t argc = 9;
+    napi_value args[9] = {};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     std::string id = argc > 0 ? GetStringArg(env, args[0]) : "inst_0";
     std::string subdir = argc > 1 ? GetStringArg(env, args[1]) : "userdata14";
@@ -811,7 +811,8 @@ napi_value SetInstanceConfigNapi(napi_env env, napi_callback_info info) {
     std::string brand = argc > 5 ? GetStringArg(env, args[5]) : "";
     std::string model = argc > 6 ? GetStringArg(env, args[6]) : "";
     int32_t adbPort = argc > 7 ? GetInt32Arg(env, args[7], 5555) : 5555;
-    AndroidRuntime::Instance().SetInstanceConfig(id, subdir, dpi, audio, root, brand, model, adbPort);
+    bool enableGms = argc > 8 ? GetBoolArg(env, args[8], false) : false;
+    AndroidRuntime::Instance().SetInstanceConfig(id, subdir, dpi, audio, root, brand, model, adbPort, enableGms);
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
@@ -1122,6 +1123,8 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setBool("paused", rt.IsPaused());
     setBool("connected", useGfx ? gfx.IsConnected() : hwc.IsConnected());
     setBool("wmAgentReady", rt.IsWmAgentReady());
+    setBool("gmsAvailable", rt.IsGmsAvailable());
+    setBool("gmsEnabled", rt.IsGmsEnabled());
     setBool("vsyncActive", useGfx ? gfx.IsActive() : hwc.UsingNativeVsync());
     setBool("inputReady", inp.HasTouchClient() || inp.HasKbdClient());
     setBool("gamepadReady", inp.HasGamepadClient());

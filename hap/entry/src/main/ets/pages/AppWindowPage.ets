@@ -203,7 +203,7 @@ struct AppWindowPage {
         if (primary) {
           native.setInstanceConfig(
             primary.id, primary.dataSubdir, primary.dpi, primary.enableAudio,
-            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort
+            primary.enableRoot, primary.deviceBrand, primary.deviceModel, primary.adbPort, primary.enableGms
           );
           native.setResourceConfig(
             primary.profile, '', primary.memLimitMb, primary.diskLimitGb, primary.cpuCores
