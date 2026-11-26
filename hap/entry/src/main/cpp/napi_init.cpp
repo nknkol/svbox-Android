@@ -546,6 +546,13 @@ napi_value SetPausedNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value TrimMemoryNapi(napi_env env, napi_callback_info /*info*/) {
+    std::string res = AndroidRuntime::Instance().TrimMemory();
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, res.c_str(), NAPI_AUTO_LENGTH, &out);
+    return out;
+}
+
 napi_value SaveRawSnapshotNapi(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4] = {};
@@ -1228,6 +1235,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "pollWmEvents", nullptr, PollWmEventsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getDisplayStats", nullptr, GetDisplayStatsNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setPaused", nullptr, SetPausedNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "trimMemory", nullptr, TrimMemoryNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setVisible", nullptr, SetVisibleNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "saveRawSnapshot", nullptr, SaveRawSnapshotNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "runGuestCmd", nullptr, RunGuestCmdNapi, nullptr, nullptr, nullptr, napi_default, nullptr },

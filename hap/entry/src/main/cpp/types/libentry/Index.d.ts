@@ -97,6 +97,7 @@ export const setSyscallMode: (syscallMode: string) => boolean;
 export const setRefreshRate: (hz: number) => boolean;
 export const setDisplayRefreshRate: (slot: number, hz: number) => boolean;
 export const setPaused: (paused: boolean) => string;
+export const trimMemory: () => string;
 export const setVisible: (visible: boolean) => boolean;
 export const setDisplayVisible: (slot: number, visible: boolean) => boolean;
 export const saveRawSnapshot: (path: string, width: number, height: number, pixels: ArrayBuffer) => boolean;

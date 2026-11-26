@@ -1109,6 +1109,13 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - 基于开源 `MindTheGapps-14.0.0-arm64` 通过 `scripts/prepare_gms_layer.py` 组装精简只读层 `gms_layer14/`（24 文件，215.3 MiB；剔除 SetupWizard/Velvet 等容器冲突组件，并将 `product`/`system_ext` 映射至 `system/` 避免被 bind-mount 遮蔽），零修改 `rootfs14/`。
   - 全链路贯通 `enableGms` 开关（C++ `--lower gms_layer14` + `override.prop` / NAPI / UI「设备设置→其他」/ `--ps enableGms`），并在关闭 GMS 时自动停用可能残留于 `/data/app` 的 Play Store 自更新包避免后台崩溃。
   - 真机验证：`com.google.android.gms`、`com.google.android.gsf`、`com.android.vending` 等 7 个包与 6 个核心进程稳定运行，零 FATAL/privapp 异常，Google Play 商店成功打开并自动更新至 `54.4.11`，点击登录直达 Google 账号登录页（`MinuteMaidActivity`）。
+- **阶段 4（单容器瘦身与内存占用优化）**：
+  - Layer 1 `svbox`（commits `31a60db`、`e957ef2`）：补全 `--mem-mb` 模式下 `/proc/meminfo` 的 `Cached`/`KReclaimable`/`Buffers`/`Active`/`Inactive`/`SwapTotal`/`SwapFree` 上限裁剪，修复 Android 误判 `Free RAM = 14.5 GB (Lost -12.4 GB)` 导致从不回收缓存进程的根因。
+  - Layer 2 `svbox-Android`：
+    1. 启动后自动回收残留 `bootanimation` 进程（`53.9 MB -> 0 MB` PSS + 释放宿主 EGL 缓冲）。
+    2. `SvboxWmAgent` 新增基于 `lastUpdateTime` 的磁盘标签缓存 `/ipc/icons/labels.tsv` 并采用紧凑堆参数 `-Xms4m -Xmx32m`，避免 `PackageManager.loadLabel/loadIcon` 在 `ResourcesManager` 永久 mmap 全部已安装 APK（`.apk mmap 28.0 -> 2.5 MB`，`SvboxWmAgent` 总 PSS `146.0 -> 111.8 MB`）。
+    3. 按 `memLimitMb`（2G/4G/6G/8G+）分档动态注入 `dalvik.vm.heap*`（`heaptargetutilization=0.75`）、限制 `dalvik.vm.madvise.*` 预读膨胀、配置 `activity_manager_constants max_cached_processes`，并新增 `trimMemory()` 一键清理与全窗隐藏 20 秒自动后台清理机制。
+  - 真机验证（4GB 档纯净 AOSP 空闲态）：总 Guest PSS 从 `1,413.1 MB` 降至 `1,183.1 MB`（`-230 MB / -16.3%`），Cached PSS 从 `237.3 MB` 降至 `13.7 MB`（`-94.2%`），`dumpsys meminfo` 空闲估算恢复真实（`Free 644 MB`）。
 
 
 

@@ -93,6 +93,8 @@ struct Index {
   @State private fps: number = 0;
   @State private cpuPercent: number = 0;
   @State private memMb: number = 0;
+  @State private hostMemMb: number = 0;
+  @State private gfxMemMb: number = 0;
   @State private memLimitMb: number = 4096;
   @State private activeProcs: number = 0;
   @State private gpuRenderer: string = '';
@@ -381,6 +383,8 @@ struct Index {
       }
       this.cpuPercent = st.cpuPercent;
       this.memMb = st.memMb;
+      this.hostMemMb = st.hostMemMb ?? 0;
+      this.gfxMemMb = st.gfxMemMb ?? 0;
       this.memLimitMb = st.memLimitMb;
       this.activeProcs = st.activeProcs;
       this.gpuRenderer = st.gpuRenderer;
@@ -1519,7 +1523,8 @@ struct Index {
         Text(
           `${inst.width}×${inst.height} · ${inst.dpi} DPI` +
           (this.isInstanceRunning(inst)
-            ? ` · ${this.fps} FPS · ${this.activeProcs} 进程 · 内存 ${this.memMb} MB`
+            ? ` · ${this.fps} FPS · ${this.activeProcs} 进程 · PSS ${this.memMb} MB` +
+              (this.gfxMemMb > 0 ? ` (显存 ${this.gfxMemMb} MB)` : '')
             : ` · 分区 ${inst.dataSubdir}`)
         )
           .fontSize(FontSize.CAPTION)
@@ -1576,6 +1581,21 @@ struct Index {
               }
             })
           }
+
+          Button({ type: ButtonType.Circle }) {
+            SymbolGlyph($r('sys.symbol.clean_fill'))
+              .fontSize(IconSize.SM)
+              .fontColor([$r('sys.color.brand')])
+          }
+          .width(ControlSize.BTN_MD)
+          .height(ControlSize.BTN_MD)
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .hoverEffect(HoverEffect.Highlight)
+          .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.92 })
+          .onClick(() => {
+            native.trimMemory();
+            this.showToast('正在释放闲置缓存内存...');
+          })
 
           Button({ type: ButtonType.Circle }) {
             SymbolGlyph(this.paused ? $r('sys.symbol.play_fill') : $r('sys.symbol.pause_fill'))
@@ -2434,7 +2454,8 @@ struct Index {
           Row({ space: Spacing.SM }) {
             Circle({ width: 7, height: 7 })
               .fill(this.paused ? $r('sys.color.alert') : $r('sys.color.confirm'))
-            Text(`${this.refreshRate}Hz · CPU ${Math.round(this.cpuPercent)}% · ${this.memMb} MB`)
+            Text(`${this.refreshRate}Hz · CPU ${Math.round(this.cpuPercent)}% · PSS ${this.memMb} MB` +
+              (this.hostMemMb > 0 ? ` (+宿主 ${this.hostMemMb} MB)` : ''))
               .fontSize(FontSize.MICRO)
               .fontColor($r('sys.color.font_secondary'))
           }

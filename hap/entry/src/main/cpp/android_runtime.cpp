@@ -1228,6 +1228,29 @@ void AndroidRuntime::OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWind
 
 void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
     const bool show = visible && !paused_.load();
+    if (displaySlot >= 0 && displaySlot < 16) {
+        const uint32_t bit = 1u << static_cast<uint32_t>(displaySlot);
+        uint32_t prev = visibleDisplayMask_.load();
+        uint32_t next = visible ? (prev | bit) : (prev & ~bit);
+        while (!visibleDisplayMask_.compare_exchange_weak(prev, next)) {
+            next = visible ? (prev | bit) : (prev & ~bit);
+        }
+        if (visible) {
+            hideSeq_.fetch_add(1);
+        } else if (prev != 0 && next == 0 && running_.load() && !paused_.load()) {
+            const uint64_t seq = hideSeq_.fetch_add(1) + 1;
+            std::thread([this, seq]() {
+                for (int i = 0; i < 40 && running_.load(); ++i) {
+                    if (hideSeq_.load() != seq || visibleDisplayMask_.load() != 0 || paused_.load()) return;
+                    if (!SleepCancelableMs(500)) return;
+                }
+                if (running_.load() && !paused_.load() &&
+                    hideSeq_.load() == seq && visibleDisplayMask_.load() == 0) {
+                    TrimMemory();
+                }
+            }).detach();
+        }
+    }
     if (displaySlot == 0) {
         if (UseGfxstream()) {
             GfxstreamBridge::Instance().SetVisible(show);
@@ -1238,6 +1261,67 @@ void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
     }
     if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
     GfxstreamBridge::Instance().SetDisplayVisible(displaySlot, show);
+}
+
+void AndroidRuntime::ReapBootAnimation() {
+    pid_t pid = bootanimPid_.exchange(-1);
+    if (pid <= 0) return;
+    int st = 0;
+    if (waitpid(pid, &st, WNOHANG) == 0) {
+        kill(-pid, SIGTERM);
+        kill(pid, SIGTERM);
+        for (int waited = 0; waited < 250; waited += 25) {
+            if (waitpid(pid, &st, WNOHANG) != 0) {
+                OH_LOG_INFO(LOG_APP, "Reaped bootanimation pid=%d cleanly (SIGTERM)", static_cast<int>(pid));
+                return;
+            }
+            usleep(25000);
+        }
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, WNOHANG);
+        OH_LOG_INFO(LOG_APP, "Reaped bootanimation pid=%d (SIGKILL)", static_cast<int>(pid));
+    }
+}
+
+std::string AndroidRuntime::TrimMemory() {
+    if (!running_.load()) return "Not running";
+    if (paused_.load()) return "Paused";
+    bool expected = false;
+    if (!trimBusy_.compare_exchange_strong(expected, true)) {
+        return "Trimming";
+    }
+    std::thread([this]() {
+        struct Guard {
+            std::atomic<bool>& flag;
+            ~Guard() { flag.store(false); }
+        } guard{ trimBusy_ };
+        auto before = GetTelemetry();
+        if (running_.load() && !paused_.load()) {
+            std::vector<std::string> argv = BaseSvboxArgs();
+            argv.push_back("--");
+            argv.push_back("system/bin/sh");
+            argv.push_back("-c");
+            argv.push_back("am kill-all >/dev/null 2>&1 || true");
+            pid_t p = Spawn(argv, true);
+            if (p > 0) {
+                int st = 0;
+                for (int waited = 0; waited < 2500 && running_.load(); waited += 50) {
+                    if (waitpid(p, &st, WNOHANG) != 0) break;
+                    usleep(50000);
+                }
+            }
+        }
+        if (running_.load() && wmAgentReady_.load() && !paused_.load()) {
+            (void)WmRpc("TRIM_MEMORY", 2000);
+        }
+        auto after = GetTelemetry();
+        OH_LOG_INFO(LOG_APP, "TrimMemory: guestPSS %u->%u MB hostPSS %u->%u MB gfx %u->%u MB",
+                    before.containerRssMb, after.containerRssMb,
+                    before.hostNativeRssMb, after.hostNativeRssMb,
+                    before.graphicsMemMb, after.graphicsMemMb);
+    }).detach();
+    return "Trimming memory...";
 }
 
 std::string AndroidRuntime::IconsHostDir() const {
@@ -2895,10 +2979,55 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             "ro.com.google.gmsversion=14_202405\n"
             "ro.com.google.clientidbase=android-google\n";
     }
+    // Scale ART Dalvik heap & eager madvise caps to configured container RAM tier
+    // (cuts empty heap slack from 50% -> 25% and stops 100 MB+ cold odex/vdex pre-faulting).
+    const uint32_t memTierMb = memLimitMb_.load();
+    std::string memProps;
+    if (memTierMb <= 2048) {
+        memProps =
+            "ro.config.low_ram=true\n"
+            "dalvik.vm.heapstartsize=8m\n"
+            "dalvik.vm.heapgrowthlimit=128m\n"
+            "dalvik.vm.heapsize=256m\n"
+            "dalvik.vm.heaptargetutilization=0.75\n"
+            "dalvik.vm.heapminfree=2m\n"
+            "dalvik.vm.heapmaxfree=8m\n";
+    } else if (memTierMb <= 4096) {
+        memProps =
+            "dalvik.vm.heapstartsize=8m\n"
+            "dalvik.vm.heapgrowthlimit=192m\n"
+            "dalvik.vm.heapsize=384m\n"
+            "dalvik.vm.heaptargetutilization=0.75\n"
+            "dalvik.vm.heapminfree=4m\n"
+            "dalvik.vm.heapmaxfree=12m\n";
+    } else if (memTierMb <= 6144) {
+        memProps =
+            "dalvik.vm.heapstartsize=12m\n"
+            "dalvik.vm.heapgrowthlimit=256m\n"
+            "dalvik.vm.heapsize=512m\n"
+            "dalvik.vm.heaptargetutilization=0.75\n"
+            "dalvik.vm.heapminfree=4m\n"
+            "dalvik.vm.heapmaxfree=16m\n";
+    } else {
+        memProps =
+            "dalvik.vm.heapstartsize=16m\n"
+            "dalvik.vm.heapgrowthlimit=384m\n"
+            "dalvik.vm.heapsize=512m\n"
+            "dalvik.vm.heaptargetutilization=0.75\n"
+            "dalvik.vm.heapminfree=8m\n"
+            "dalvik.vm.heapmaxfree=24m\n";
+    }
+    memProps +=
+        "dalvik.vm.madvise.artfile.size=33554432\n"
+        "dalvik.vm.madvise.odexfile.size=16777216\n"
+        "dalvik.vm.madvise.vdexfile.size=16777216\n"
+        "pm.dexopt.bg-dexopt=verify\n";
+
     WriteFile(overrideProp,
         gpuProps +
         deviceProps +
         gmsProps +
+        memProps +
         "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
         "debug.stagefright.ccodec=0\n"
@@ -3555,7 +3684,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         // Note: stock vendor/bin/hw/android.hardware.bluetooth@1.1-service.sim has an upstream
         // compile-time ABI bug in initialize_impl() (optional<Address> offset 16 vs 32) causing
         // unconditional SIGABRT; Bluetooth feature is cleanly declared unavailable above.
-        launchPaced("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" });
+        bootanimPid_.store(runSvbox("bootanimation", { "-e", sfLdPath, "system/bin/bootanimation" }));
         if (!SleepCancelableMs(40)) return;
 
         int zfd = MakeListenUnix(sockDir + "/zygote");
@@ -3604,7 +3733,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
         const std::string wmSockCopy = ipcDir + "/wm_agent.sock";
         const bool gmsActive = enableGms_ && !gmsLayerDir_.empty();
-        std::thread([this, targetHz, allowRoot, hasWmAgent, gmsActive, wmSockCopy, logDir]() {
+        const uint32_t memTierPost = memLimitMb_.load();
+        const int maxCachedProcs = (memTierPost <= 2048) ? 8
+                                 : (memTierPost <= 4096) ? 12
+                                 : (memTierPost <= 6144) ? 16 : 24;
+        std::thread([this, targetHz, allowRoot, hasWmAgent, gmsActive, maxCachedProcs, wmSockCopy, logDir]() {
             // Wait ~8s for system_server + PackageManager + DisplayManager to come online, then start wm_agent
             for (int i = 0; i < 16 && running_.load(); ++i) {
                 if (!SleepCancelableMs(500)) return;
@@ -3612,7 +3745,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             if (!running_.load()) return;
 
             if (running_.load()) {
-                std::string initCmd;
+                std::string initCmd =
+                    "settings put global activity_manager_constants max_cached_processes=" +
+                    std::to_string(maxCachedProcs) + "; ";
                 if (!allowRoot) {
                     initCmd += "settings put global adb_enabled 0; "
                                "settings put global development_settings_enabled 0; ";
@@ -3650,6 +3785,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 wmArgv.push_back("CLASSPATH=/data/local/tmp/svbox_wm/svbox-wm-agent.jar");
                 wmArgv.push_back("--");
                 wmArgv.push_back("system/bin/app_process64");
+                wmArgv.push_back("-Xms4m");
+                wmArgv.push_back("-Xmx32m");
                 wmArgv.push_back("-Xusejit:false");
                 wmArgv.push_back("-Dsvbox.jni.dir=/data/local/tmp/svbox_wm");
                 wmArgv.push_back("/system/bin");
@@ -3673,11 +3810,22 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                 }
             }
 
+            // Reap bootanimation once system_server & wm_agent are online (~54 MB PSS + EGL buffers freed).
+            ReapBootAnimation();
+
             if (targetHz != 60 && running_.load()) {
                 int32_t curHz = refreshRate_.load();
                 if (curHz == targetHz) {
                     SetRefreshRate(curHz);
                 }
+            }
+
+            // Wait ~4s for Launcher3 / boot broadcasts to settle, then shed one-shot boot receivers.
+            for (int i = 0; i < 8 && running_.load(); ++i) {
+                if (!SleepCancelableMs(500)) return;
+            }
+            if (running_.load() && !paused_.load()) {
+                TrimMemory();
             }
         }).detach();
     }
@@ -3756,6 +3904,9 @@ std::string AndroidRuntime::Stop() {
     running_.store(false);
     paused_.store(false);
     wmAgentReady_.store(false);
+    bootanimPid_.store(-1);
+    visibleDisplayMask_.store(0);
+    hideSeq_.fetch_add(1);
 
     auto killAndReapPids = [&]() {
         std::vector<pid_t> pidsCopy;

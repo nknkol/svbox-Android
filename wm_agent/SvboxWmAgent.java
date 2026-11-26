@@ -7,8 +7,11 @@ import android.content.ComponentName;
 import android.hardware.display.IVirtualDisplayCallback;
 import android.view.Surface;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -439,6 +442,8 @@ public class SvboxWmAgent {
             } else if ("GET_TASKS".equals(cmd)) {
                 int slot = parts.length >= 2 ? Integer.parseInt(parts[1]) : -1;
                 return cmdGetTasks(slot);
+            } else if ("TRIM_MEMORY".equals(cmd)) {
+                return cmdTrimMemory();
             }
             return "{\"ok\":false,\"error\":\"unknown command\"}";
         } catch (Throwable t) {
@@ -1091,6 +1096,43 @@ public class SvboxWmAgent {
         File iconDirFile = new File(iconsDir);
         if (!iconDirFile.exists()) iconDirFile.mkdirs();
 
+        // Disk-backed pkg -> (lastUpdateTime, label) cache avoids opening APKs via
+        // PackageManager.loadLabel/loadIcon (which permanently mmaps every APK in ResourcesManager).
+        Map<String, String> labelCache = new HashMap<String, String>();
+        Map<String, Long> mtimeCache = new HashMap<String, Long>();
+        File labelCacheFile = new File(iconDirFile, "labels.tsv");
+        if (labelCacheFile.exists()) {
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(new InputStreamReader(new FileInputStream(labelCacheFile), StandardCharsets.UTF_8));
+                String ln;
+                while ((ln = br.readLine()) != null) {
+                    int t1 = ln.indexOf('\t');
+                    int t2 = t1 > 0 ? ln.indexOf('\t', t1 + 1) : -1;
+                    if (t1 > 0 && t2 > t1) {
+                        String p = ln.substring(0, t1);
+                        try {
+                            long mt = Long.parseLong(ln.substring(t1 + 1, t2));
+                            String lb = ln.substring(t2 + 1);
+                            mtimeCache.put(p, Long.valueOf(mt));
+                            labelCache.put(p, lb);
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (br != null) {
+                    try { br.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        boolean cacheDirty = false;
+        boolean touchedApk = false;
+        Method getPkgInfo = null;
+        try {
+            getPkgInfo = pm.getClass().getMethod("getPackageInfo", String.class, int.class);
+        } catch (Throwable ignored) {}
+
         Set<String> seenPkgs = new HashSet<String>();
         StringBuilder sb = new StringBuilder();
         sb.append("{\"ok\":true,\"apps\":[");
@@ -1105,12 +1147,35 @@ public class SvboxWmAgent {
                 if (pkg == null || pkg.isEmpty() || !seenPkgs.add(pkg)) continue;
                 if ("com.android.launcher3".equals(pkg) || "com.android.quickstep".equals(pkg)) continue;
 
-                String label = pkg;
-                try {
-                    Object cs = ri.getClass().getMethod("loadLabel",
-                            Class.forName("android.content.pm.PackageManager")).invoke(ri, pm);
-                    if (cs != null && cs.toString().length() > 0) label = cs.toString();
-                } catch (Throwable ignored) {}
+                long lastUpdate = 0L;
+                if (getPkgInfo != null) {
+                    try {
+                        Object pi = getPkgInfo.invoke(pm, pkg, 0);
+                        if (pi != null) {
+                            Field f = findField(pi.getClass(), "lastUpdateTime");
+                            if (f != null) lastUpdate = f.getLong(pi);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+
+                Long cachedMt = mtimeCache.get(pkg);
+                String cachedLb = labelCache.get(pkg);
+                boolean metaFresh = !forceIcons && cachedMt != null && cachedMt.longValue() == lastUpdate
+                        && cachedLb != null && cachedLb.length() > 0;
+
+                String label = metaFresh ? cachedLb : pkg;
+                if (!metaFresh) {
+                    try {
+                        Object cs = ri.getClass().getMethod("loadLabel",
+                                Class.forName("android.content.pm.PackageManager")).invoke(ri, pm);
+                        if (cs != null && cs.toString().length() > 0) label = cs.toString();
+                        touchedApk = true;
+                    } catch (Throwable ignored) {}
+                    String cleanLabel = label.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
+                    labelCache.put(pkg, cleanLabel);
+                    mtimeCache.put(pkg, Long.valueOf(lastUpdate));
+                    cacheDirty = true;
+                }
 
                 Object appInfo = getFieldObj(ai, "applicationInfo");
                 int appFlags = appInfo != null ? getIntField(appInfo, "flags", 0) : 0;
@@ -1131,8 +1196,9 @@ public class SvboxWmAgent {
                 String iconFileName = pkg + ".png";
                 File iconOut = new File(iconDirFile, iconFileName);
                 boolean hasIcon = iconOut.exists() && iconOut.length() > 0 && iconOut.length() <= 100 * 1024;
-                if (!hasIcon || forceIcons) {
+                if (!hasIcon || forceIcons || !metaFresh) {
                     hasIcon = exportAppIconPng(ri, pm, iconOut);
+                    touchedApk = true;
                 }
 
                 if (!first) sb.append(',');
@@ -1150,8 +1216,44 @@ public class SvboxWmAgent {
                         .append("}");
             }
         }
+        if (cacheDirty) {
+            File tmp = new File(iconDirFile, "labels.tsv.tmp");
+            FileOutputStream fos = null;
+            try {
+                fos = new FileOutputStream(tmp);
+                StringBuilder cb = new StringBuilder();
+                for (Map.Entry<String, String> e : labelCache.entrySet()) {
+                    Long mt = mtimeCache.get(e.getKey());
+                    cb.append(e.getKey()).append('\t')
+                            .append(mt != null ? mt.longValue() : 0L).append('\t')
+                            .append(e.getValue()).append('\n');
+                }
+                fos.write(cb.toString().getBytes(StandardCharsets.UTF_8));
+                fos.close();
+                fos = null;
+                tmp.renameTo(labelCacheFile);
+            } catch (Throwable ignored) {
+                tmp.delete();
+            } finally {
+                if (fos != null) {
+                    try { fos.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        if (touchedApk) {
+            System.gc();
+        }
         sb.append("]}");
         return sb.toString();
+    }
+
+    private String cmdTrimMemory() {
+        Runtime rt = Runtime.getRuntime();
+        long beforeKb = (rt.totalMemory() - rt.freeMemory()) / 1024L;
+        System.gc();
+        System.runFinalization();
+        long afterKb = (rt.totalMemory() - rt.freeMemory()) / 1024L;
+        return "{\"ok\":true,\"beforeKb\":" + beforeKb + ",\"afterKb\":" + afterKb + "}";
     }
 
     private boolean exportAppIconPng(Object resolveInfo, Object pm, File outFile) {

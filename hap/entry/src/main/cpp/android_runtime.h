@@ -60,6 +60,7 @@ public:
     void SetDisplayVisible(int32_t displaySlot, bool visible);
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
+    std::string TrimMemory();
     bool RunGuestCmd(const std::string& shCmd, const std::string& outPath);
     std::string InstallApkSync(const std::string& guestApkPath);
     bool DumpProcs(const std::string& outPath);
@@ -88,6 +89,7 @@ public:
 private:
     AndroidRuntime() = default;
     void FlushGuestStateBeforeStop();
+    void ReapBootAnimation();
     void BootWorker(std::string mode, int32_t width, int32_t height);
     void LmkdLoop(std::string sockPath);
     void LogdwLoop(std::string sockPath, std::string outPath);
@@ -166,6 +168,10 @@ private:
     std::string rootfs_;
 
     std::atomic<bool> wmAgentReady_{false};
+    std::atomic<pid_t> bootanimPid_{-1};
+    std::atomic<uint32_t> visibleDisplayMask_{0};
+    std::atomic<uint64_t> hideSeq_{0};
+    std::atomic<bool> trimBusy_{false};
     std::string wmSockPath_;
     std::string iconsHostDir_;
     std::thread wmEventThread_;
