@@ -1034,6 +1034,19 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - 冷启动后 `webview_zygote`、`com.android.webview:sandboxed_process0`（真实内核 Seccomp-BPF 零警告）、`media.extractor`、`media.swcodec` 全部零报错常驻；`org.chromium.webview_shell` 加载本地 HTML/JS（V8 JIT `6*7=42`）与真实 HTTPS 网页（`https://www.qq.com/`、`https://m.baidu.com/`）完整渲染无白屏；《王者荣耀》内点击「与QQ好友玩」2 秒内正常弹出清晰「QQ 授权登录」WebView 页面，连续 3 次冷启动零白块。
   - **系统调用替换模式实测对比**：`inline`（原版全量内联）因修改 `/data` 下游戏 `.so` 代码段约 <20s 触发 `SIGBUS`；`hybrid`（系统库内联 + `/data` seccomp）与 `adaptive`（Zygote/App 全走 seccomp + BPF 直通）均可完整进入公告/登录页且零白块，但约 60s 处仍存在后续待查的周期性退出（`hybrid` `SIGSEGV` / `adaptive` `SIGBUS`）。
 
+### 11.13 根治登录后 / 60s 周期性 `SIGBUS`/`SIGSEGV` 闪退（Layer 1 `/proc/<pid>/map_files` 能力校验与隐藏 + `[vvar]/[vdso]` 归一化）
+- **现象**：用户通过 QQ WebView 登录并进入《王者荣耀》游戏大厅后约 44–60s，主进程与 `xg_vip_service` 周期性以 `signal 7 (Bus error)` / `signal 11 (Segmentation fault)` 退出（即使切换 `pure_seccomp` 零代码页改写依然复现）。
+- **精准根因（通过 `svbox` 自身系统调用边界环形缓冲审计定位，未触碰任何第三方二进制）**：
+  1. 退出前触发线程连续执行了 **1,014 次 `readlinkat("/proc/self/map_files/<lo>-<hi>")`**。`svbox` 此前已虚拟化 `/proc/<pid>/maps`、`smaps` 与 `/proc/<pid>/fd`，但完全遗漏了 `/proc/<pid>/map_files`。
+  2. 上游 Linux 5.15 内核（`fs/proc/base.c`）要求 `CAP_SYS_ADMIN` 或 `CAP_CHECKPOINT_RESTORE` 才允许列举/解析 `/proc/<pid>/map_files`（普通非特权 UID 应返回 `-EPERM`），而鸿蒙内核未校验容器虚拟能力，导致普通应用直接读出了 `0x3f00000000` 处的 `/data/app/svbox.org/.../svbox`、`/memfd:elf-mounts (deleted)`、`owner.db`、`.svbox_svc_cache` 等宿主运行时内部映射。
+  3. 同时 `/proc/<pid>/maps` 中仍暴露鸿蒙内核特有的特殊 VMA 名称 `[kshare]` / `[shmm]`（标准 Linux 为 `[vvar]` / `[vdso]`），且 `path_is_internal_runtime()` 遗漏 `/memfd:elf-mounts`。
+- **Layer 1 `svbox` 通用 Linux 修复（[`vfs_bridge_internal.h`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_bridge_internal.h)、[`vfs_ops.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_ops.c)、[`vfs_procfs.c`](file:///storage/Users/currentUser/Workspace/svbox/src/payload/logic/vfs_procfs.c)，零 Android/游戏代码）**：
+  1. 新增 `pb_proc_map_files_guard()` 并在 `proot_proc_filter_pids()` 扩展对 `/proc/<pid>/map_files` 目录 `getdents64` 的处理：对无 `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE` 的非特权容器进程严格按 Linux 5.15 语义返回 `-EPERM`（并清零目录缓冲防字节残留）；对特权进程过滤掉全部受保护/内部运行时映射并经 `vma_track` / 容器路径翻译目标。
+  2. 在 `path_is_internal_runtime()` 补齐 `/memfd:elf-mounts`，并在 `pb_proc_maps()` 中于 `platform_is_harmonyos()` 下将 `[kshare]` / `[shmm]` 归一化为标准 Linux `[vvar]` / `[vdso]`。
+- **真机与全量回归验证（`HAD-W32`，`enableRoot=false`，`syscallMode=adaptive`）**：
+  - `svbox` 全量回归 **100% PASS**（`make check-oci`、`test/vfs/test_svc.py` 84/84、`test/fs_policy/fake_ids.py`、`backstop.py`）；容器内 root 列举 `/proc/self/map_files` 0 泄漏、UID `10091` 返回 `EPERM`，`/proc/self/maps` 显示标准 `[vvar]` / `[vdso]`。
+  - 真机实测《王者荣耀》主进程（PID `5199`）成功登录并进入大厅（`_m_isLobbyLoginFinish:True`，连同 `estPlugin`、`webview_zygote`、`sandboxed_process0` 并发运行），**连续稳定存活超过 8 分钟以上零 `SIGBUS`/零 `SIGSEGV`/零 `emuglGLESv2_enc` 报错**，`xg_vip_service`（PID `6826`）同样持续稳定在线 6 分钟以上。
+
 
 
 
