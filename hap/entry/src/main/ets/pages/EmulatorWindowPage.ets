@@ -77,6 +77,7 @@ struct EmulatorWindowPage {
 
   private pollTimer: number = -1;
   private rotSynced: boolean = false;
+  private manualRotating: boolean = false;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
   private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
 
@@ -89,6 +90,14 @@ struct EmulatorWindowPage {
 
   private isRotated90(): boolean {
     return (this.displayRotation & 1) === 1;
+  }
+
+  private surfaceRotateAngle(): number {
+    const r: number = this.displayRotation & 3;
+    if (r === 1) return -90;
+    if (r === 2) return 180;
+    if (r === 3) return 90;
+    return 0;
   }
 
   private visualW(): number {
@@ -182,6 +191,17 @@ struct EmulatorWindowPage {
     }
   }
 
+  private applyGuestRotation(rot: number, resizeWindow: boolean): void {
+    const r: number = rot & 3;
+    const prevLandscape: boolean = this.isRotated90();
+    const nextLandscape: boolean = (r & 1) === 1;
+    this.displayRotation = r;
+    native.setDisplay0Rotation(r);
+    if (resizeWindow || prevLandscape !== nextLandscape) {
+      this.applyEmulatorAspectLock(true);
+    }
+  }
+
   private async syncDisplayRotationFromGuest(): Promise<void> {
     if (this.rotSynced || !native.isWmAgentReady()) return;
     this.rotSynced = true;
@@ -191,9 +211,7 @@ struct EmulatorWindowPage {
       if (rep.ok && rep.rotation !== undefined) {
         const rot: number = rep.rotation & 3;
         if (rot !== this.displayRotation) {
-          this.displayRotation = rot;
-          native.setDisplay0Rotation(rot);
-          await this.applyEmulatorAspectLock(true);
+          this.applyGuestRotation(rot, true);
         }
       }
     } catch (_e) {
@@ -206,6 +224,7 @@ struct EmulatorWindowPage {
       return;
     }
     const nextRot: number = this.isRotated90() ? 0 : 1;
+    this.manualRotating = true;
     try {
       const raw: string = await native.wmRpcAsync(`SET_DISPLAY_ROTATION ${nextRot}`);
       const rep: RotationReply = JSON.parse(raw) as RotationReply;
@@ -213,12 +232,15 @@ struct EmulatorWindowPage {
         this.showToast('屏幕旋转失败');
         return;
       }
-      this.displayRotation = nextRot;
-      native.setDisplay0Rotation(nextRot);
-      await this.applyEmulatorAspectLock(true);
+      const applied: number = rep.rotation !== undefined ? (rep.rotation & 3) : nextRot;
+      this.applyGuestRotation(applied, true);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'handleToggleRotation failed: %{public}s', String(err));
       this.showToast(`旋转异常：${String(err)}`);
+    } finally {
+      setTimeout(() => {
+        this.manualRotating = false;
+      }, 250);
     }
   }
 
@@ -299,6 +321,14 @@ struct EmulatorWindowPage {
           this.dispH = cur.height;
           this.applyEmulatorAspectLock(false);
         }
+        if (!this.manualRotating && cur.displayRotation !== undefined) {
+          const guestRot: number = cur.displayRotation & 3;
+          if (guestRot !== this.displayRotation) {
+            hilog.info(0x0000, TAG, 'Auto-following Android Display 0 rotation: %{public}d -> %{public}d',
+              this.displayRotation, guestRot);
+            this.applyGuestRotation(guestRot, true);
+          }
+        }
         if ((cur.refreshRate === 60 || cur.refreshRate === 90 || cur.refreshRate === 120) &&
             this.refreshRate !== cur.refreshRate) {
           this.refreshRate = cur.refreshRate;
@@ -306,7 +336,7 @@ struct EmulatorWindowPage {
         if (this.statusText !== cur.statusText) this.statusText = cur.statusText;
       } catch (_e) {
       }
-    }, 1000);
+    }, 250);
   }
 
   aboutToDisappear(): void {
@@ -609,7 +639,7 @@ struct EmulatorWindowPage {
           .defaultFocus(true)
           .width(this.surfaceBoxW())
           .height(this.surfaceBoxH())
-          .rotate({ angle: this.isRotated90() ? -90 : 0 })
+          .rotate({ angle: this.surfaceRotateAngle() })
           .backgroundColor('#000000')
 
         if (this.keymapProfile.enabled && this.keymapProfile.showHints &&

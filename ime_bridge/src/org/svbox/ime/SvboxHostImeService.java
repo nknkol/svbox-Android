@@ -121,20 +121,23 @@ public class SvboxHostImeService extends InputMethodService {
 
     private int resolveDisplayId() {
         try {
-            Dialog dlg = getWindow();
-            if (dlg != null && dlg.getWindow() != null) {
-                Context wctx = dlg.getWindow().getContext();
-                if (wctx != null) {
-                    int did = wctx.getDisplayId();
-                    if (did >= 0) return did;
-                }
-            }
-        } catch (Throwable ignored) {}
-        try {
             Display d = getDisplay();
             if (d != null) {
                 int did = d.getDisplayId();
                 if (did >= 0) return did;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Dialog dlg = getWindow();
+            if (dlg != null && dlg.getWindow() != null) {
+                Context wctx = dlg.getWindow().getContext();
+                if (wctx != null) {
+                    Display d = wctx.getDisplay();
+                    if (d != null) {
+                        int did = d.getDisplayId();
+                        if (did >= 0) return did;
+                    }
+                }
             }
         } catch (Throwable ignored) {}
         return 0;

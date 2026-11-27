@@ -11,6 +11,7 @@ export interface RuntimeStatus {
   frames: number;
   width: number;
   height: number;
+  displayRotation?: number;
   fps: number;
   refreshRate: number;
   cpuPercent: number;

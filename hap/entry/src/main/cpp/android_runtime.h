@@ -53,6 +53,7 @@ public:
     int32_t RefreshRate() const { return refreshRate_.load(); }
     int32_t DisplayWidth() const { return displayW_.load(); }
     int32_t DisplayHeight() const { return displayH_.load(); }
+    int32_t Display0Rotation() const { return display0Rotation_.load(); }
     void OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h);
     void OnSurfaceDestroyed(OHNativeWindow* window = nullptr);
     void OnDisplaySurfaceChanged(int32_t displaySlot, OHNativeWindow* window, int32_t w, int32_t h);
@@ -152,6 +153,7 @@ private:
     std::atomic<int32_t> refreshRate_{60};
     std::atomic<int32_t> displayW_{720};
     std::atomic<int32_t> displayH_{1280};
+    std::atomic<int32_t> display0Rotation_{0};
 
     OHNativeWindow* surfaceWindow_ = nullptr;
     OHNativeWindow* secondaryWindow_[9] = {};

@@ -1147,25 +1147,18 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - 实测踩坑 3（横屏桌面/抽屉被挤成中间 405px 竖条）：Android 14 `Launcher3QuickStep` 在 `sw<600dp` 手机规格下默认 `pref_allowRotation=false` 并调用 `setRequestedOrientation(SCREEN_ORIENTATION_NOSENSOR)`，当 Display 0 锁定为横屏 `1280×720` 时，`ActivityRecord` 会对 `resizeableActivity=true` 的 `QuickstepLauncher` 施加居中 `405×720` 方向信箱裁剪，导致抽屉 4 列图标被硬塞进 `202dp` 宽度并截断文字。修复：在 `android_runtime.cpp` 启动前原地（保 inode/owner.db）及首启 `initCmd` 为 `com.android.launcher3.prefs.xml` / `com.android.launcher3.device.prefs.xml` 写入 `pref_allowRotation=true`，横屏桌面（右侧垂直 Dock）与全宽 16:9 应用抽屉（完整中文标签、零信箱、零拥挤）实机验证通过。
     - `EmulatorWindowPage.ets` 与 `AppWindowPage.ets` 标题栏通过 `.onAreaChange` 实时测量 `barVpW` 并为图标添加 `.flexShrink(0)`，窄屏时自动将 FPS 徽章、多任务、输入法、拆出、键鼠映射、宏录制按优先级收入 `更多 ⋮` 菜单，宽屏自动展开，彻底消除左侧图标裁剪。
   - **真机实测（`HAD-W32`）**：冷启动 `Fatal signal = 0`；竖屏 `760×1427` 零裁剪零黑边 -> 点击旋转切换横屏 `1480×909`（`105/120Hz` + 完整工具栏展开 + 点击精准启动 WebView）-> 点击 `about:blank` 输入框自动触发 `Host IME attached`（零警告）并弹出原生小艺拼音候选框 -> 实测物理键盘 `nihao`+空格上屏 `你好`、`shijie`+空格+退格变为 `你好世` -> 回主页自动 `Host IME detached` -> 旋转回竖屏 `760×1427` 完整闭环。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- **2026-11-27 传统模拟器横屏游戏自动旋转跟随（修复横屏游戏被压缩成顶部横条）**：
+  - **双根因**：
+    1. **误锁 `mFixedToUserRotation=ENABLED`**：此前 `SvboxWmAgent.cmdSetDisplayRotation()` 无论手动旋横还是旋回竖屏都无条件调用 `setFixedToUserRotation(0, 2 /* ENABLED */)`，导致切回竖屏后 Android 14 `DisplayRotation` 永久忽略游戏声明的 `screenOrientation="sensorLandscape"`，把横屏游戏（如棕色尘埃 2 `com.neowizgames.game.browndust2`）强行压缩成竖屏顶部 `720×405` 窄条。
+    2. **宿主窗口未监听 Display 0 运行时旋转事件**：即使 Android 14 主动将 Display 0 从 `ROTATION_0` 旋至 `ROTATION_90`，`EmulatorWindowPage.ets` 仅在启动时同步一次方向，未订阅后续旋转变更，导致鸿蒙窗口保持竖屏、画面未随游戏自动横置。
+  - **修复**：
+    - `wm_agent/SvboxWmAgent.java`：新增 `rotationWatchLoop()`（120ms 轮询 `getDefaultDisplayRotation()`），旋转变化即时推送 `{"event":"DISPLAY_ROTATION_CHANGED","slot":0,"rotation":<0..3>}`；重写 `cmdSetDisplayRotation()`，优先以 `setFixedToUserRotation(0, 0 /* DEFAULT */)` + `freezeDisplayRotation(0, r)` 执行手动旋转，仅当前台应用主动抗拒手动旋转时才临时启用 `ENABLED`，并在 `onTaskMovedToFront()` 前台包切换时自动清除临时锁；同时在 `android_runtime.cpp` `initCmd` 启动时执行 `wm fixed-to-user-rotation default` 清理历史持久化锁态。
+    - `android_runtime.h/.cpp` + `napi_init.cpp` + `Index.d.ts`：`WmEventLoop` 收到 `DISPLAY_ROTATION_CHANGED` 立即更新原子 `display0Rotation_` 并同步 `InputBridge::Instance().SetDisplay0Rotation(rot)`，通过 O(1) `getStatus().displayRotation` 暴露给 ArkTS。
+    - `EmulatorWindowPage.ets`：将状态轮询提升至 250ms，检测到 `displayRotation` 变化自动调用 `applyGuestRotation()`（支持 0/90/180/270 四向旋转）并自动按新方向重锁宽高比与缩放鸿蒙窗口（竖屏 `760×1427` ↔ 横屏 `1480×909`）。
+    - 顺带优化 `ime_bridge/src/org/svbox/ime/SvboxHostImeService.java` 优先走公开 API 30+ `getDisplay().getDisplayId()`，消除 logcat 中 `Context;->getDisplayId()` 隐藏 API 警告。
+  - **真机实测（`HAD-W32`）**：
+    - 竖屏主屏（`760×1427`）上滑打开应用抽屉直接点击 **BrownDust II**（不点手动旋转）：`wm_agent` 推送 `DISPLAY_ROTATION_CHANGED (0 -> 1)`，`SvboxEmuPage` 自动跟随将窗口无黑边切换至横屏 `1480×909`，全屏 16:9 Vulkan 画面零压缩，点击设置齿轮精准命中弹出设置弹窗；
+    - 点击主页（`⌂`）：自动回落 `1 -> 0` 恢复竖屏 `760×1427`；
+    - 手动点击旋转至横屏再手动旋回竖屏后再次进入 **BrownDust II**：仍能自动旋转至 `1480×909`（无 `fixed-to-user-rotation` 粘滞）；`org.svbox.ime` 零隐藏 API 警告。
 
 

@@ -1185,6 +1185,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     setI64("frames", static_cast<int64_t>(useGfx ? gfx.FrameCount() : hwc.FrameCount()));
     setI32("width", useGfx ? gfx.FrameWidth() : hwc.FrameWidth());
     setI32("height", useGfx ? gfx.FrameHeight() : hwc.FrameHeight());
+    setI32("displayRotation", rt.Display0Rotation());
     setI32("fps", useGfx ? gfx.Fps() : hwc.Fps());
     setI32("refreshRate", rt.RefreshRate());
     setDouble("cpuPercent", tel.systemCpuPercent);

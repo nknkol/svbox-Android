@@ -98,6 +98,8 @@ public class SvboxWmAgent {
     private volatile int imeFd = -1;
     private volatile boolean imeFocused = false;
     private volatile int imeFocusSlot = 0;
+    private volatile boolean tempFixedRotationActive = false;
+    private volatile String lastDisplay0TopPkg = "";
     private volatile String lastClipText = "";
     private final Map<Integer, DisplaySlot> slotsByIdx = new HashMap<Integer, DisplaySlot>();
     private final Map<Integer, DisplaySlot> slotsByAndroidId = new HashMap<Integer, DisplaySlot>();
@@ -164,6 +166,15 @@ public class SvboxWmAgent {
             }, "svbox-ime-ensure");
             imeEnsureThread.setDaemon(true);
             imeEnsureThread.start();
+
+            Thread rotWatchThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    rotationWatchLoop();
+                }
+            }, "svbox-rot-watch");
+            rotWatchThread.setDaemon(true);
+            rotWatchThread.start();
 
             log("SvboxWmAgent ready: ctrl=" + ctrlSockPath + " present=" + presentSockPath);
             looperCls.getMethod("loop").invoke(null);
@@ -236,6 +247,16 @@ public class SvboxWmAgent {
                 @Override
                 public void onTaskMovedToFront(ActivityManager.RunningTaskInfo info) {
                     if (info != null && info.topActivity != null) {
+                        if (info.displayId == 0) {
+                            String d0Pkg = info.topActivity.getPackageName();
+                            if (d0Pkg != null && !d0Pkg.equals(lastDisplay0TopPkg)) {
+                                lastDisplay0TopPkg = d0Pkg;
+                                if (tempFixedRotationActive) {
+                                    tempFixedRotationActive = false;
+                                    clearFixedToUserRotation();
+                                }
+                            }
+                        }
                         handleTaskEvent(info.taskId, info.displayId,
                                 info.topActivity.getPackageName(),
                                 info.topActivity.flattenToShortString());
@@ -1475,27 +1496,63 @@ public class SvboxWmAgent {
         return "{\"ok\":false,\"error\":\"ime not connected\"}";
     }
 
+    private int queryDisplay0Rotation() {
+        try {
+            if (windowMgr != null) {
+                Object val = windowMgr.getClass().getMethod("getDefaultDisplayRotation").invoke(windowMgr);
+                if (val instanceof Integer) return ((Integer) val).intValue() & 3;
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    private void clearFixedToUserRotation() {
+        try {
+            if (windowMgr != null) {
+                windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
+                        .invoke(windowMgr, 0, 0 /* FIXED_TO_USER_ROTATION_DEFAULT */);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void rotationWatchLoop() {
+        int lastRot = -1;
+        while (true) {
+            try {
+                if (windowMgr != null) {
+                    int rot = queryDisplay0Rotation();
+                    if (rot != lastRot) {
+                        lastRot = rot;
+                        String ev = "{\"event\":\"DISPLAY_ROTATION_CHANGED\",\"slot\":0,\"rotation\":" + rot + "}";
+                        log("Emit " + ev);
+                        broadcastEvent(ev);
+                    }
+                }
+                Thread.sleep(120);
+            } catch (Throwable ignored) {
+                try { Thread.sleep(300); } catch (InterruptedException ignored2) { return; }
+            }
+        }
+    }
+
     private String cmdSetDisplayRotation(int rot) {
         try {
             if (windowMgr != null) {
                 if (rot < 0) {
-                    try {
-                        windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
-                                .invoke(windowMgr, 0, 0 /* DEFAULT */);
-                    } catch (Throwable ignored) {}
+                    tempFixedRotationActive = false;
+                    clearFixedToUserRotation();
                     try {
                         windowMgr.getClass().getMethod("thawDisplayRotation", int.class)
                                 .invoke(windowMgr, 0);
                     } catch (Throwable ignored) {}
-                    return "{\"ok\":true,\"rotation\":0,\"locked\":false}";
+                    return "{\"ok\":true,\"rotation\":" + queryDisplay0Rotation() + ",\"locked\":false}";
                 }
                 int r = rot & 3;
-                try {
-                    windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
-                            .invoke(windowMgr, 0, 2 /* ENABLED */);
-                } catch (Throwable t) {
-                    log("setFixedToUserRotation warning: " + t);
-                }
+                // First try standard user-rotation with fixedToUserRotation=DEFAULT (0) so
+                // landscape games (Brown Dust II, Honor of Kings, etc.) still auto-rotate
+                // naturally when launched from portrait mode instead of being squished!
+                tempFixedRotationActive = false;
+                clearFixedToUserRotation();
                 boolean frozen = false;
                 try {
                     windowMgr.getClass().getMethod("freezeDisplayRotation", int.class, int.class)
@@ -1510,31 +1567,42 @@ public class SvboxWmAgent {
                     } catch (Throwable ignored) {}
                 }
                 if (frozen) {
-                    return "{\"ok\":true,\"rotation\":" + r + ",\"locked\":true}";
+                    // Check if the foreground activity honored the requested orientation.
+                    // If a portrait/landscape-locked app resisted manual rotation, apply a
+                    // temporary fixed-to-user-rotation override (auto-cleared on app switch).
+                    try { Thread.sleep(160); } catch (InterruptedException ignored) {}
+                    int actual = queryDisplay0Rotation();
+                    if (actual != r) {
+                        try {
+                            windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
+                                    .invoke(windowMgr, 0, 2 /* FIXED_TO_USER_ROTATION_ENABLED */);
+                            windowMgr.getClass().getMethod("freezeDisplayRotation", int.class, int.class)
+                                    .invoke(windowMgr, 0, r);
+                            tempFixedRotationActive = true;
+                            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+                            actual = queryDisplay0Rotation();
+                        } catch (Throwable t) {
+                            log("temporary fixedToUserRotation override warn: " + t);
+                        }
+                    }
+                    return "{\"ok\":true,\"rotation\":" + actual + ",\"locked\":true}";
                 }
             }
             // Fallback via wm shell command
             int r = rot < 0 ? 0 : (rot & 3);
             String cmd = rot < 0
                     ? "wm fixed-to-user-rotation default; wm user-rotation free"
-                    : ("wm fixed-to-user-rotation enabled; wm user-rotation lock " + r);
+                    : ("wm fixed-to-user-rotation default; wm user-rotation lock " + r);
             Process p = new ProcessBuilder("/system/bin/sh", "-c", cmd).redirectErrorStream(true).start();
             p.waitFor();
-            return "{\"ok\":true,\"rotation\":" + r + ",\"via\":\"shell\"}";
+            return "{\"ok\":true,\"rotation\":" + queryDisplay0Rotation() + ",\"via\":\"shell\"}";
         } catch (Throwable t) {
             return "{\"ok\":false,\"error\":" + jsonStr(String.valueOf(t)) + "}";
         }
     }
 
     private String cmdGetDisplayRotation() {
-        int rot = 0;
-        try {
-            if (windowMgr != null) {
-                Object val = windowMgr.getClass().getMethod("getDefaultDisplayRotation").invoke(windowMgr);
-                if (val instanceof Integer) rot = ((Integer) val).intValue();
-            }
-        } catch (Throwable ignored) {}
-        return "{\"ok\":true,\"rotation\":" + rot + "}";
+        return "{\"ok\":true,\"rotation\":" + queryDisplay0Rotation() + "}";
     }
 
     private static int parseIntSafe(String s, int def) {

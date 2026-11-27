@@ -1550,6 +1550,10 @@ void AndroidRuntime::WmEventLoop(std::string sockPath) {
                             imeState_.cursorX = cx;
                             imeState_.cursorY = cy;
                             imeState_.cursorH = ch;
+                        } else if (lineBuf.find("\"DISPLAY_ROTATION_CHANGED\"") != std::string::npos) {
+                            int32_t rot = parseJsonInt(lineBuf, "rotation", 0) & 3;
+                            display0Rotation_.store(rot);
+                            InputBridge::Instance().SetDisplay0Rotation(rot);
                         } else {
                             std::lock_guard<std::mutex> lk(wmEventMu_);
                             if (wmEventQueue_.size() < 64) {
@@ -3892,6 +3896,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                     "pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true; "
                     "ime enable org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
                     "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
+                    "wm fixed-to-user-rotation default >/dev/null 2>&1 || true; "
                     "LP=/data/user/0/com.android.launcher3/shared_prefs/com.android.launcher3.prefs.xml; "
                     "if [ -f \"$LP\" ] && ! grep -q 'pref_allowRotation.*true' \"$LP\"; then "
                     "  sed -i '/pref_allowRotation/d; s|</map>|    <boolean name=\"pref_allowRotation\" value=\"true\" />\\n</map>|' \"$LP\" && "
@@ -4067,6 +4072,8 @@ std::string AndroidRuntime::Stop() {
     bootanimPid_.store(-1);
     visibleDisplayMask_.store(0);
     hideSeq_.fetch_add(1);
+    display0Rotation_.store(0);
+    InputBridge::Instance().SetDisplay0Rotation(0);
     {
         std::lock_guard<std::mutex> ilk(imeStateMu_);
         imeState_.seq++;
