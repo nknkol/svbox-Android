@@ -264,6 +264,12 @@ struct Index {
         AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
         dirty = true;
       }
+      const reqMemMb: number | undefined = AppStorage.get<number>('requestedMemLimitMb');
+      if (reqMemMb && reqMemMb >= 1024 && reqMemMb <= 32768) {
+        primary.memLimitMb = reqMemMb;
+        AppStorage.setOrCreate<number>('requestedMemLimitMb', 0);
+        dirty = true;
+      }
       const reqGms: string | undefined = AppStorage.get<string>('requestedEnableGms');
       if (reqGms === 'true' || reqGms === 'false') {
         primary.enableGms = (reqGms === 'true');
@@ -352,6 +358,11 @@ struct Index {
           if (reqDiskGb === 8 || reqDiskGb === 16 || reqDiskGb === 32 || reqDiskGb === 64 || reqDiskGb === 128) {
             target.diskLimitGb = reqDiskGb;
             AppStorage.setOrCreate<number>('requestedDiskLimitGb', 0);
+          }
+          const reqMemMb: number | undefined = AppStorage.get<number>('requestedMemLimitMb');
+          if (reqMemMb && reqMemMb >= 1024 && reqMemMb <= 32768) {
+            target.memLimitMb = reqMemMb;
+            AppStorage.setOrCreate<number>('requestedMemLimitMb', 0);
           }
           const reqGms: string | undefined = AppStorage.get<string>('requestedEnableGms');
           if (reqGms === 'true' || reqGms === 'false') {

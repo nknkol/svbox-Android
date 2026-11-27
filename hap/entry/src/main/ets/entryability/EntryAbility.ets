@@ -26,6 +26,7 @@ export default class EntryAbility extends UIAbility {
     const rawRoot: Object | undefined = want.parameters ? want.parameters['enableRoot'] : undefined;
     const rawSyscall: Object | undefined = want.parameters ? want.parameters['syscallMode'] : undefined;
     const rawDiskGb: Object | undefined = want.parameters ? want.parameters['diskLimitGb'] : undefined;
+    const rawMemMb: Object | undefined = want.parameters ? want.parameters['memLimitMb'] : undefined;
     const rawGms: Object | undefined = want.parameters ? want.parameters['enableGms'] : undefined;
     const rawForm: Object | undefined = want.parameters ? want.parameters['deviceForm'] : undefined;
     const autoStr: string = typeof rawAuto === 'string' ? rawAuto : '';
@@ -42,6 +43,7 @@ export default class EntryAbility extends UIAbility {
     const rootStr: string = typeof rawRoot === 'string' ? rawRoot : (typeof rawRoot === 'boolean' ? String(rawRoot) : '');
     const syscallStr: string = typeof rawSyscall === 'string' ? rawSyscall : '';
     const diskGbStr: string = typeof rawDiskGb === 'string' ? rawDiskGb : (typeof rawDiskGb === 'number' ? String(rawDiskGb) : '');
+    const memMbStr: string = typeof rawMemMb === 'string' ? rawMemMb : (typeof rawMemMb === 'number' ? String(rawMemMb) : '');
     const gmsStr: string = typeof rawGms === 'string' ? rawGms : (typeof rawGms === 'boolean' ? String(rawGms) : '');
     const formStr: string = typeof rawForm === 'string' ? rawForm : '';
     if (formStr === 'pc' || formStr === 'tablet' || formStr === 'phone' || formStr === 'mobile') {
@@ -101,6 +103,12 @@ export default class EntryAbility extends UIAbility {
       const gb: number = Number(diskGbStr);
       if (gb === 8 || gb === 16 || gb === 32 || gb === 64 || gb === 128) {
         AppStorage.setOrCreate<number>('requestedDiskLimitGb', gb);
+      }
+    }
+    if (memMbStr.length > 0) {
+      const mb: number = Number(memMbStr);
+      if (mb >= 1024 && mb <= 32768) {
+        AppStorage.setOrCreate<number>('requestedMemLimitMb', mb);
       }
     }
     if (gmsStr === 'true' || gmsStr === 'false') {

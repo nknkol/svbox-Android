@@ -3023,11 +3023,11 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     } else if (memTierMb <= 4096) {
         memProps =
             "dalvik.vm.heapstartsize=8m\n"
-            "dalvik.vm.heapgrowthlimit=192m\n"
-            "dalvik.vm.heapsize=384m\n"
+            "dalvik.vm.heapgrowthlimit=256m\n"
+            "dalvik.vm.heapsize=512m\n"
             "dalvik.vm.heaptargetutilization=0.75\n"
             "dalvik.vm.heapminfree=4m\n"
-            "dalvik.vm.heapmaxfree=12m\n";
+            "dalvik.vm.heapmaxfree=16m\n";
     } else if (memTierMb <= 6144) {
         memProps =
             "dalvik.vm.heapstartsize=12m\n"
