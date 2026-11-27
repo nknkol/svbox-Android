@@ -138,6 +138,7 @@ private:
     std::atomic<int32_t> displayH_{1280};
 
     OHNativeWindow* surfaceWindow_ = nullptr;
+    OHNativeWindow* secondaryWindow_[9] = {};
     int32_t surfaceW_ = 0;
     int32_t surfaceH_ = 0;
 

@@ -49,6 +49,6 @@ std::string ResolveCpuset(const std::string& profile,
                           int32_t* outNice,
                           std::string* outSched);
 
-Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids);
+Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync = false);
 
 } // namespace SchedQos

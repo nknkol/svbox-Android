@@ -3,6 +3,7 @@
 #include "ohos_bridge/log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -414,7 +415,7 @@ std::string ResolveCpuset(const std::string& profile,
     return result;
 }
 
-Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
+static Telemetry ComputeTelemetryNow(const std::vector<pid_t>& rootPids) {
     Telemetry t;
     const auto& hd = GetHiDebugApi();
     if (hd.getSysCpu) t.systemCpuPercent = hd.getSysCpu() * 100.0;
@@ -439,6 +440,7 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
     DIR* d = opendir("/proc");
     if (d) {
         struct dirent* ent = nullptr;
+        int scanned = 0;
         while ((ent = readdir(d)) != nullptr) {
             if (ent->d_name[0] < '1' || ent->d_name[0] > '9') continue;
             pid_t p = static_cast<pid_t>(std::atoi(ent->d_name));
@@ -451,6 +453,10 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
                 if (kb > 0) {
                     totalKb += kb;
                     count++;
+                }
+                // Yield gently so reading smaps_rollup never creates kernel mmap_lock bursts
+                if ((++scanned & 3) == 0) {
+                    usleep(1000);
                 }
             }
         }
@@ -466,6 +472,54 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids) {
     t.containerRssMb = static_cast<uint32_t>(totalKb / 1024ull);
     t.activeProcs = count;
     return t;
+}
+
+Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync) {
+    static std::mutex g_telMu;
+    static Telemetry g_cachedTel;
+    static int64_t g_lastSampleMs = 0;
+    static std::atomic<bool> g_sampling{false};
+
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count();
+
+    if (sync) {
+        Telemetry fresh = ComputeTelemetryNow(rootPids);
+        std::lock_guard<std::mutex> lk(g_telMu);
+        g_cachedTel = fresh;
+        g_lastSampleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+        return fresh;
+    }
+
+    Telemetry snap;
+    bool needRefresh = false;
+    {
+        std::lock_guard<std::mutex> lk(g_telMu);
+        snap = g_cachedTel;
+        needRefresh = (g_lastSampleMs == 0 || (nowMs - g_lastSampleMs) >= 3000);
+    }
+    if (needRefresh) {
+        bool expected = false;
+        if (g_sampling.compare_exchange_strong(expected, true)) {
+            std::vector<pid_t> pidsCopy = rootPids;
+            std::thread([pidsCopy]() {
+                SetCurrentThreadQoS(Level::Background, "telemetry");
+                Telemetry fresh = ComputeTelemetryNow(pidsCopy);
+                {
+                    std::lock_guard<std::mutex> lk(g_telMu);
+                    g_cachedTel = fresh;
+                    g_lastSampleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count();
+                }
+                g_sampling.store(false);
+            }).detach();
+        }
+    }
+    return snap;
 }
 
 } // namespace SchedQos

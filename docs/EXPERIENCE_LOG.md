@@ -1121,6 +1121,10 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - **PC 键鼠映射引擎（`ohos_bridge/src/input_bridge.cpp` + `KeymapStore.ets` + `KeymapOverlay.ets`）**：在原生 C++ `InputBridge` 中实现零往返延迟多指虚拟触控合成（`InjectNormalizedTouch` + `SetKeymapConfig` + `HandleKeymapKey`/`HandleKeymapMouse`），支持 `WASD` 8 向模拟摇杆（finger `500`）、多键并行点击（finger `501..518`）与右键走位（finger `519`），并在模拟器与自由多窗内提供实时可拖拽键位编辑器、半透明无遮挡提示层与 MOBA/FPS/通用一键模板，按包名持久化至 `keymaps.json`。
   - **轻量自动化脚本/宏（`MacroStore` + `MacroRunner` + `MacroAutomationOverlay`）**：支持屏幕可视化录制点击/滑动与等待间隔（录制同时实时透传至 Android）、按包名持久化至 `macros.json`、支持 `1次/5次/20次/无限` 循环回放与随时中断。
   - 全链路真机回归（启用 GMS + Stage 4 瘦身 + Stage 5 全功能）：GMS 开启态总 Guest PSS 由 `2,316.7 MB` 降至 `1,691.7 MB`（`-625.0 MB / -27.0%`），7 个 GMS 进程、剪贴板 UTF-8 双向同步、`TRIM_MEMORY` 与动态 8 核拓扑均通过，零 JS/Android 致命异常。
+- **2026-11-27 界面严重卡顿与拖拽缩放窗口出现白框修复**：
+  - 根因 1：`GetStatusNapi()` 每 450–500ms 在 ArkUI 主线程同步调用 `SchedQos::SampleTelemetry()` 遍历全部 60+ Android 进程的 `/proc/<pid>/smaps_rollup`（触发内核 `mmap_read_lock` 逐页表扫描），导致 `org.svbox.android` 主线程长期满载 **103% CPU**、`render_service` 每 8.3ms 丢弃 VSync（`ArkUI request vsync, but no vsync received in 3 seconds`），输入卡死且窗口拖拽时 ArkUI 无法及时提交新尺寸帧而残留系统透明白框。
+  - 根因 2：`AndroidRuntime::OnSurfaceChanged()` / `OnDisplaySurfaceChanged()` 在同一 `OHNativeWindow*` 拖拽缩放的每一像素都重复调用 `GfxstreamBridge::SetWindow()` / `SetDisplayWindow()`，在主线程上加锁并重建 Vulkan Swapchain。
+  - 修复：`SchedQos::SampleTelemetry()` 改为 **O(1) 非阻塞缓存读取（<0.01ms）+ 后台 `Background` QoS 线程每 3 秒异步温和采样**（每 4 进程 `usleep(1000)` 避免内核锁突发）；`OnSurfaceChanged` / `OnDisplaySurfaceChanged` 对同一 `OHNativeWindow*` 指针跳过重复重建，由鸿蒙 `RenderService` 硬件 120Hz 缩放；`EmulatorWindowPage` 轮询降频至 1000ms 并仅在值变更时更新 `@State`。真机实测：主线程 CPU 从 **103% 降至 0.0%**，VSync 丢失从每帧告警降至 **0**。
 
 
 

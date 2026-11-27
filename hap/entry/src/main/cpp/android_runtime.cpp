@@ -1151,15 +1151,23 @@ void AndroidRuntime::SetRefreshRate(int32_t hz) {
 
 void AndroidRuntime::OnSurfaceChanged(OHNativeWindow* window, int32_t w, int32_t h) {
     bool useGfx = false;
+    bool sameWindow = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        sameWindow = (window != nullptr && window == surfaceWindow_);
         surfaceWindow_ = window;
         surfaceW_ = w;
         surfaceH_ = h;
         useGfx = running_.load() ? (activeGpuMode_ != "swiftshader") : (gpuMode_ != "swiftshader");
     }
     if (useGfx) {
-        GfxstreamBridge::Instance().SetWindow(window, w, h);
+        // When the same OHNativeWindow is merely resized during live window drag,
+        // OHOS RenderService scales the attached buffer in hardware at 120Hz.
+        // Calling SetWindow() redundantly would tear down & rebuild the Vulkan swapchain
+        // on the ArkUI main thread on every drag pixel.
+        if (!sameWindow) {
+            GfxstreamBridge::Instance().SetWindow(window, w, h);
+        }
     } else {
         HwcRenderer::Instance().SetWindow(window, w, h);
     }
@@ -1214,7 +1222,15 @@ void AndroidRuntime::OnDisplaySurfaceChanged(int32_t displaySlot, OHNativeWindow
         return;
     }
     if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
-    GfxstreamBridge::Instance().SetDisplayWindow(displaySlot, window, w, h);
+    bool sameWin = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sameWin = (window != nullptr && window == secondaryWindow_[displaySlot]);
+        secondaryWindow_[displaySlot] = window;
+    }
+    if (!sameWin) {
+        GfxstreamBridge::Instance().SetDisplayWindow(displaySlot, window, w, h);
+    }
 }
 
 void AndroidRuntime::OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWindow* window) {
@@ -1223,6 +1239,14 @@ void AndroidRuntime::OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWind
         return;
     }
     if (displaySlot < 1 || displaySlot >= SVBOX_GFX_MAX_DISPLAYS) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (window != nullptr && secondaryWindow_[displaySlot] != nullptr &&
+            window != secondaryWindow_[displaySlot]) {
+            return;
+        }
+        secondaryWindow_[displaySlot] = nullptr;
+    }
     GfxstreamBridge::Instance().ClearDisplayWindow(displaySlot);
 }
 
@@ -1296,7 +1320,7 @@ std::string AndroidRuntime::TrimMemory() {
             std::atomic<bool>& flag;
             ~Guard() { flag.store(false); }
         } guard{ trimBusy_ };
-        auto before = GetTelemetry();
+        auto before = SchedQos::SampleTelemetry({}, true);
         if (running_.load() && !paused_.load()) {
             std::vector<std::string> argv = BaseSvboxArgs();
             argv.push_back("--");
@@ -1315,7 +1339,7 @@ std::string AndroidRuntime::TrimMemory() {
         if (running_.load() && wmAgentReady_.load() && !paused_.load()) {
             (void)WmRpc("TRIM_MEMORY", 2000);
         }
-        auto after = GetTelemetry();
+        auto after = SchedQos::SampleTelemetry({}, true);
         OH_LOG_INFO(LOG_APP, "TrimMemory: guestPSS %u->%u MB hostPSS %u->%u MB gfx %u->%u MB",
                     before.containerRssMb, after.containerRssMb,
                     before.hostNativeRssMb, after.hostNativeRssMb,
@@ -1414,6 +1438,10 @@ int32_t AndroidRuntime::FindDisplaySlotForPkg(const std::string& pkg) const {
 
 void AndroidRuntime::ReleaseDisplaySlot(int32_t slot) {
     if (slot < 1 || slot > 8) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        secondaryWindow_[slot] = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lk(slotMapMu_);
         slotPkg_[slot].clear();
@@ -3972,6 +4000,10 @@ std::string AndroidRuntime::Stop() {
 
     if (wmEventThread_.joinable()) {
         wmEventThread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i <= 8; ++i) secondaryWindow_[i] = nullptr;
     }
     {
         std::lock_guard<std::mutex> lk(slotMapMu_);

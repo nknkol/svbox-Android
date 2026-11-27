@@ -147,20 +147,21 @@ struct EmulatorWindowPage {
     this.pollTimer = setInterval(() => {
       try {
         const cur: RuntimeStatus = native.getStatus();
-        this.running = cur.running;
-        this.wmAgentReady = cur.wmAgentReady;
-        this.fps = cur.fps;
-        if (cur.width > 0 && cur.height > 0) {
+        if (this.running !== cur.running) this.running = cur.running;
+        if (this.wmAgentReady !== cur.wmAgentReady) this.wmAgentReady = cur.wmAgentReady;
+        if (this.fps !== cur.fps) this.fps = cur.fps;
+        if (cur.width > 0 && cur.height > 0 && (this.dispW !== cur.width || this.dispH !== cur.height)) {
           this.dispW = cur.width;
           this.dispH = cur.height;
         }
-        if (cur.refreshRate === 60 || cur.refreshRate === 90 || cur.refreshRate === 120) {
+        if ((cur.refreshRate === 60 || cur.refreshRate === 90 || cur.refreshRate === 120) &&
+            this.refreshRate !== cur.refreshRate) {
           this.refreshRate = cur.refreshRate;
         }
-        this.statusText = cur.statusText;
+        if (this.statusText !== cur.statusText) this.statusText = cur.statusText;
       } catch (_e) {
       }
-    }, 450);
+    }, 1000);
   }
 
   aboutToDisappear(): void {
