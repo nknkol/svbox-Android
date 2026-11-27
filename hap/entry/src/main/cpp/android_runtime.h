@@ -163,6 +163,7 @@ private:
     std::vector<pid_t> pids_;
     std::vector<int> ownedFds_;
     std::thread bootThread_;
+    std::thread swcodecThread_;
     std::thread lmkdThread_;
     std::thread logdwThread_;
     std::thread dnsThread_;

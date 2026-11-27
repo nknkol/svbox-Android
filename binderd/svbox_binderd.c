@@ -68,6 +68,7 @@ struct bhandle {
     bool     released_strong;
     bool     has_death;
     bool     death_sent;
+    bool     death_clear_pending;
     uint64_t death_cookie;
     bool     used;
 };
@@ -497,7 +498,7 @@ static void maybe_reclaim_handle(struct bproc *proc, struct bhandle *he)
     if (!he || !he->used)
         return;
     if (he->strong_refs > 0 || he->weak_refs > 0 || he->in_flight > 0 ||
-        he->has_death || he->death_sent)
+        he->has_death || he->death_sent || he->death_clear_pending)
         return;
     uint32_t nid = he->node_id;
     he->used = false;
@@ -733,6 +734,48 @@ static struct bmsg *make_simple_br(uint32_t br_cmd, const void *body, uint32_t b
         m->payload_len = body_len;
     }
     return m;
+}
+
+static bool remove_dead_binder_from_list(struct bmsg **head, struct bmsg **tail, uint64_t cookie)
+{
+    bool removed = false;
+    struct bmsg *prev = NULL;
+    struct bmsg *cur = *head;
+    while (cur) {
+        struct bmsg *next = cur->next;
+        if (cur->br_cmd == SV_BR_DEAD_BINDER && cur->payload_len == 8 &&
+            memcmp(cur->payload, &cookie, 8) == 0) {
+            if (prev)
+                prev->next = next;
+            else
+                *head = next;
+            if (*tail == cur)
+                *tail = prev;
+            cur->next = NULL;
+            free_bmsg(cur);
+            removed = true;
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
+    return removed;
+}
+
+/* Cancel any undelivered BR_DEAD_BINDER(cookie) queued for proc or its threads. */
+static bool remove_pending_dead_binder(struct bproc *proc, uint64_t cookie)
+{
+    if (!proc)
+        return false;
+    bool removed = remove_dead_binder_from_list(&proc->inbox_head, &proc->inbox_tail, cookie);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        struct bthread *ot = &g_threads[i];
+        if (ot->used && ot->proc_id == proc->proc_id) {
+            if (remove_dead_binder_from_list(&ot->direct_head, &ot->direct_tail, cookie))
+                removed = true;
+        }
+    }
+    return removed;
 }
 
 static bool should_spawn_looper(struct bproc *proc, struct bthread *excluding)
@@ -1460,8 +1503,13 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
                 for (int hi = 0; hi < proc->handles_cap; hi++) {
                     struct bhandle *he = &proc->handles[hi];
                     if (he->used && he->death_sent && he->death_cookie == cookie) {
+                        bool send_clear = he->death_clear_pending;
                         he->death_sent = false;
+                        he->death_clear_pending = false;
                         maybe_reclaim_handle(proc, he);
+                        if (send_clear) {
+                            push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &cookie, 8));
+                        }
                         break;
                     }
                 }
@@ -1481,11 +1529,14 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
             if (he) {
                 struct bnode *n = find_node(he->node_id);
                 if (!n || !n->used) {
+                    he->has_death = false;
                     he->death_sent = true;
+                    he->death_clear_pending = false;
                     he->death_cookie = cookie;
                     push_direct(t, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
                 } else {
                     he->has_death = true;
+                    he->death_clear_pending = false;
                     he->death_cookie = cookie;
                 }
             } else if (handle != 0) {
@@ -1504,11 +1555,38 @@ static void handle_binder_wr(struct bthread *t, const uint8_t *buf, uint32_t len
                 cookie = hc.cookie;
             }
             struct bhandle *he = find_handle_entry(proc, handle);
-            if (he) {
-                he->has_death = false;
-                maybe_reclaim_handle(proc, he);
+            if (!he && proc->handles) {
+                for (int hi = 0; hi < proc->handles_cap; hi++) {
+                    struct bhandle *cand = &proc->handles[hi];
+                    if (cand->used && (cand->has_death || cand->death_sent) &&
+                        cand->death_cookie == cookie) {
+                        he = cand;
+                        break;
+                    }
+                }
             }
-            push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &cookie, 8));
+            bool cancelled = remove_pending_dead_binder(proc, cookie);
+            if (he && he->death_sent && he->death_cookie == cookie) {
+                if (cancelled) {
+                    /* Undelivered BR_DEAD_BINDER removed before userspace saw it: safe to finish clear now. */
+                    he->death_sent = false;
+                    he->death_clear_pending = false;
+                    maybe_reclaim_handle(proc, he);
+                    push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &cookie, 8));
+                } else {
+                    /* BR_DEAD_BINDER is already in flight to userspace (BpHwBinder::sendObituary);
+                     * defer BR_CLEAR_DEATH_NOTIFICATION_DONE until BC_DEAD_BINDER_DONE arrives so
+                     * the proxy weak ref is not dropped while sendObituary() is running. */
+                    he->death_clear_pending = true;
+                }
+            } else {
+                if (he && he->has_death && he->death_cookie == cookie) {
+                    he->has_death = false;
+                    he->death_clear_pending = false;
+                    maybe_reclaim_handle(proc, he);
+                }
+                push_direct(t, make_simple_br(SV_BR_CLEAR_DEATH_NOTIFICATION_DONE, &cookie, 8));
+            }
             break;
         }
         default:
@@ -1634,6 +1712,7 @@ static void drop_conn(struct conn_entry *ce)
                         p->handles[hi].in_flight = 0;
                         p->handles[hi].has_death = false;
                         p->handles[hi].death_sent = false;
+                        p->handles[hi].death_clear_pending = false;
                     }
                 }
                 free(p->handles);
@@ -1660,6 +1739,7 @@ static void drop_conn(struct conn_entry *ce)
                                     uint64_t cookie = oh->death_cookie;
                                     oh->has_death = false;
                                     oh->death_sent = true;
+                                    oh->death_clear_pending = false;
                                     push_inbox(op, make_simple_br(SV_BR_DEAD_BINDER, &cookie, 8));
                                     wake_proc_waiters(op);
                                 }

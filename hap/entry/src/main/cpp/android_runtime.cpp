@@ -3794,8 +3794,43 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         // Android 14 software Codec2 HAL (android.hardware.media.c2@1.0::IComponentStore/software).
         // Prevents StorageManagerService's MediaCodecList init from deadlocking its Handler thread
         // before H_BOOT_COMPLETED / H_COMPLETE_UNLOCK_USER / emulated;0 auto-mount.
+        // Supervised like Android init so any unexpected codec crash recovers cleanly within 1s.
         if (FileExists(rootfs_ + "/system/apex/com.android.media.swcodec/bin/mediaswcodec")) {
-            launchPaced("mediaswcodec", { "apex/com.android.media.swcodec/bin/mediaswcodec" });
+            pid_t swPid = runSvbox("mediaswcodec", { "apex/com.android.media.swcodec/bin/mediaswcodec" });
+            SleepCancelableMs(8);
+            if (swcodecThread_.joinable()) {
+                swcodecThread_.join();
+            }
+            swcodecThread_ = std::thread([this, swPid, logDir]() {
+                pid_t curPid = swPid;
+                int respawns = 0;
+                while (running_.load() && curPid > 0) {
+                    if (!SleepCancelableMs(300)) break;
+                    if (!running_.load()) break;
+                    int st = 0;
+                    pid_t r = waitpid(curPid, &st, WNOHANG);
+                    if (r == curPid || (r < 0 && errno == ECHILD)) {
+                        if (!running_.load()) break;
+                        if (respawns >= 10) {
+                            OH_LOG_WARN(LOG_APP, "mediaswcodec exited too many times (%d); stopping supervisor", respawns);
+                            break;
+                        }
+                        ++respawns;
+                        OH_LOG_WARN(LOG_APP, "mediaswcodec (pid=%d, status=0x%x) exited; respawning (#%d)",
+                                    static_cast<int>(curPid), st, respawns);
+                        if (!SleepCancelableMs(500)) break;
+                        if (!running_.load()) break;
+                        std::vector<std::string> argv = BaseSvboxArgs();
+                        argv.push_back("--");
+                        argv.push_back("apex/com.android.media.swcodec/bin/mediaswcodec");
+                        curPid = Spawn(argv, true, logDir + "/mediaswcodec.log");
+                        if (curPid <= 0) {
+                            OH_LOG_ERROR(LOG_APP, "mediaswcodec respawn failed");
+                            break;
+                        }
+                    }
+                }
+            });
         }
         launchPaced("installd", { "-e", sfLdPath, "system/bin/installd" });
         launchPaced("storaged", { "-e", sfLdPath, "system/bin/storaged" });
@@ -4146,7 +4181,10 @@ std::string AndroidRuntime::Stop() {
     if (bootThread_.joinable()) {
         bootThread_.join();
     }
-    // Reap any straggler spawned by bootThread_ right as Stop() raced with startup.
+    if (swcodecThread_.joinable()) {
+        swcodecThread_.join();
+    }
+    // Reap any straggler spawned by bootThread_/swcodecThread_ right as Stop() raced with startup.
     killAndReapPids();
 
     if (wmEventThread_.joinable()) {

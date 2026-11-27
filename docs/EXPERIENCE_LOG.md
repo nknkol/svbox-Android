@@ -1188,6 +1188,13 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - `gpu/ohos_host/svbox_gfxstream_capi.cpp` + `gpu/ohos_host/apply_host_patches.py`：关闭 `features.YuvCache.enabled = false`；为 `ColorBufferGl::readPixelsYUVCached` 增加 `if (!m_yuv_converter)` 空指针守卫；修复 `ColorBufferGl::readPixels` 中 `GL_RGB` 临时 4-bpp 缓冲区的每帧堆泄漏（改为 `std::vector<uint8_t>`）。
     - `gpu/android_guest/apply_guest_patches.py`：修复 `gralloc_old.cpp` 中 `HAL_PIXEL_FORMAT_YV12` 使用 `GL_RGB`（3 bpp）并与 `gralloc_lock` 读回一致；修复 `FormatConversions.cpp` `rgb888_to_yuv420p` 的 `i / 2` 色度索引；修复 `getAshmemColorOffset` 与 `gralloc_register_buffer` 仅在 `cb->hostHandle || cb->canBePosted()` / `cb->hostHandle` 时保留/写入 16 字节头部偏移。
   - **真机实测（`HAD-W32`）**：启动 **BrownDust II**（`com.neowizgames.game.browndust2`），自动旋横至 `1480×909`，`c2.android.avc.decoder`（1280×720 H.264，`allocatorID 19/18`）与 `c2.android.aac.decoder`（48kHz 双声道 AAC，`allocatorID 19`）全部正常建池、解码并渲染输出，零 `mediaswcodec` / 宿主进程崩溃，顺利越过“正在确认下载容量 100%”并弹出完整 **下载弹窗（下载容量 15,531 MB / 可用空间 100,957 MB / 取消·下载）**。
+- **2026-11-27 修复 `svbox-binderd` `BR_DEAD_BINDER` / `BC_CLEAR_DEATH_NOTIFICATION` UAF 导致清理后台后重开游戏卡死**：
+  - **根因**：用户在多任务页点击“全部清除”（`LAUNCHER_TASK_CLEAR_ALL`）关闭正在使用 Codec2 的游戏时，`svbox-binderd` 在 `drop_conn()` 中将 `SV_BR_DEAD_BINDER(cookie)` 推入 `mediaswcodec` 的 `proc->inbox`；与此同时 `mediaswcodec` 另一线程析构 `BpHwBinder` 发送 `BC_CLEAR_DEATH_NOTIFICATION`。旧版 `svbox_binderd.c` 未撤销队列中未派发的 `SV_BR_DEAD_BINDER`，也未在已派发状态下等待 `BC_DEAD_BINDER_DONE`，而是立即回复 `BR_CLEAR_DEATH_NOTIFICATION_DONE` 让 `BpHwBinder` 释放弱引用并析构；随后 `HwBinder` 线程取出队列中残留的 `BR_DEAD_BINDER(cookie)` 调用 `BpHwBinder::sendObituary()`（`pc 0x9d464`, `x20=0x2`）发生 Use-After-Free 空指针 `SIGSEGV`，直接击毙 `mediaswcodec`。又因 `android_runtime.cpp` 未对 `mediaswcodec` 做进程守护拉起，用户再次打开游戏时 `HidlServiceManagement::getService("android.hardware.media.c2@1.0::IComponentStore/software")` 永久阻塞等待，再次卡死在“正在确认下载容量 100%”。
+  - **修复**：
+    - `binderd/svbox_binderd.c`：严格对齐 Linux 内核 `drivers/android/binder.c` 死亡通知状态机——`struct bhandle` 新增 `death_clear_pending`；收到 `SV_BC_CLEAR_DEATH_NOTIFICATION` 时先调用 `remove_pending_dead_binder()` 清除 `proc->inbox` 与各线程 `direct` 队列中尚未送达用户态的 `SV_BR_DEAD_BINDER(cookie)`，若已送达用户态正在执行 `sendObituary()` 则挂起 `death_clear_pending=true`，延后至收到 `SV_BC_DEAD_BINDER_DONE` 时再下发 `SV_BR_CLEAR_DEATH_NOTIFICATION_DONE`。
+    - `hap/entry/src/main/cpp/android_runtime.h` + `android_runtime.cpp`：新增 `swcodecThread_` 守护线程，效仿 Android `init` 监控 `mediaswcodec` 意外退出并在 500ms 后自动拉起（`Stop()` 时安全回收 join）。
+  - **真机实测（`HAD-W32`）**：完整压测 **启动《棕色尘埃 2》弹出下载弹窗 → 点击多任务“全部清除”（`LAUNCHER_TASK_CLEAR_ALL`）杀死进程 → 校验 `mediaswcodec` 同 PID（`34046`）零崩溃存活（零 `F/DEBUG` / `sendObituary` 异常）→ 二次重新启动《棕色尘埃 2》**：再次顺利越过 100% 并弹出下载弹窗（`15,531 MB / 100,956 MB`）。
+
 
 
 
