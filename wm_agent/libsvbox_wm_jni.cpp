@@ -245,6 +245,14 @@ Java_org_svbox_wm_SvboxWmAgent_nativeGetReaderSurface(JNIEnv* env, jclass, jlong
     return ANativeWindow_toSurface(env, anw);
 }
 
+JNIEXPORT jlong JNICALL
+Java_org_svbox_wm_SvboxWmAgent_nativeGetReaderFrames(JNIEnv*, jclass, jlong handle) {
+    auto* ctx = reinterpret_cast<DisplayReaderCtx*>(handle);
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->mu);
+    return static_cast<jlong>(ctx->frames);
+}
+
 JNIEXPORT void JNICALL
 Java_org_svbox_wm_SvboxWmAgent_nativeDestroyReader(JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<DisplayReaderCtx*>(handle);

@@ -39,6 +39,7 @@ public class SvboxWmAgent {
 
     private static native long nativeCreateReader(int slot, int width, int height, String presentSock);
     private static native Surface nativeGetReaderSurface(long handle);
+    private static native long nativeGetReaderFrames(long handle);
     private static native void nativeDestroyReader(long handle);
 
     private static native int nativeListenUnix(String path);
@@ -84,6 +85,7 @@ public class SvboxWmAgent {
     private Object systemContext;
     private Object displayMgr;
     private Object inputMgr;
+    private Object windowMgr;
     private Object atm;
     private Object am;
     private Object clipboardMgr;
@@ -96,6 +98,7 @@ public class SvboxWmAgent {
     private final Map<Integer, DisplaySlot> slotsByAndroidId = new HashMap<Integer, DisplaySlot>();
     private final CopyOnWriteArrayList<Integer> eventFds = new CopyOnWriteArrayList<Integer>();
     private final Set<Integer> notifiedTasks = Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
+    private final Map<Integer, Long> taskFirstSeenMs = new ConcurrentHashMap<Integer, Long>();
 
     public SvboxWmAgent(String ctrlSockPath, String presentSockPath, String iconsDir) {
         this.ctrlSockPath = ctrlSockPath;
@@ -165,6 +168,12 @@ public class SvboxWmAgent {
                 getSvc.invoke(null, "display"));
         inputMgr = asInterface("android.hardware.input.IInputManager$Stub",
                 getSvc.invoke(null, "input"));
+        try {
+            windowMgr = asInterface("android.view.IWindowManager$Stub",
+                    getSvc.invoke(null, "window"));
+        } catch (Throwable t) {
+            log("IWindowManager init warning: " + t);
+        }
         atm = asInterface("android.app.IActivityTaskManager$Stub",
                 getSvc.invoke(null, "activity_task"));
         am = asInterface("android.app.IActivityManager$Stub",
@@ -215,6 +224,7 @@ public class SvboxWmAgent {
                     if (info == null) return;
                     final int dId = info.displayId;
                     notifiedTasks.remove(info.taskId);
+                    taskFirstSeenMs.remove(info.taskId);
                     final DisplaySlot slot;
                     synchronized (slotLock) {
                         slot = slotsByAndroidId.get(dId);
@@ -242,8 +252,16 @@ public class SvboxWmAgent {
         if (pkg == null || pkg.isEmpty() || EXEMPT_CROSS_APP_PKGS.contains(pkg)) {
             return;
         }
+        taskFirstSeenMs.putIfAbsent(Integer.valueOf(taskId), Long.valueOf(System.currentTimeMillis()));
+
+        Object rootTask = findRootTaskInfo(taskId);
         int displayId = knownDisplayId;
-        if (displayId < 0) {
+        if (rootTask != null) {
+            int rootTid = getIntField(rootTask, "taskId", -1);
+            int rootDid = getIntField(rootTask, "displayId", -1);
+            if (rootDid >= 0) displayId = rootDid;
+            if (rootTid > 0) taskId = rootTid;
+        } else if (displayId < 0) {
             displayId = findDisplayForTask(taskId);
         }
         if (displayId <= 0) return;
@@ -254,6 +272,19 @@ public class SvboxWmAgent {
         }
         if (slot == null || slot.boundPkg == null || slot.boundPkg.isEmpty()) return;
         if (pkg.equals(slot.boundPkg)) return;
+
+        // Guard against embedded activities (e.g. billing sheet, OAuth, Custom Tabs) running
+        // inside the host app's own root task: never rip the host's own task out of its window!
+        if (rootTask != null) {
+            String basePkg = getComponentPackage(getFieldObj(rootTask, "baseActivity"));
+            String origPkg = getComponentPackage(getFieldObj(rootTask, "origActivity"));
+            if (slot.boundPkg.equals(basePkg) || slot.boundPkg.equals(origPkg)) {
+                return;
+            }
+            int numAct = getIntField(rootTask, "numActivities", 1);
+            if (numAct <= 0) return;
+        }
+
         if (!notifiedTasks.add(taskId)) return;
 
         String label = resolveAppLabel(pkg);
@@ -269,29 +300,83 @@ public class SvboxWmAgent {
         broadcastEvent(ev);
     }
 
-    private int findDisplayForTask(int taskId) {
-        if (atm == null) return -1;
+    private String getComponentPackage(Object compObj) {
+        if (compObj == null) return null;
+        try {
+            return (String) compObj.getClass().getMethod("getPackageName").invoke(compObj);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Object findRootTaskInfo(int taskId) {
+        if (atm == null || taskId <= 0) return null;
         try {
             @SuppressWarnings("unchecked")
             List<Object> tasks = (List<Object>) atm.getClass()
                     .getMethod("getAllRootTaskInfos").invoke(atm);
-            if (tasks == null) return -1;
+            if (tasks == null) return null;
             for (Object t : tasks) {
                 int tid = getIntField(t, "taskId", -1);
-                if (tid == taskId) {
-                    return getIntField(t, "displayId", -1);
-                }
+                if (tid == taskId) return t;
                 Object childIds = getFieldObj(t, "childTaskIds");
                 if (childIds instanceof int[]) {
                     for (int cid : (int[]) childIds) {
-                        if (cid == taskId) {
-                            return getIntField(t, "displayId", -1);
-                        }
+                        if (cid == taskId) return t;
                     }
                 }
             }
         } catch (Throwable ignored) {}
-        return -1;
+        return null;
+    }
+
+    private Object findLiveTaskForPackage(String pkg) {
+        if (atm == null || pkg == null || pkg.isEmpty()) return null;
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object> tasks = (List<Object>) atm.getClass()
+                    .getMethod("getAllRootTaskInfos").invoke(atm);
+            if (tasks == null) return null;
+            for (Object t : tasks) {
+                int tid = getIntField(t, "taskId", -1);
+                int numAct = getIntField(t, "numActivities", 0);
+                if (tid <= 0 || numAct <= 0) continue;
+                String basePkg = getComponentPackage(getFieldObj(t, "baseActivity"));
+                String topPkg = getComponentPackage(getFieldObj(t, "topActivity"));
+                String origPkg = getComponentPackage(getFieldObj(t, "origActivity"));
+                if (pkg.equals(basePkg) || pkg.equals(topPkg) || pkg.equals(origPkg)) {
+                    return t;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private float getTransitionAnimationScale() {
+        if (windowMgr == null) return 1.0f;
+        try {
+            Object val = windowMgr.getClass().getMethod("getAnimationScale", int.class)
+                    .invoke(windowMgr, 1 /* TRANSITION_ANIMATION_SCALE */);
+            if (val instanceof Float) {
+                return ((Float) val).floatValue();
+            }
+        } catch (Throwable ignored) {}
+        return 1.0f;
+    }
+
+    private long getSlotFrames(int slot) {
+        if (slot <= 0) return 0;
+        long handle = 0;
+        synchronized (slotLock) {
+            DisplaySlot ds = slotsByIdx.get(slot);
+            if (ds != null) handle = ds.readerHandle;
+        }
+        return handle != 0 ? nativeGetReaderFrames(handle) : 0;
+    }
+
+    private int findDisplayForTask(int taskId) {
+        Object t = findRootTaskInfo(taskId);
+        return t != null ? getIntField(t, "displayId", -1) : -1;
     }
 
     private void checkDisplayEmpty(DisplaySlot slot) {
@@ -672,23 +757,105 @@ public class SvboxWmAgent {
         return "{\"ok\":true,\"slot\":" + slot + ",\"existed\":true}";
     }
 
-    private String cmdLaunchApp(int slot, String pkg, String comp) throws Exception {
-        int displayId = 0;
-        if (slot > 0) {
-            synchronized (slotLock) {
-                DisplaySlot ds = slotsByIdx.get(slot);
-                if (ds == null) return "{\"ok\":false,\"error\":\"slot not active\"}";
-                ds.boundPkg = pkg;
-                displayId = ds.androidDisplayId;
+    private boolean moveTaskCleanly(final int taskId, final int targetSlot, final int targetDisplayId, String reason) throws Exception {
+        Object info = findRootTaskInfo(taskId);
+        if (info == null || getIntField(info, "numActivities", 0) <= 0) {
+            log("moveTaskCleanly(" + reason + "): task=" + taskId + " vanished before move");
+            return false;
+        }
+        final int srcDisplayId = getIntField(info, "displayId", -1);
+        if (srcDisplayId == targetDisplayId) {
+            try {
+                atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, targetDisplayId);
+            } catch (Throwable ignored) {}
+            return true;
+        }
+
+        // Wait for any in-flight Android 14 Shell Transition (DefaultTransitionHandler OPEN
+        // animation on srcDisplayId) to finish before calling moveRootTaskToDisplay. Moving a
+        // task mid-transition lets the old transition's finishTransaction reparent Surface(Task)
+        // back onto srcDisplayId while WM bounds belong to targetDisplayId!
+        Long seenAt = taskFirstSeenMs.get(Integer.valueOf(taskId));
+        if (srcDisplayId > 0 && seenAt != null) {
+            float animScale = getTransitionAnimationScale();
+            long settleMs = Math.min(1200L, Math.max(250L, Math.round(850.0f * Math.max(0.25f, animScale))));
+            long elapsed = System.currentTimeMillis() - seenAt.longValue();
+            if (elapsed < settleMs) {
+                long waitMs = settleMs - elapsed;
+                log("Waiting " + waitMs + "ms for srcDisplayId=" + srcDisplayId
+                        + " Shell Transition to settle before moving task=" + taskId);
+                try { Thread.sleep(waitMs); } catch (InterruptedException ignored) {}
+            }
+            // Re-check task survived cold-start / transition
+            info = findRootTaskInfo(taskId);
+            if (info == null || getIntField(info, "numActivities", 0) <= 0) {
+                log("moveTaskCleanly(" + reason + "): task=" + taskId + " exited during settle wait");
+                return false;
             }
         }
 
-        // Resolve launcher component if not supplied
-        if (comp == null || comp.isEmpty()) {
-            comp = resolveLauncherComponent(pkg);
+        final long framesBefore = getSlotFrames(targetSlot);
+        atm.getClass().getMethod("moveRootTaskToDisplay", int.class, int.class)
+                .invoke(atm, taskId, targetDisplayId);
+        try { Thread.sleep(60); } catch (InterruptedException ignored) {}
+        if (srcDisplayId > 0 && srcDisplayId != targetDisplayId) {
+            try {
+                atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, srcDisplayId);
+            } catch (Throwable ignored) {}
+            try { Thread.sleep(30); } catch (InterruptedException ignored) {}
         }
+        try {
+            atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, targetDisplayId);
+        } catch (Throwable ignored) {}
 
-        // Launch cleanly via IActivityTaskManager with ActivityOptions.setLaunchDisplayId(displayId)
+        // Self-healing watchdog: if an unusually slow Shell Transition (>900ms) STILL finished
+        // after moveRootTaskToDisplay and yanked Surface(name=Task) back onto srcDisplayId,
+        // targetSlot stays stuck at frames <= framesBefore + 1. Detect and reparent cleanly once.
+        if (targetSlot > 0 && srcDisplayId > 0) {
+            Thread heal = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(700);
+                        DisplaySlot cur;
+                        synchronized (slotLock) {
+                            cur = slotsByIdx.get(targetSlot);
+                        }
+                        if (cur == null || cur.androidDisplayId != targetDisplayId) return;
+                        Object tNow = findRootTaskInfo(taskId);
+                        if (tNow == null || getIntField(tNow, "numActivities", 0) <= 0) return;
+                        if (getIntField(tNow, "displayId", -1) != targetDisplayId) return;
+                        long framesNow = getSlotFrames(targetSlot);
+                        if (framesNow <= framesBefore + 1) {
+                            log("Watchdog: slot=" + targetSlot + " displayId=" + targetDisplayId
+                                    + " stuck at frames=" + framesNow + " after move of task=" + taskId
+                                    + "; triggering clean reparent");
+                            atm.getClass().getMethod("moveRootTaskToDisplay", int.class, int.class)
+                                    .invoke(atm, taskId, 0);
+                            Thread.sleep(180);
+                            atm.getClass().getMethod("moveRootTaskToDisplay", int.class, int.class)
+                                    .invoke(atm, taskId, targetDisplayId);
+                            Thread.sleep(50);
+                            try {
+                                atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, srcDisplayId);
+                            } catch (Throwable ignored) {}
+                            Thread.sleep(30);
+                            try {
+                                atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, targetDisplayId);
+                            } catch (Throwable ignored) {}
+                        }
+                    } catch (Throwable t) {
+                        log("Watchdog reparent warning: " + t);
+                    }
+                }
+            }, "svbox-reparent-check");
+            heal.setDaemon(true);
+            heal.start();
+        }
+        return true;
+    }
+
+    private int startActivityOnDisplay(String pkg, String comp, int displayId) throws Exception {
         Class<?> intentCls = Class.forName("android.content.Intent");
         Object intent = intentCls.getConstructor(String.class).newInstance("android.intent.action.MAIN");
         intentCls.getMethod("addCategory", String.class).invoke(intent, "android.intent.category.LAUNCHER");
@@ -717,8 +884,89 @@ public class SvboxWmAgent {
         Method startAsUser = atm.getClass().getMethod("startActivityAsUser",
                 appThreadCls, String.class, String.class, intentCls, String.class,
                 ibinderCls, String.class, int.class, int.class, profCls, bundleCls, int.class);
-        int rc = ((Integer) startAsUser.invoke(atm,
+        return ((Integer) startAsUser.invoke(atm,
                 null, "com.android.shell", null, intent, null, null, null, 0, 0, null, bundle, 0)).intValue();
+    }
+
+    private String cmdLaunchApp(int slot, String pkg, String comp) throws Exception {
+        int displayId = 0;
+        if (slot > 0) {
+            synchronized (slotLock) {
+                DisplaySlot ds = slotsByIdx.get(slot);
+                if (ds == null) return "{\"ok\":false,\"error\":\"slot not active\"}";
+                ds.boundPkg = pkg;
+                displayId = ds.androidDisplayId;
+            }
+        }
+
+        // If the app ALREADY has a live task (e.g. on display 0 or another display), move it
+        // cleanly onto our target VirtualDisplay instead of letting ActivityStarter bring the
+        // old task to front on display 0 and leave this slot black!
+        if (slot > 0) {
+            Object existing = findLiveTaskForPackage(pkg);
+            if (existing != null) {
+                int existingTid = getIntField(existing, "taskId", -1);
+                int existingDid = getIntField(existing, "displayId", -1);
+                if (existingTid > 0) {
+                    if (existingDid == displayId) {
+                        try {
+                            atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, displayId);
+                        } catch (Throwable ignored) {}
+                        log("Reused existing task=" + existingTid + " for " + pkg + " already on slot=" + slot + " displayId=" + displayId);
+                        return "{\"ok\":true,\"rc\":0,\"reused\":true,\"taskId\":" + existingTid + ",\"displayId\":" + displayId + "}";
+                    } else if (existingDid >= 0) {
+                        boolean moved = moveTaskCleanly(existingTid, slot, displayId, "launch-reuse:" + pkg);
+                        if (moved) {
+                            log("Moved existing task=" + existingTid + " (" + pkg + ") from displayId=" + existingDid
+                                    + " to slot=" + slot + " displayId=" + displayId);
+                            return "{\"ok\":true,\"rc\":0,\"moved\":true,\"taskId\":" + existingTid + ",\"displayId\":" + displayId + "}";
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve launcher component if not supplied
+        boolean callerProvidedComp = (comp != null && !comp.isEmpty());
+        if (!callerProvidedComp) {
+            comp = resolveLauncherComponent(pkg);
+        }
+
+        int rc = startActivityOnDisplay(pkg, comp, displayId);
+        // Retry once with freshly resolved launcher component if cached component became stale (e.g. rc=-92)
+        if (rc < 0 && callerProvidedComp) {
+            String freshComp = resolveLauncherComponent(pkg);
+            if (freshComp != null && !freshComp.isEmpty() && !freshComp.equals(comp)) {
+                log("Retrying launch of " + pkg + " with fresh component " + freshComp + " (stale=" + comp + " rc=" + rc + ")");
+                comp = freshComp;
+                rc = startActivityOnDisplay(pkg, comp, displayId);
+            }
+        }
+
+        // Post-launch verification for secondary displays: if Android routed a singleTask/reused
+        // task onto display 0 (or another display) instead of displayId, pull it onto displayId!
+        if (rc >= 0 && slot > 0) {
+            for (int attempt = 0; attempt < 6; attempt++) {
+                Object live = findLiveTaskForPackage(pkg);
+                if (live != null) {
+                    int liveTid = getIntField(live, "taskId", -1);
+                    int liveDid = getIntField(live, "displayId", -1);
+                    if (liveTid > 0) {
+                        if (liveDid == displayId) {
+                            break;
+                        }
+                        if (liveDid >= 0 && liveDid != displayId) {
+                            log("Post-launch redirect: " + pkg + " task=" + liveTid
+                                    + " landed on displayId=" + liveDid + " instead of " + displayId + "; moving");
+                            moveTaskCleanly(liveTid, slot, displayId, "post-launch-fix:" + pkg);
+                            break;
+                        }
+                    }
+                }
+                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            }
+        }
+
         try {
             atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, displayId);
         } catch (Throwable ignored) {}
@@ -741,11 +989,10 @@ public class SvboxWmAgent {
                 targetDisplayId = ds.androidDisplayId;
             }
         }
-        atm.getClass().getMethod("moveRootTaskToDisplay", int.class, int.class)
-                .invoke(atm, taskId, targetDisplayId);
-        try {
-            atm.getClass().getMethod("focusTopTask", int.class).invoke(atm, targetDisplayId);
-        } catch (Throwable ignored) {}
+        boolean ok = moveTaskCleanly(taskId, targetSlot, targetDisplayId, "MOVE_TASK");
+        if (!ok) {
+            return "{\"ok\":false,\"taskId\":" + taskId + ",\"error\":\"task no longer exists\"}";
+        }
         log("Moved task=" + taskId + " to slot=" + targetSlot + " displayId=" + targetDisplayId);
         return "{\"ok\":true,\"taskId\":" + taskId + ",\"displayId\":" + targetDisplayId + "}";
     }

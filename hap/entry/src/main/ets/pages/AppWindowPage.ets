@@ -43,6 +43,7 @@ const TAG: string = 'SvboxAppPage';
 interface WmBasicReply {
   ok?: boolean;
   displayId?: number;
+  rc?: number;
   error?: string;
 }
 
@@ -71,6 +72,7 @@ struct AppWindowPage {
   @State private stageVpH: number = 0;
   @State private stageReady: boolean = false;
   @State private ready: boolean = false;
+  @State private launchError: boolean = false;
   @State private bannerText: string = '正在初始化 Android 14 应用窗口...';
   @State private iconUri: string = '';
   @State private topBarHex: string = '#161920';
@@ -398,9 +400,39 @@ struct AppWindowPage {
     }
   }
 
+  private async launchOrMoveIntoDisplay(): Promise<boolean> {
+    if (this.moveTaskId > 0) {
+      this.bannerText = `正在将「${this.androidLabel}」移至独立窗口...`;
+      const mvJson: string = await native.wmRpcAsync(
+        `MOVE_TASK ${this.moveTaskId} ${this.displaySlot} ${this.androidPkg}`
+      );
+      const mvRep: WmBasicReply = JSON.parse(mvJson) as WmBasicReply;
+      if (mvRep.ok) {
+        return true;
+      }
+      hilog.warn(0x0000, TAG, 'MOVE_TASK failed (%{public}s), falling back to LAUNCH_APP for %{public}s',
+        mvRep.error ?? 'unknown', this.androidPkg);
+    }
+    this.bannerText = `正在打开「${this.androidLabel}」...`;
+    const compArg: string = this.androidComp.length > 0 ? ` ${this.androidComp}` : '';
+    const launchJson: string = await native.wmRpcAsync(
+      `LAUNCH_APP ${this.displaySlot} ${this.androidPkg}${compArg}`
+    );
+    const lRep: WmBasicReply = JSON.parse(launchJson) as WmBasicReply;
+    if (!lRep.ok) {
+      const rcTxt: string = lRep.rc !== undefined ? ` (rc=${lRep.rc})` : '';
+      this.launchError = true;
+      this.bannerText = `无法启动「${this.androidLabel}」：应用可能未安装或已退出${rcTxt}`;
+      hilog.error(0x0000, TAG, 'LAUNCH_APP failed pkg=%{public}s reply=%{public}s', this.androidPkg, launchJson);
+      return false;
+    }
+    return true;
+  }
+
   private async createAndLaunchDisplay(): Promise<void> {
     if (this.displayCreated || this.displaySlot < 1) return;
     this.displayCreated = true;
+    this.launchError = false;
     const dpi: number = this.winMode === 'adaptive'
       ? computeAdaptiveDpi(this.dispW, this.dispH)
       : computeDpiForSize(this.dispW, this.dispH);
@@ -412,34 +444,65 @@ struct AppWindowPage {
       const rep: WmBasicReply = JSON.parse(createJson) as WmBasicReply;
       if (!rep.ok) {
         this.displayCreated = false;
+        this.launchError = true;
         this.bannerText = `建屏失败: ${rep.error ?? 'unknown'}`;
         return;
       }
 
-      if (this.moveTaskId > 0) {
-        await native.wmRpcAsync(`MOVE_TASK ${this.moveTaskId} ${this.displaySlot} ${this.androidPkg}`);
-      } else {
-        const compArg: string = this.androidComp.length > 0 ? ` ${this.androidComp}` : '';
-        await native.wmRpcAsync(`LAUNCH_APP ${this.displaySlot} ${this.androidPkg}${compArg}`);
-      }
-      this.ready = true;
-      this.bannerText = '';
+      const launched: boolean = await this.launchOrMoveIntoDisplay();
       this.lastAppliedW = this.dispW;
       this.lastAppliedH = this.dispH;
       this.applyWindowAspectPolicy(false);
       native.setDisplayRefreshRate(this.displaySlot, this.curHz);
       native.setDisplayVisible(this.displaySlot, true);
+      if (!launched) {
+        return;
+      }
+      this.ready = true;
+      this.launchError = false;
+      this.bannerText = '';
     } catch (err) {
       this.displayCreated = false;
+      this.launchError = true;
       this.bannerText = `启动异常: ${String(err)}`;
       hilog.error(0x0000, TAG, 'createAndLaunchDisplay failed: %{public}s', String(err));
+    }
+  }
+
+  private async retryLaunch(): Promise<void> {
+    if (this.displaySlot < 1) return;
+    this.launchError = false;
+    if (!this.displayCreated) {
+      await this.createAndLaunchDisplay();
+      return;
+    }
+    try {
+      const launched: boolean = await this.launchOrMoveIntoDisplay();
+      if (launched) {
+        this.ready = true;
+        this.launchError = false;
+        this.bannerText = '';
+      }
+    } catch (err) {
+      this.launchError = true;
+      this.bannerText = `启动异常: ${String(err)}`;
     }
   }
 
   private onRelaunchSeq(): void {
     if (!this.ready || this.displaySlot < 1) return;
     if (this.moveTaskId > 0) {
-      native.wmRpcAsync(`MOVE_TASK ${this.moveTaskId} ${this.displaySlot} ${this.androidPkg}`);
+      native.wmRpcAsync(`MOVE_TASK ${this.moveTaskId} ${this.displaySlot} ${this.androidPkg}`)
+        .then((raw: string) => {
+          try {
+            const rep: WmBasicReply = JSON.parse(raw) as WmBasicReply;
+            if (!rep.ok) {
+              native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
+            }
+          } catch (_e) {
+          }
+        })
+        .catch(() => {});
     } else {
       native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
     }
@@ -753,14 +816,42 @@ struct AppWindowPage {
         }
 
         if (!this.ready || this.bannerText.length > 0) {
-          Column({ space: 10 }) {
-            LoadingProgress()
-              .width(34)
-              .height(34)
-              .color('#38BDF8')
+          Column({ space: 12 }) {
+            if (!this.launchError) {
+              LoadingProgress()
+                .width(34)
+                .height(34)
+                .color('#38BDF8')
+            } else {
+              SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
+                .fontSize(30)
+                .fontColor(['#F59E0B'])
+            }
             Text(this.bannerText.length > 0 ? this.bannerText : '正在渲染...')
               .fontSize(13)
-              .fontColor('#D1D5DB')
+              .fontColor('#E5E7EB')
+              .textAlign(TextAlign.Center)
+              .constraintSize({ maxWidth: 280 })
+            if (this.launchError) {
+              Row({ space: 10 }) {
+                Button('重试', { type: ButtonType.Capsule })
+                  .height(30)
+                  .fontSize(12)
+                  .fontColor('#FFFFFF')
+                  .backgroundColor('#0A59F7')
+                  .onClick(() => { this.retryLaunch(); })
+                Button('关闭窗口', { type: ButtonType.Capsule })
+                  .height(30)
+                  .fontSize(12)
+                  .fontColor('#E5E7EB')
+                  .backgroundColor('#374151')
+                  .onClick(() => {
+                    const ctx: common.UIAbilityContext =
+                      this.getUIContext().getHostContext() as common.UIAbilityContext;
+                    ctx.terminateSelf().catch(() => {});
+                  })
+              }
+            }
           }
           .padding(20)
           .backgroundColor('#CC11141B')

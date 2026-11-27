@@ -3306,17 +3306,29 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             MkdirP(injectLayer_ + sysSub);
         }
 
-        // Cleanly mark Bluetooth unavailable because stock rootfs14 bluetooth@1.1-service.sim
-        // has an upstream Redroid14 Address::FromString ABI mismatch that unconditionally SIGABRTs
-        // inside initialize_impl(), causing repeated com.android.bluetooth boot crash loops.
+        // Expose standard handheld features (including Bluetooth/BLE, multitouch, camera, GPS,
+        // gyroscope, USB host) so Google Play's implicit <uses-feature> filtering delivers native
+        // arm64-v8a Android 14 builds (Chrome 131+, Edge, Brave, etc.) instead of rejecting them or
+        // falling back to pre-2022 legacy APKs. Keep Bluetooth radio OFF via settings_global
+        // (bluetooth_on=0) so stock rootfs14 bluetooth@1.1-service.sim never starts or crash-loops.
         MkdirP(injectLayer_ + "/vendor/etc/permissions");
-        WriteFile(injectLayer_ + "/vendor/etc/permissions/redroid-removed-permissions.xml",
+        WriteFile(injectLayer_ + "/vendor/etc/permissions/svbox-handheld-features.xml",
                   "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                   "<permissions>\n"
-                  "    <unavailable-feature name=\"android.hardware.bluetooth\" />\n"
-                  "    <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n"
+                  "    <feature name=\"android.hardware.bluetooth\" />\n"
+                  "    <feature name=\"android.hardware.bluetooth_le\" />\n"
+                  "    <feature name=\"android.hardware.touchscreen.multitouch\" />\n"
+                  "    <feature name=\"android.hardware.touchscreen.multitouch.distinct\" />\n"
+                  "    <feature name=\"android.hardware.touchscreen.multitouch.jazzhand\" />\n"
+                  "    <feature name=\"android.hardware.camera.any\" />\n"
+                  "    <feature name=\"android.hardware.camera.front\" />\n"
+                  "    <feature name=\"android.hardware.camera.autofocus\" />\n"
+                  "    <feature name=\"android.hardware.location.gps\" />\n"
+                  "    <feature name=\"android.hardware.sensor.gyroscope\" />\n"
+                  "    <feature name=\"android.hardware.sensor.light\" />\n"
+                  "    <feature name=\"android.hardware.usb.host\" />\n"
                   "</permissions>\n");
-        chmod((injectLayer_ + "/vendor/etc/permissions/redroid-removed-permissions.xml").c_str(), 0644);
+        chmod((injectLayer_ + "/vendor/etc/permissions/svbox-handheld-features.xml").c_str(), 0644);
 
         MkdirP(injectLayer_ + "/system/usr/idc");
         const std::string idcDst = injectLayer_ + "/system/usr/idc/svbox-touchscreen.idc";
@@ -3775,7 +3787,10 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             if (running_.load()) {
                 std::string initCmd =
                     "settings put global activity_manager_constants max_cached_processes=" +
-                    std::to_string(maxCachedProcs) + "; ";
+                    std::to_string(maxCachedProcs) + "; "
+                    "settings put global bluetooth_on 0; "
+                    "settings put global ble_scan_always_enabled 0; "
+                    "pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true; ";
                 if (!allowRoot) {
                     initCmd += "settings put global adb_enabled 0; "
                                "settings put global development_settings_enabled 0; ";
