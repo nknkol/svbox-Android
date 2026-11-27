@@ -3584,6 +3584,36 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         }
     }
 
+    // Enable Launcher3 Home/App-Drawer rotation so landscape emulator mode renders full-width
+    // 16:9 Home & App Drawer instead of Android 14 orientation-letterboxing Launcher3 into a
+    // narrow 405px portrait pillar. Patch existing XML in-place to preserve owner.db inode/UID.
+    {
+        const std::string lPrefsDir = dataBase_ + "/data/data/com.android.launcher3/shared_prefs";
+        for (const char* fn : { "com.android.launcher3.prefs.xml", "com.android.launcher3.device.prefs.xml" }) {
+            const std::string p = lPrefsDir + "/" + fn;
+            if (!FileExists(p)) continue;
+            std::ifstream in(p);
+            if (!in) continue;
+            std::string xml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            in.close();
+            if (xml.find("name=\"pref_allowRotation\" value=\"true\"") != std::string::npos) continue;
+            size_t posFalse = xml.find("name=\"pref_allowRotation\" value=\"false\"");
+            if (posFalse != std::string::npos) {
+                xml.replace(posFalse, std::strlen("name=\"pref_allowRotation\" value=\"false\""),
+                            "name=\"pref_allowRotation\" value=\"true\"");
+            } else {
+                size_t closeTag = xml.rfind("</map>");
+                if (closeTag == std::string::npos) continue;
+                xml.insert(closeTag, "    <boolean name=\"pref_allowRotation\" value=\"true\" />\n");
+            }
+            int fd = open(p.c_str(), O_WRONLY | O_TRUNC);
+            if (fd >= 0) {
+                (void)write(fd, xml.data(), xml.size());
+                close(fd);
+            }
+        }
+    }
+
     // 2.5 Generate Android 14 /linkerconfig/* directly into persistent cache dir (all files + apex.libraries.config.txt)
     {
         const std::string lcDir = dataBase_ + "/cache/linkerconfig_a14";
@@ -3861,7 +3891,12 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                     "settings put global ble_scan_always_enabled 0; "
                     "pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true; "
                     "ime enable org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
-                    "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; ";
+                    "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
+                    "LP=/data/user/0/com.android.launcher3/shared_prefs/com.android.launcher3.prefs.xml; "
+                    "if [ -f \"$LP\" ] && ! grep -q 'pref_allowRotation.*true' \"$LP\"; then "
+                    "  sed -i '/pref_allowRotation/d; s|</map>|    <boolean name=\"pref_allowRotation\" value=\"true\" />\\n</map>|' \"$LP\" && "
+                    "  am force-stop com.android.launcher3 >/dev/null 2>&1 || true; "
+                    "fi; ";
                 if (!allowRoot) {
                     initCmd += "settings put global adb_enabled 0; "
                                "settings put global development_settings_enabled 0; ";
