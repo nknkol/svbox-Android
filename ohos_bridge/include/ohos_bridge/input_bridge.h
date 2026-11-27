@@ -48,7 +48,9 @@ public:
     void InjectScrollForDisplay(int displaySlot, float x, float y, float deltaY);
     // HarmonyOS OH_NativeXComponent_KeyCode -> Linux KEY_*
     void InjectOhosKey(int32_t ohosKeyCode, bool down);
-    // WSA-style shared host IME guard (prevents double-typing while HarmonyOS IME owns text input)
+    // Release any Linux keys currently marked pressed in virtual evdev (prevents stuck keys on blur/stop)
+    void ReleaseAllKeys();
+    // WSA-style shared host IME active state (suppresses game touch keymaps while typing in Android)
     void SetHostImeActive(int displaySlot, bool active);
     bool IsHostImeActive(int displaySlot) const;
     bool ShouldSuppressKeyForHostIme(int displaySlot, int32_t ohosKeyCode, bool down);
@@ -194,4 +196,8 @@ private:
 
     std::mutex gamepadStateMu_;
     int32_t gamepadAbs_[64] = {};
+
+    static constexpr size_t kMaxLinuxKeyCode = 768;
+    std::mutex kbdStateMu_;
+    bool evdevKeyDown_[kMaxLinuxKeyCode] = {};
 };

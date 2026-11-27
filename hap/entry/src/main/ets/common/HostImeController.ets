@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import native, { ImeState } from 'libentry.so';
 import { syncHostClipboardToAndroid, utf8ToBase64 } from './InputBridgeHelper';
+import { isPcDevice } from './DeviceProfile';
 
 const TAG: string = 'SvboxHostIme';
 
@@ -30,7 +31,44 @@ interface SlotImeWindowInfo {
   active: boolean;
 }
 
-function mapAndroidInputType(inputType: number): inputMethod.TextInputType {
+/**
+ * On HarmonyOS PC (2in1), password/number/phone/datetime inputs should use direct
+ * physical keyboard passthrough rather than HarmonyOS XiaoYi IME:
+ *  - XiaoYi refuses physical key interception for `pwdkbd` ("current device is pwdkbd on pc, return")
+ *    and ignores numeric keys ("ignore keyCodeNumber").
+ *  - Users never compose Chinese Pinyin inside passwords, OTP codes, numbers, or phone fields.
+ * On touch-only mobile/tablet devices, we still attach the system IME so the soft keyboard pops up.
+ */
+function shouldBypassHostImeOnPc(inputType: number): boolean {
+  if (!isPcDevice()) return false;
+  const cls: number = inputType & ANDROID_TYPE_MASK_CLASS;
+  const variation: number = inputType & ANDROID_TYPE_MASK_VARIATION;
+  if (cls === ANDROID_TYPE_CLASS_NUMBER ||
+      cls === ANDROID_TYPE_CLASS_PHONE ||
+      cls === ANDROID_TYPE_CLASS_DATETIME) {
+    return true;
+  }
+  if (cls === ANDROID_TYPE_CLASS_TEXT) {
+    if (variation === ANDROID_TYPE_TEXT_VARIATION_PASSWORD ||
+        variation === ANDROID_TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+        variation === ANDROID_TYPE_TEXT_VARIATION_WEB_PASSWORD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function mapAndroidInputType(inputType: number, forceGenericOnPc: boolean): inputMethod.TextInputType {
+  // On HarmonyOS PC, XiaoYi's password/email/url sub-layouts emit "unknown layout id" or
+  // "GetImeByInputType type: 3 not supported". Use standard TEXT / MULTILINE on PC so
+  // CN/EN switching works smoothly without triggering broken pc-pwdkbd paths.
+  if (forceGenericOnPc || isPcDevice()) {
+    if ((inputType & ANDROID_TYPE_MASK_CLASS) === ANDROID_TYPE_CLASS_TEXT &&
+        (inputType & ANDROID_TYPE_TEXT_FLAG_MULTI_LINE) !== 0) {
+      return inputMethod.TextInputType.MULTILINE;
+    }
+    return inputMethod.TextInputType.TEXT;
+  }
   const cls: number = inputType & ANDROID_TYPE_MASK_CLASS;
   const variation: number = inputType & ANDROID_TYPE_MASK_VARIATION;
   if (cls === ANDROID_TYPE_CLASS_NUMBER) {
@@ -100,8 +138,67 @@ class HostImeManager {
   private lastCursorSeq: number = -1;
   private attached: boolean = false;
   private attachedSlot: number = -1;
+  private attachedInputType: number = -1;
+  private attachedImeOptions: number = -1;
   private attachBusy: boolean = false;
   private manualForced: boolean = false;
+  private manualBypassedSlot: number = -1;
+  private bypassLostFocusAtMs: number = 0;
+
+  // Stored bound listener references so ctrl.off(type, fn) unregisters cleanly without ImsaKit nullptr warnings
+  private readonly insertTextCb = (text: string): void => {
+    if (!native.isWmAgentReady() || !text || text.length === 0) return;
+    const slot: number = this.attachedSlot >= 0 ? this.attachedSlot : 0;
+    native.wmRpcAsync(`IME_COMMIT ${utf8ToBase64(text)} ${slot}`).catch(() => {});
+  };
+
+  private readonly deleteLeftCb = (length: number): void => {
+    if (!native.isWmAgentReady()) return;
+    const n: number = Math.max(1, Math.floor(length));
+    native.wmRpcAsync(`IME_DELETE ${n} 0`).catch(() => {});
+  };
+
+  private readonly deleteRightCb = (length: number): void => {
+    if (!native.isWmAgentReady()) return;
+    const n: number = Math.max(1, Math.floor(length));
+    native.wmRpcAsync(`IME_DELETE 0 ${n}`).catch(() => {});
+  };
+
+  private readonly sendFunctionKeyCb = (fnKey: inputMethod.FunctionKey): void => {
+    if (!native.isWmAgentReady()) return;
+    const ek: number = fnKey ? Number(fnKey.enterKeyType) : 0;
+    native.wmRpcAsync(`IME_ACTION ${ek}`).catch(() => {});
+  };
+
+  private readonly moveCursorCb = (direction: inputMethod.Direction): void => {
+    if (!native.isWmAgentReady()) return;
+    native.wmRpcAsync(`IME_MOVE ${Number(direction)}`).catch(() => {});
+  };
+
+  private readonly extendActionCb = (action: inputMethod.ExtendAction): void => {
+    if (!native.isWmAgentReady()) return;
+    if (action === inputMethod.ExtendAction.PASTE) {
+      syncHostClipboardToAndroid(true).then(() => {
+        native.wmRpcAsync('IME_EXTEND 5').catch(() => {});
+      }).catch(() => {
+        native.wmRpcAsync('IME_EXTEND 5').catch(() => {});
+      });
+    } else {
+      native.wmRpcAsync(`IME_EXTEND ${Number(action)}`).catch(() => {});
+    }
+  };
+
+  private readonly getLeftTextCb = (_length: number): string => {
+    return '';
+  };
+
+  private readonly getRightTextCb = (_length: number): string => {
+    return '';
+  };
+
+  private readonly getTextIndexCb = (): number => {
+    return 0;
+  };
 
   private ensureController(): inputMethod.InputMethodController | undefined {
     if (!this.controller) {
@@ -143,99 +240,63 @@ class HostImeManager {
 
   private bindPostAttachListeners(ctrl: inputMethod.InputMethodController): void {
     if (this.postAttachBound) return;
-    this.unbindPostAttachListeners(ctrl);
     // Per HarmonyOS IMF runtime, insertText/delete/functionKey/moveCursor require an attached client first.
     try {
-      ctrl.on('insertText', (text: string) => {
-        if (!native.isWmAgentReady() || !text || text.length === 0) return;
-        const slot: number = this.attachedSlot >= 0 ? this.attachedSlot : 0;
-        native.wmRpcAsync(`IME_COMMIT ${utf8ToBase64(text)} ${slot}`).catch(() => {});
-      });
+      ctrl.on('insertText', this.insertTextCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(insertText) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('deleteLeft', (length: number) => {
-        if (!native.isWmAgentReady()) return;
-        const n: number = Math.max(1, Math.floor(length));
-        native.wmRpcAsync(`IME_DELETE ${n} 0`).catch(() => {});
-      });
+      ctrl.on('deleteLeft', this.deleteLeftCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(deleteLeft) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('deleteRight', (length: number) => {
-        if (!native.isWmAgentReady()) return;
-        const n: number = Math.max(1, Math.floor(length));
-        native.wmRpcAsync(`IME_DELETE 0 ${n}`).catch(() => {});
-      });
+      ctrl.on('deleteRight', this.deleteRightCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(deleteRight) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('sendFunctionKey', (fnKey: inputMethod.FunctionKey) => {
-        if (!native.isWmAgentReady()) return;
-        const ek: number = fnKey ? Number(fnKey.enterKeyType) : 0;
-        native.wmRpcAsync(`IME_ACTION ${ek}`).catch(() => {});
-      });
+      ctrl.on('sendFunctionKey', this.sendFunctionKeyCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(sendFunctionKey) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('moveCursor', (direction: inputMethod.Direction) => {
-        if (!native.isWmAgentReady()) return;
-        native.wmRpcAsync(`IME_MOVE ${Number(direction)}`).catch(() => {});
-      });
+      ctrl.on('moveCursor', this.moveCursorCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(moveCursor) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('handleExtendAction', (action: inputMethod.ExtendAction) => {
-        if (!native.isWmAgentReady()) return;
-        if (action === inputMethod.ExtendAction.PASTE) {
-          syncHostClipboardToAndroid(true).then(() => {
-            native.wmRpcAsync('IME_EXTEND 5').catch(() => {});
-          }).catch(() => {
-            native.wmRpcAsync('IME_EXTEND 5').catch(() => {});
-          });
-        } else {
-          native.wmRpcAsync(`IME_EXTEND ${Number(action)}`).catch(() => {});
-        }
-      });
+      ctrl.on('handleExtendAction', this.extendActionCb);
     } catch (err) {
       hilog.warn(0x0000, TAG, 'on(handleExtendAction) warn: %{public}s', String(err));
     }
 
     try {
-      ctrl.on('getLeftTextOfCursor', (_length: number): string => {
-        return '';
-      });
-      ctrl.on('getRightTextOfCursor', (_length: number): string => {
-        return '';
-      });
-      ctrl.on('getTextIndexAtCursor', (): number => {
-        return 0;
-      });
+      ctrl.on('getLeftTextOfCursor', this.getLeftTextCb);
+      ctrl.on('getRightTextOfCursor', this.getRightTextCb);
+      ctrl.on('getTextIndexAtCursor', this.getTextIndexCb);
     } catch (_e) {
     }
     this.postAttachBound = true;
   }
 
   private unbindPostAttachListeners(ctrl: inputMethod.InputMethodController): void {
-    try { ctrl.off('insertText'); } catch (_e) {}
-    try { ctrl.off('deleteLeft'); } catch (_e) {}
-    try { ctrl.off('deleteRight'); } catch (_e) {}
-    try { ctrl.off('sendFunctionKey'); } catch (_e) {}
-    try { ctrl.off('moveCursor'); } catch (_e) {}
-    try { ctrl.off('handleExtendAction'); } catch (_e) {}
-    try { ctrl.off('getLeftTextOfCursor'); } catch (_e) {}
-    try { ctrl.off('getRightTextOfCursor'); } catch (_e) {}
-    try { ctrl.off('getTextIndexAtCursor'); } catch (_e) {}
+    if (!this.postAttachBound) return;
+    try { ctrl.off('insertText', this.insertTextCb); } catch (_e) {}
+    try { ctrl.off('deleteLeft', this.deleteLeftCb); } catch (_e) {}
+    try { ctrl.off('deleteRight', this.deleteRightCb); } catch (_e) {}
+    try { ctrl.off('sendFunctionKey', this.sendFunctionKeyCb); } catch (_e) {}
+    try { ctrl.off('moveCursor', this.moveCursorCb); } catch (_e) {}
+    try { ctrl.off('handleExtendAction', this.extendActionCb); } catch (_e) {}
+    try { ctrl.off('getLeftTextOfCursor', this.getLeftTextCb); } catch (_e) {}
+    try { ctrl.off('getRightTextOfCursor', this.getRightTextCb); } catch (_e) {}
+    try { ctrl.off('getTextIndexAtCursor', this.getTextIndexCb); } catch (_e) {}
     this.postAttachBound = false;
   }
 
@@ -251,6 +312,10 @@ class HostImeManager {
 
   public unregisterWindow(slot: number): void {
     this.slots.delete(slot);
+    if (this.manualBypassedSlot === slot) {
+      this.manualBypassedSlot = -1;
+      this.bypassLostFocusAtMs = 0;
+    }
     if (this.attached && this.attachedSlot === slot) {
       this.detachCurrent();
     }
@@ -268,10 +333,11 @@ class HostImeManager {
     if (!active && this.attached && this.attachedSlot === slot) {
       this.detachCurrent();
     } else if (active) {
-      // Re-sync if Android already has an editable field focused in this window
+      // Re-sync if Android already has an editable non-bypassed field focused in this window
       try {
         const st: ImeState = native.getImeState();
-        if (st.active && st.slot === slot && !this.attached) {
+        if (st.active && st.slot === slot && !this.attached &&
+            this.manualBypassedSlot !== slot && !shouldBypassHostImeOnPc(st.inputType)) {
           this.attachToSlot(slot, st.inputType, st.imeOptions, st.lastTapX, st.lastTapY, false);
         }
       } catch (_e) {
@@ -285,9 +351,15 @@ class HostImeManager {
 
   public async toggleManualAttach(slot: number): Promise<boolean> {
     if (this.attached && this.attachedSlot === slot) {
+      // User explicitly chose direct keyboard passthrough — remember until they leave text input
+      // or click the keyboard icon again so focus hops (e.g. multi-box OTP) do not hijack it back.
+      this.manualBypassedSlot = slot;
+      this.bypassLostFocusAtMs = 0;
       await this.detachCurrent();
       return false;
     }
+    this.manualBypassedSlot = -1;
+    this.bypassLostFocusAtMs = 0;
     const st: ImeState = native.getImeState();
     const ok: boolean = await this.attachToSlot(
       slot,
@@ -311,14 +383,49 @@ class HostImeManager {
     if (this.slots.size === 0) return;
     try {
       const st: ImeState = native.getImeState();
+
+      // Clear manual bypass only after Android genuinely leaves text input for >= 1.5s,
+      // preventing brief active=0 -> active=1 focus hops across OTP boxes from re-attaching.
+      if (this.manualBypassedSlot >= 0) {
+        if (!st.active) {
+          const now: number = Date.now();
+          if (this.bypassLostFocusAtMs === 0) {
+            this.bypassLostFocusAtMs = now;
+          } else if (now - this.bypassLostFocusAtMs >= 1500) {
+            this.manualBypassedSlot = -1;
+            this.bypassLostFocusAtMs = 0;
+          }
+        } else {
+          this.bypassLostFocusAtMs = 0;
+        }
+      }
+
       if (st.seq !== this.lastSeq) {
         this.lastSeq = st.seq;
         if (st.active) {
-          const target: SlotImeWindowInfo | undefined = this.slots.get(st.slot);
-          if (target && target.active) {
-            this.attachToSlot(st.slot, st.inputType, st.imeOptions, st.lastTapX, st.lastTapY, false);
+          if (this.manualBypassedSlot === st.slot) {
+            // Respect user's explicit release into direct keyboard passthrough.
+          } else if (!this.manualForced && shouldBypassHostImeOnPc(st.inputType)) {
+            if (this.attached && this.attachedSlot === st.slot) {
+              hilog.info(0x0000, TAG, 'Detaching Host IME for direct ASCII/password/number field inputType=0x%{public}s',
+                st.inputType.toString(16));
+              this.detachCurrent();
+            }
+          } else {
+            const target: SlotImeWindowInfo | undefined = this.slots.get(st.slot);
+            if (target && target.active) {
+              if (this.attached && this.attachedSlot === st.slot) {
+                // Already attached to this slot: avoid re-calling ctrl.attach(newEditBox=true) on
+                // redundant WebView showSoftInput/onStartInput storms.
+                if (this.attachedInputType !== st.inputType || this.attachedImeOptions !== st.imeOptions) {
+                  this.updateAttachedAttribute(st.inputType, st.imeOptions);
+                }
+              } else {
+                this.attachToSlot(st.slot, st.inputType, st.imeOptions, st.lastTapX, st.lastTapY, false);
+              }
+            }
           }
-        } else if (!this.manualForced) {
+        } else if (!this.manualForced && this.attached) {
           this.detachCurrent();
         }
       }
@@ -328,6 +435,20 @@ class HostImeManager {
           this.updateCursorForSlot(st.cursorSlot, st.cursorX, st.cursorY, st.cursorH);
         }
       }
+    } catch (_e) {
+    }
+  }
+
+  private updateAttachedAttribute(inputType: number, imeOptions: number): void {
+    const ctrl: inputMethod.InputMethodController | undefined = this.controller;
+    if (!ctrl || !this.attached) return;
+    this.attachedInputType = inputType;
+    this.attachedImeOptions = imeOptions;
+    try {
+      ctrl.updateAttribute({
+        textInputType: mapAndroidInputType(inputType, this.manualForced),
+        enterKeyType: mapAndroidEnterKey(imeOptions, inputType),
+      }).catch(() => {});
     } catch (_e) {
     }
   }
@@ -425,6 +546,8 @@ class HostImeManager {
         }
         this.attached = false;
         this.attachedSlot = -1;
+        this.attachedInputType = -1;
+        this.attachedImeOptions = -1;
       }
 
       let winId: number = 0;
@@ -436,7 +559,7 @@ class HostImeManager {
       const cursor: inputMethod.CursorInfo = this.computeScreenCursor(info, tapX, tapY, 36, false);
       const textConfig: inputMethod.TextConfig = {
         inputAttribute: {
-          textInputType: mapAndroidInputType(inputType),
+          textInputType: mapAndroidInputType(inputType, isManual),
           enterKeyType: mapAndroidEnterKey(imeOptions, inputType),
         },
         cursorInfo: cursor,
@@ -444,6 +567,9 @@ class HostImeManager {
         newEditBox: true,
       };
 
+      // Mark active BEFORE await ctrl.attach so game touch keymaps are suppressed immediately
+      // with zero async race window while IMF attaches.
+      native.setHostImeActive(slot, true);
       await ctrl.attach(true, textConfig);
       this.bindPostAttachListeners(ctrl);
       if (winId > 0) {
@@ -459,11 +585,12 @@ class HostImeManager {
 
       this.attached = true;
       this.attachedSlot = slot;
+      this.attachedInputType = inputType;
+      this.attachedImeOptions = imeOptions;
       this.manualForced = isManual;
-      native.setHostImeActive(slot, true);
       AppStorage.setOrCreate<number>('hostImeAttachedSlot', slot);
-      hilog.info(0x0000, TAG, 'Host IME attached slot=%{public}d winId=%{public}d cursor=(%{public}d,%{public}d) manual=%{public}d',
-        slot, winId, cursor.left, cursor.top, isManual ? 1 : 0);
+      hilog.info(0x0000, TAG, 'Host IME attached slot=%{public}d winId=%{public}d inputType=0x%{public}s cursor=(%{public}d,%{public}d) manual=%{public}d',
+        slot, winId, inputType.toString(16), cursor.left, cursor.top, isManual ? 1 : 0);
       return true;
     } catch (err) {
       hilog.warn(0x0000, TAG, 'Host IME attach(slot=%{public}d) warn: %{public}s', slot, String(err));
@@ -475,9 +602,12 @@ class HostImeManager {
   }
 
   public async detachCurrent(): Promise<void> {
+    if (!this.attached && this.attachedSlot < 0) return;
     const prevSlot: number = this.attachedSlot;
     this.attached = false;
     this.attachedSlot = -1;
+    this.attachedInputType = -1;
+    this.attachedImeOptions = -1;
     this.manualForced = false;
     if (prevSlot >= 0) {
       try {

@@ -199,6 +199,10 @@ void DispatchMouseEventCB(OH_NativeXComponent* component, void* window) {
 
 void DispatchHoverEventCB(OH_NativeXComponent*, bool) {}
 
+void OnBlurEventCB(OH_NativeXComponent*, void*) {
+    InputBridge::Instance().ReleaseAllKeys();
+}
+
 bool DispatchKeyEventCB(OH_NativeXComponent* component, void*) {
     int32_t slot = DisplaySlotFromXC(component);
     OH_NativeXComponent_KeyEvent* kev = nullptr;
@@ -211,14 +215,15 @@ bool DispatchKeyEventCB(OH_NativeXComponent* component, void*) {
     OH_NativeXComponent_GetKeyEventCode(kev, &code);
     if (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN || act == OH_NATIVEXCOMPONENT_KEY_ACTION_UP) {
         bool down = (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN);
-        if (InputBridge::Instance().ShouldSuppressKeyForHostIme(slot, static_cast<int32_t>(code), down)) {
-            // Return false so HarmonyOS InputMethodFramework handles this key cleanly
-            // without double-typing or firing keymap touch macros inside text fields.
-            return false;
+        bool imeActive = InputBridge::Instance().IsHostImeActive(slot);
+        // Never fire game touch keymaps while typing in an Android text field.
+        if (!imeActive) {
+            if (InputBridge::Instance().HandleKeymapKey(slot, static_cast<int32_t>(code), down)) {
+                return true;
+            }
         }
-        if (InputBridge::Instance().HandleKeymapKey(slot, static_cast<int32_t>(code), down)) {
-            return true;
-        }
+        // HarmonyOS Stage 3 (post-IME): any key reaching here was NOT consumed by the host IME
+        // (e.g. physical digits 0-9, passwords, numbers, OTP, English direct keys, symbols).
         InputBridge::Instance().InjectOhosKey(static_cast<int32_t>(code), down);
         return true;
     }
@@ -1371,7 +1376,8 @@ napi_value Init(napi_env env, napi_value exports) {
             OH_NativeXComponent_RegisterCallback(nativeXC, &g_xcCallback);
             OH_NativeXComponent_RegisterMouseEventCallback(nativeXC, &g_mouseCallback);
             OH_NativeXComponent_RegisterKeyEventCallbackWithResult(nativeXC, DispatchKeyEventCB);
-            OH_LOG_INFO(LOG_APP, "Registered OH_NativeXComponent Surface + Touch + Mouse + Key callbacks");
+            OH_NativeXComponent_RegisterBlurEventCallback(nativeXC, OnBlurEventCB);
+            OH_LOG_INFO(LOG_APP, "Registered OH_NativeXComponent Surface + Touch + Mouse + Key + Blur callbacks");
         }
     }
     return exports;

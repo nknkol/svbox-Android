@@ -372,6 +372,10 @@ void InputBridge::Start(const std::string& touchSockPath,
         std::lock_guard<std::mutex> lk(gamepadStateMu_);
         std::memset(gamepadAbs_, 0, sizeof(gamepadAbs_));
     }
+    {
+        std::lock_guard<std::mutex> lk(kbdStateMu_);
+        std::memset(evdevKeyDown_, 0, sizeof(evdevKeyDown_));
+    }
 
     running_.store(true);
     if (!touchSockPath.empty()) {
@@ -422,6 +426,7 @@ void InputBridge::StartSecondaryTouch(int displaySlot, const std::string& sockPa
 }
 
 void InputBridge::Stop() {
+    ReleaseAllKeys();
     running_.store(false);
     DetachGameControllerKit();
     auto stopSrv = [](EvdevServer& srv) {
@@ -1014,11 +1019,47 @@ void InputBridge::InjectScrollForDisplay(int displaySlot, float x, float y, floa
 }
 
 void InputBridge::InjectLinuxKey(uint16_t linuxKey, bool down) {
-    if (!running_.load() || linuxKey == 0) return;
+    if (!running_.load() || linuxKey == 0 || linuxKey >= kMaxLinuxKeyCode) return;
+    {
+        std::lock_guard<std::mutex> lk(kbdStateMu_);
+        if (down) {
+            // Like real Linux kernel evdev, never emit redundant EV_KEY value=1 while already held.
+            // HarmonyOS MMI emits software key-repeat KEY_DOWN events while Android InputDispatcher
+            // also runs its own repeat timer; suppressing duplicate DOWN prevents 2x repeat bursts.
+            if (evdevKeyDown_[linuxKey]) return;
+            evdevKeyDown_[linuxKey] = true;
+        } else {
+            // Drop orphan KEY_UP for keys whose KEY_DOWN was consumed in Stage 2 by HarmonyOS IME.
+            if (!evdevKeyDown_[linuxKey]) return;
+            evdevKeyDown_[linuxKey] = false;
+        }
+    }
     struct timeval tv = NowMonotonicTv();
     std::vector<struct input_event> evs;
     evs.reserve(2);
     PushEv(evs, tv, EV_KEY, linuxKey, down ? 1 : 0);
+    PushEv(evs, tv, EV_SYN, SYN_REPORT, 0);
+    BroadcastEvents(&kbdSrv_, evs.data(), evs.size() * sizeof(struct input_event));
+}
+
+void InputBridge::ReleaseAllKeys() {
+    std::vector<uint16_t> held;
+    {
+        std::lock_guard<std::mutex> lk(kbdStateMu_);
+        for (size_t k = 1; k < kMaxLinuxKeyCode; ++k) {
+            if (evdevKeyDown_[k]) {
+                evdevKeyDown_[k] = false;
+                held.push_back(static_cast<uint16_t>(k));
+            }
+        }
+    }
+    if (held.empty() || !running_.load()) return;
+    struct timeval tv = NowMonotonicTv();
+    std::vector<struct input_event> evs;
+    evs.reserve(held.size() + 1);
+    for (uint16_t lk : held) {
+        PushEv(evs, tv, EV_KEY, lk, 0);
+    }
     PushEv(evs, tv, EV_SYN, SYN_REPORT, 0);
     BroadcastEvents(&kbdSrv_, evs.data(), evs.size() * sizeof(struct input_event));
 }
@@ -1127,7 +1168,27 @@ uint16_t InputBridge::MapOhosKeyToLinux(int32_t k) const {
         case 2074: return KEY_CAPSLOCK;
         case 2081: return KEY_HOME;
         case 2082: return KEY_END;
+        case 2102: return KEY_NUMLOCK;
+        case 2103: return KEY_KP0;
+        case 2104: return KEY_KP1;
+        case 2105: return KEY_KP2;
+        case 2106: return KEY_KP3;
+        case 2107: return KEY_KP4;
+        case 2108: return KEY_KP5;
+        case 2109: return KEY_KP6;
+        case 2110: return KEY_KP7;
+        case 2111: return KEY_KP8;
+        case 2112: return KEY_KP9;
+        case 2113: return KEY_KPSLASH;
+        case 2114: return KEY_KPASTERISK;
+        case 2115: return KEY_KPMINUS;
+        case 2116: return KEY_KPPLUS;
+        case 2117: return KEY_KPDOT;
+        case 2118: return KEY_KPCOMMA;
         case 2119: return KEY_KPENTER;
+        case 2120: return KEY_KPEQUAL;
+        case 2121: return KEY_KPLEFTPAREN;
+        case 2122: return KEY_KPRIGHTPAREN;
         case 2210: return KEY_APPSELECT;
         default: return 0;
     }
@@ -1163,26 +1224,16 @@ bool InputBridge::ShouldSuppressKeyForHostIme(int displaySlot, int32_t k, bool d
         hostAltHeld_.store(down);
         return false;
     }
-    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
-    if (!hostImeActive_[displaySlot].load()) return false;
-    // Allow Ctrl/Alt shortcuts (Ctrl+C/V/A/X/Z, etc.) to pass through cleanly
-    if (hostCtrlHeld_.load() || hostAltHeld_.load()) return false;
-    // Letters A-Z, digits 0-9
-    if ((k >= 2017 && k <= 2042) || (k >= 2000 && k <= 2009)) return true;
-    // Punctuation, Space, Backspace, Delete, Enter, Shift, CapsLock, Arrows
-    switch (k) {
-        case 2012: case 2013: case 2014: case 2015: // Arrow keys (candidate navigation / moveCursor)
-        case 2016: case 2054: case 2119:            // Enter / Numpad Enter
-        case 2043: case 2044:                       // Comma, Period
-        case 2047: case 2048: case 2074:            // Shift, CapsLock (CN/EN IME toggle)
-        case 2050: case 2055: case 2071:            // Space, Backspace, Delete
-        case 2056: case 2057: case 2058: case 2059:
-        case 2060: case 2061: case 2062: case 2063:
-        case 2064:
-            return true;
-        default:
-            return false;
-    }
+    // HarmonyOS dispatches physical keys in 3 stages:
+    //   Stage 1: ArkUI onKeyPreIme & shortcuts
+    //   Stage 2: HarmonyOS IMF (XiaoYi/Sogou/etc.) — consumes Pinyin / composing keys
+    //   Stage 3: ArkUI onKeyEvent / XComponent DispatchKeyEventCB — ONLY receives keys
+    //            NOT consumed by Stage 2 IME (e.g. physical digits 0-9, passwords, numbers,
+    //            OTP, English direct keys, symbols, non-composing Backspace/Enter).
+    // Therefore Stage 3 must NEVER swallow unconsumed keys; InjectLinuxKey's evdevKeyDown_
+    // pairing automatically drops orphan KEY_UP events for keys consumed in Stage 2.
+    (void)displaySlot;
+    return false;
 }
 
 void InputBridge::SetDisplay0Rotation(int rotation) {

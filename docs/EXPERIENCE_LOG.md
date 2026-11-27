@@ -1160,5 +1160,20 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - 竖屏主屏（`760×1427`）上滑打开应用抽屉直接点击 **BrownDust II**（不点手动旋转）：`wm_agent` 推送 `DISPLAY_ROTATION_CHANGED (0 -> 1)`，`SvboxEmuPage` 自动跟随将窗口无黑边切换至横屏 `1480×909`，全屏 16:9 Vulkan 画面零压缩，点击设置齿轮精准命中弹出设置弹窗；
     - 点击主页（`⌂`）：自动回落 `1 -> 0` 恢复竖屏 `760×1427`；
     - 手动点击旋转至横屏再手动旋回竖屏后再次进入 **BrownDust II**：仍能自动旋转至 `1480×909`（无 `fixed-to-user-rotation` 粘滞）；`org.svbox.ime` 零隐藏 API 警告。
+- **2026-11-27 修复密码/数字/验证码无法输入及释放鸿蒙输入法后输入重复**：
+  - **三层根因（经 `hilog` 与华为官方 `faqs-ime-2` / `use-inputmethod-in-custom-edit-box` 交叉实证）**：
+    1. **密码/数字/验证码无法输入**：HarmonyOS PC 窗口按键采用 3 阶段派发（Stage 1 `onKeyPreIme` → Stage 2 系统输入法小艺 → Stage 3 `onKeyEvent` / `XComponent DispatchKeyEventCB`）。华为小艺在 PC 上会主动忽略物理数字键（`ignore keyCodeNumber`），并对密码/数字/电话框触发 `GetImeByInputType type: 3 not supported` / `HMKeyboard_KeyboardToolWindow: current device is pwdkbd on pc, return` 而直接透传给 Stage 3；但此前 `InputBridge::ShouldSuppressKeyForHostIme()` 在 `hostImeActive_=true` 时无差别拦截丢弃了 Stage 3 的所有字母/数字/符号/退格/回车，导致按键落入黑洞。
+    2. **点击键盘图标释放后被悄悄重新接管 + 吞掉 `KEY_UP` 引发卡键/重复输入**：用户点击键盘图标释放鸿蒙输入法后未记录手动直通锁，验证码框切换下一格或 WebView 触发 `onStartInput` 时 `pollOnce()` 在 41–54ms 内强行重新 `attach()` 并把 `hostImeActive_` 翻回 `true`，吞掉了当前按键的 `KEY_UP`，导致 Android `InputDispatcher` 认为按键未松开触发 500ms 自动连发重复字符；同时 `InputBridge::InjectLinuxKey()` 未过滤 HarmonyOS MMI 软件连发产生的重复 `EV_KEY value=1`，与 Android 自身连发计时器叠加造成双倍重复；`attachToSlot()` 此前也在 `ctrl.attach()` 之后经历 2 次 `await` 才置 `setHostImeActive(true)` 且对 WebView 频繁 `showSoftInput` 重复调用 `ctrl.attach(newEditBox=true)`。
+    3. `unbindPostAttachListeners()` 此前调用 `ctrl.off('insertText')` 未传回调引用，触发 `ImsaKit: UnRegisterListener, callback is nullptr!` 报错。
+  - **修复**：
+    - `ohos_bridge/include/ohos_bridge/input_bridge.h` + `ohos_bridge/src/input_bridge.cpp` + `hap/entry/src/main/cpp/napi_init.cpp`：遵循 HarmonyOS 3 阶段派发模型，Stage 3 `DispatchKeyEventCB` 仅在 `IsHostImeActive()` 时屏蔽游戏键鼠映射宏，其余所有未被小艺在 Stage 2 消费的物理按键（数字 `0-9`、密码、符号、`Shift+2(@)` 等）全部直通 `evdev`；`InjectLinuxKey()` 增加 `evdevKeyDown_[768]` 状态机（丢弃 Stage 2 消费 `KEY_DOWN` 后残留的孤儿 `KEY_UP`，并过滤冗余 `value=1` 防双倍连发），注册 `OH_NativeXComponent_RegisterBlurEventCallback` 失焦调用 `ReleaseAllKeys()`，并补齐小键盘 `KEY_NUMPAD_0..9` 等键码映射。
+    - `hap/entry/src/main/ets/common/HostImeController.ets`：PC 端检测到 `NUMBER`/`PHONE`/`DATETIME`/`PASSWORD`/`VISIBLE_PASSWORD`/`WEB_PASSWORD` 时自动跳过并释放鸿蒙输入法切回原生硬件键盘直通（移动端保留软键盘）；PC 端普通文本统一映射为 `TEXT`/`MULTILINE` 避免触发 `InputPwdService`/`InputEnLowerService` 异常；支持 `manualBypassedSlot`（用户手动点键盘释放后跨焦点跳转保持直通，直至离开文本编辑 1.5s 或再次点击恢复）；同 slot 重复 `IME_FOCUS` 改走幂等去重/`updateAttribute()` 消除 4×/180ms 反复 `attach` 风暴，且 `setHostImeActive(true)` 提前至 `attach()` 前消除异步双打窗口；保存监听器引用传给 `ctrl.off(type, cb)` 彻底消除 `ImsaKit nullptr` 报错。
+  - **真机实测（`HAD-W32`，Android 14 Chrome 4 框实测页，全程不点键盘图标）**：
+    - `1. TEXT`：中文拼音 `nihao`+空格 + 物理数字 `1234` + 退格 → `[你好123] len=5`；切换英文 + `Shift+2(@)` + `./12` → `abc@./12`；
+    - `2. PASSWORD`：点击即自动释放鸿蒙输入法直通，输入 `Abc123@!` + 退格 → `[Abc123@] len=7`（零 `pwdkbd` 错误）；
+    - `3. NUMBER`：输入 `987654` + 退格 → `[98765] len=5`；
+    - `4. OTP`（6 格自动跳焦验证码）：50ms 快速连打 `123456` → `[123456] len=6`（零丢失、零卡键、零重复）；
+    - 手动释放验证：点击键盘释放后再次点击地址栏保持直通，连打 31 字符 `http://127.0.0.1:18999/t.html` 零重复；冷启动 `Fatal signal = 0`，`ImsaKit UnRegisterListener` 错误为 0。
+
 
 
