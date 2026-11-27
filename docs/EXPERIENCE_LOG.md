@@ -1233,6 +1233,22 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - **真机实测（`HAD-W32`，Maleoon 916 · Vulkan · 120Hz）**：
     - 3D 旅馆实机场景稳定 **`59.5–60.0 FPS`**（持续 40s+ `qsri=119–120 / 2s`）；`on_vkQueueSubmit` 脏页扫描从 **`819.2 ms (7,610.5 MB)` 降至 `1.0–1.8 ms (0.0 MB)`（提速 >500×）**；Guest `vkQueueSignalReleaseImageANDROID` 均值降至 **`0.37–0.55 ms`**；3D 旅馆桌椅/立柱纹理 100% 正常零洋红；连续 3 次全新安装冷启动零崩溃。
     - **附带观测（鸿蒙 PC 失焦降频）**：`org.svbox.android` 获焦前台运行时 `Cpus_allowed_list=0..19`（含 8 颗大核 `12..19`，单核实测比小核 `cpu0/1` 快 `11.6×`）且 `RenderThread` 获 `RT -10`，稳定满 60 FPS；一旦窗口失焦（如点击终端）或后台静置，鸿蒙 `rss` 会将进程限核至 `0..11` 并降权，`qsri` 均值由 `0.51 ms` 升至 `1.55 ms` 并触发 `[E/SwappyVk] Failed to wait for fence 2`，导致 `SwappyVk` 主动降档至 `30.0 FPS`（切回前台并旋转屏幕重建 `VkSwapchainKHR` 后恢复 60 FPS）。
+- **2026-11-27 修复失焦/后台回归前台后无法自动回升 60 FPS（鸿蒙 `APP_NAP`/`CgroupSched` 抹除核心亲和性 + Kirin X90 三档算力聚类与前台瞬时恢复）**：
+  - **三层根因实证（`HAD-W32` Kirin X90 20 核真机实测）**：
+    1. **鸿蒙 `APP_NAP`/`CgroupSched` 切回前台永久抹除 `sched_setaffinity`**：窗口失焦 5 秒后 `resource_schedule_service/APP_NAP` 将 `org.svbox.android` 及全部子进程迁入 `3:cpuset:/key-background`（`0-11`）；切回前台 `3:cpuset:/top-app` 时，内核把所有线程的 `Cpus_allowed_list` 重置为全核 **`0-19`**，彻底抹掉了启动时 `svbox --cpuset 12-19` 的大核亲和性。真机实测切回 `/top-app` 后，哪怕 Host `RenderThread` 已恢复 `RT pri=-42`，仍与 `UnityGfxDeviceWorker` 一同被 EAS 调度器长期调度在 **`cpu0–cpu3`**（单核基准 `465–905 ms`，比中核 `cpu4–11` `105–129 ms` 与大核 `cpu12–19` `91 ms` 慢 **`5×–10×`**），导致回归前台后长期卡在 `30–42 FPS` 无法自动回满 60 FPS。
+    2. **Kirin X90 核间拓扑探测与亲和性内核规则**：实测 `HAD-W32` `/sys/devices/system/cpu/cpu*/cpu_capacity` 为三档离散值 **`688 (cpu0–3) / 888 (cpu4–11) / 1024 (cpu12–19)`**，旧版 `sched_qos.cpp` `ratio >= 0.65` 阈值误将 `688`（`0.672`）归入中核并复制进小核导致 `L=0-11, M=0-11` 重叠；此外 Kirin X90 内核对纯大核掩码 `12-19` 会静默扩回 `4-19`，而“大核 + 上半中核”掩码 **`8-19`** 可被内核精确原样保留且严格排除 `cpu0–3`。
+    3. **前台焦点事件未重申期望帧率与场景加速**：`EmulatorWindowAbility.ets` 在 PC 窗口失焦→获焦仅触发 `WINDOW_ACTIVE`（不触发 `onForeground`），此前未通知 Native 重调 `OH_NativeXComponent_SetExpectedFrameRateRange(60..hz, hz)`、未重申快核亲和性、也未触发 `FASTKit` 场景提频。
+  - **修复（参考 `gpui-ohos` 已验证的 HarmonyOS API 26 调度最佳实践，零机型/游戏硬编码）**：
+    - `ohos_bridge/include/ohos_bridge/sched_qos.h` + `ohos_bridge/src/sched_qos.cpp`：
+      - `RunProbeWorker()` 改用 5% 离散算力层级聚类（在 `HAD-W32` 精准识别 `L=0-3 / M=4-11 / B=12-19`），探测线程先设 `QOS_USER_INTERACTIVE` 并修复 `%{public}` 日志与后台 `telemetry` 日志刷屏；
+      - 新增 `ReassertFastAffinity()`：前台态（`getpid()` 含大核）下动态构建 `fastMask`（`Performance` 取全大核 + 上半中核即 `8-19`，`Balanced` 取全大核 + 全中核，严格清零小核），扫描并仅重绑被内核重置含小核的宿主交互/渲染线程与同 UID 容器子进程全部线程；后台态（`/key-background` 不含大核）主动记录 `wokeFromBg` 不与系统对抗；
+      - 新增 `NotifyForegroundBurst()`：动态加载 `libscheduling_optimization.z.so` 调用 `HMS_FAST_SchedulingOptimization_PerfHint`（`HMS_FAST_PAGE_DRAWING` + `HMS_FAST_SHORT`，严禁传 `SetTids` 以防清除 `QOS_USER_INTERACTIVE`）。
+    - `hap/entry/src/main/cpp/android_runtime.{h,cpp}` + `napi_init.cpp` + `Index.d.ts`：新增 `notifyWindowActive(slot, active)`，获焦立即重调 `OH_NativeXComponent_SetExpectedFrameRateRange(60..hz, hz)`，并在非 UI 线程于 `t=0ms / +150ms / +500ms` 三段重申亲和性（兜底异步 `CgroupSched` 迁移竞态）+ `GetStatus()` 1s 节流巡检。
+    - `hap/entry/src/main/ets/entryability/{EmulatorWindowAbility,AppWindowAbility}.ets`：在 `WINDOW_ACTIVE` / `WINDOW_INACTIVE` / `onForeground` / `onBackground` / `onNewWant` 全链路接入 `native.notifyWindowActive()`。
+  - **真机实测（`HAD-W32` · 《棕色尘埃 2》3D 旅馆场景，全程不旋转屏幕）**：
+    - 启动拓扑精准识别 `20c (sys: L=4 M=8 B=8) [L=0-3 M=4-11 B=12-19]`，前台锁定 **`8-19`** 稳跑 **`60.3 FPS`**；
+    - 切至终端触发 `APP_NAP` 迁入 `3:cpuset:/key-background (0-11)` 后，直接切回 `EmulatorWindowAbility`（不点旋转）：`52 ms` 内自动重申 `SetExpectedFrameRateRange` 并重绑 **1,204 条** 宿主+容器线程至 `8-19`（`wokeFromBg=1`），稳态零重复刷屏，顶栏与实测帧率立回 **`60/120Hz`（`59.7–60.3 FPS`）**，3D 旅馆画面零瑕疵。
+
 
 
 

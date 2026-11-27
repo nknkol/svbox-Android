@@ -59,6 +59,8 @@ public:
     void OnDisplaySurfaceChanged(int32_t displaySlot, OHNativeWindow* window, int32_t w, int32_t h);
     void OnDisplaySurfaceDestroyed(int32_t displaySlot, OHNativeWindow* window = nullptr);
     void SetDisplayVisible(int32_t displaySlot, bool visible);
+    void OnWindowActiveChanged(int32_t displaySlot, bool active);
+    void MaybeReassertForegroundAffinityAsync();
     std::string SetPaused(bool paused);
     void SetVisible(bool visible);
     std::string TrimMemory();
@@ -190,7 +192,9 @@ private:
     std::atomic<bool> wmAgentReady_{false};
     std::atomic<pid_t> bootanimPid_{-1};
     std::atomic<uint32_t> visibleDisplayMask_{0};
+    std::atomic<uint32_t> activeDisplayMask_{0};
     std::atomic<uint64_t> hideSeq_{0};
+    std::atomic<uint64_t> fgBoostSeq_{0};
     std::atomic<bool> trimBusy_{false};
     std::string wmSockPath_;
     std::string iconsHostDir_;

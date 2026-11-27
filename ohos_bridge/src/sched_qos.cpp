@@ -21,6 +21,14 @@
 
 namespace SchedQos {
 
+#ifdef OHOS_BRIDGE_HEADLESS
+#define QOS_FMT_S "%s"
+#define QOS_FMT_D "%d"
+#else
+#define QOS_FMT_S "%{public}s"
+#define QOS_FMT_D "%{public}d"
+#endif
+
 namespace {
 
 using SetThreadQoSFn = int (*)(int);
@@ -163,6 +171,7 @@ std::vector<int32_t> QueryAllowedCpus() {
 }
 
 void RunProbeWorker() {
+    SetCurrentThreadQoS(Level::UserInteractive, "topo-probe");
     cpu_set_t orig;
     CPU_ZERO(&orig);
     bool hasOrig = (sched_getaffinity(0, sizeof(orig), &orig) == 0);
@@ -225,20 +234,41 @@ void RunProbeWorker() {
             if (a.score != b.score) return a.score > b.score;
             return a.cpu > b.cpu;
         });
+
+        // Cluster into distinct capacity tiers (within 5% tolerance) so 3-tier SoCs
+        // like Kirin X90 (688 / 888 / 1024) cleanly separate Little / Medium / Big
+        // even when little-core capacity exceeds 0.65 * maxScore.
+        std::vector<double> tiers;
         for (const auto& s : byDesc) {
-            double ratio = s.score / maxScore;
-            if (ratio >= 0.90) topo.bigCores.push_back(s.cpu);
-            else if (ratio >= 0.65) topo.mediumCores.push_back(s.cpu);
-            else topo.littleCores.push_back(s.cpu);
+            if (tiers.empty() || (tiers.back() - s.score) / std::max(1.0, tiers.back()) >= 0.05) {
+                tiers.push_back(s.score);
+            }
+        }
+
+        if (sysOk && tiers.size() >= 3) {
+            const double highCut = tiers.front() * 0.95;
+            const double lowCut = tiers.back() * 1.05;
+            for (const auto& s : byDesc) {
+                if (s.score >= highCut) topo.bigCores.push_back(s.cpu);
+                else if (s.score <= lowCut) topo.littleCores.push_back(s.cpu);
+                else topo.mediumCores.push_back(s.cpu);
+            }
+        } else if (sysOk && tiers.size() == 2) {
+            const double highCut = tiers.front() * 0.95;
+            for (const auto& s : byDesc) {
+                if (s.score >= highCut) topo.bigCores.push_back(s.cpu);
+                else topo.littleCores.push_back(s.cpu);
+            }
+        } else {
+            for (const auto& s : byDesc) {
+                double ratio = s.score / maxScore;
+                if (ratio >= 0.90) topo.bigCores.push_back(s.cpu);
+                else if (ratio >= 0.65) topo.mediumCores.push_back(s.cpu);
+                else topo.littleCores.push_back(s.cpu);
+            }
         }
         // Keep littleCores ascending (lowest-power first) and mediumCores descending (stronger mid first).
         std::reverse(topo.littleCores.begin(), topo.littleCores.end());
-        if (topo.littleCores.empty() && !topo.mediumCores.empty()) {
-            topo.littleCores = topo.mediumCores;
-        }
-        if (topo.mediumCores.empty()) {
-            topo.mediumCores = !topo.bigCores.empty() ? topo.bigCores : allowed;
-        }
         if (topo.bigCores.empty()) {
             topo.bigCores = allowed;
         }
@@ -252,7 +282,7 @@ void RunProbeWorker() {
         << " B=" << topo.bigCores.size() << ")";
     topo.summary = sum.str();
 
-    OB_LOG_INFO("SvboxQos", "Core topology probed: %s [L=%s M=%s B=%s]",
+    OB_LOG_INFO("SvboxQos", "Core topology probed: " QOS_FMT_S " [L=" QOS_FMT_S " M=" QOS_FMT_S " B=" QOS_FMT_S "]",
                 topo.summary.c_str(),
                 FormatCpuList(topo.littleCores).c_str(),
                 FormatCpuList(topo.mediumCores).c_str(),
@@ -297,8 +327,10 @@ bool SetCurrentThreadQoS(Level level, const char* label) {
     if (!fn) return false;
     int rc = fn(static_cast<int>(level));
     if (rc == 0) {
-        OB_LOG_INFO("SvboxQos", "SetThreadQoS(%s) = %d OK",
-                    label ? label : "?", static_cast<int>(level));
+        if (level != Level::Background) {
+            OB_LOG_INFO("SvboxQos", "SetThreadQoS(" QOS_FMT_S ") = " QOS_FMT_D " OK",
+                        label ? label : "?", static_cast<int>(level));
+        }
         return true;
     }
     return false;
@@ -410,9 +442,320 @@ std::string ResolveCpuset(const std::string& profile,
         ranked.resize(static_cast<size_t>(want));
     }
     std::string result = FormatCpuList(ranked);
-    OB_LOG_INFO("SvboxQos", "ResolveCpuset(profile=%s, target=%d, host=%dc) -> %s",
+    OB_LOG_INFO("SvboxQos", "ResolveCpuset(profile=" QOS_FMT_S ", target=" QOS_FMT_D ", host=" QOS_FMT_D "c) -> " QOS_FMT_S,
                 p.c_str(), targetCores, total, result.c_str());
     return result;
+}
+
+namespace {
+
+bool ParseCpuListToMask(const std::string& spec, cpu_set_t& outMask) {
+    CPU_ZERO(&outMask);
+    bool any = false;
+    size_t i = 0;
+    while (i < spec.size()) {
+        while (i < spec.size() && (spec[i] == ',' || spec[i] == ' ')) ++i;
+        if (i >= spec.size()) break;
+        int a = 0;
+        if (spec[i] < '0' || spec[i] > '9') return false;
+        while (i < spec.size() && spec[i] >= '0' && spec[i] <= '9') {
+            a = a * 10 + (spec[i++] - '0');
+        }
+        int b = a;
+        if (i < spec.size() && spec[i] == '-') {
+            ++i;
+            b = 0;
+            if (i >= spec.size() || spec[i] < '0' || spec[i] > '9') return false;
+            while (i < spec.size() && spec[i] >= '0' && spec[i] <= '9') {
+                b = b * 10 + (spec[i++] - '0');
+            }
+        }
+        if (a > b) std::swap(a, b);
+        for (int c = a; c <= b && c < CPU_SETSIZE && c < 64; ++c) {
+            if (c >= 0) {
+                CPU_SET(c, &outMask);
+                any = true;
+            }
+        }
+    }
+    return any;
+}
+
+bool HasAnyCpuOverlap(const cpu_set_t& a, const cpu_set_t& b) {
+    for (int c = 0; c < CPU_SETSIZE && c < 64; ++c) {
+        if (CPU_ISSET(c, &a) && CPU_ISSET(c, &b)) return true;
+    }
+    return false;
+}
+
+bool IsHostBackgroundThreadComm(const char* comm) {
+    if (!comm || !comm[0]) return false;
+    return std::strncmp(comm, "telemetry", 9) == 0 ||
+           std::strncmp(comm, "lmkd", 4) == 0 ||
+           std::strncmp(comm, "logdw", 5) == 0 ||
+           std::strncmp(comm, "dns-proxy", 9) == 0 ||
+           std::strncmp(comm, "topo-probe", 10) == 0;
+}
+
+struct FastPerfHintApi {
+    int (*builderCreate)(void**) = nullptr;
+    void (*builderDestroy)(void*) = nullptr;
+    int (*setSceneType)(void*, int) = nullptr;
+    int (*setSceneState)(void*, int) = nullptr;
+    int (*setDurationType)(void*, int) = nullptr;
+    int (*build)(void*, void**) = nullptr;
+    void (*configDestroy)(void*) = nullptr;
+    int (*perfHint)(const void*) = nullptr;
+    bool loaded = false;
+};
+
+const FastPerfHintApi& GetFastPerfHintApi() {
+    static FastPerfHintApi api = []() {
+        FastPerfHintApi a;
+        void* h = dlopen("libscheduling_optimization.z.so", RTLD_NOW | RTLD_LOCAL);
+        if (!h) return a;
+        a.builderCreate = reinterpret_cast<int (*)(void**)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_Create"));
+        a.builderDestroy = reinterpret_cast<void (*)(void*)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_Destroy"));
+        a.setSceneType = reinterpret_cast<int (*)(void*, int)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_SetSceneType"));
+        a.setSceneState = reinterpret_cast<int (*)(void*, int)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_SetSceneState"));
+        a.setDurationType = reinterpret_cast<int (*)(void*, int)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_SetDurationType"));
+        a.build = reinterpret_cast<int (*)(void*, void**)>(dlsym(h, "HMS_FAST_PerfHintConfigBuilder_Build"));
+        a.configDestroy = reinterpret_cast<void (*)(void*)>(dlsym(h, "HMS_FAST_PerfHintConfig_Destroy"));
+        a.perfHint = reinterpret_cast<int (*)(const void*)>(dlsym(h, "HMS_FAST_SchedulingOptimization_PerfHint"));
+        a.loaded = (a.builderCreate && a.builderDestroy && a.setSceneType && a.setSceneState &&
+                    a.setDurationType && a.build && a.configDestroy && a.perfHint);
+        return a;
+    }();
+    return api;
+}
+
+bool EmitFastPerfHint(bool begin) {
+    constexpr int kFastPageDrawing = 6;
+    constexpr int kFastEnd = 0;
+    constexpr int kFastBegin = 1;
+    constexpr int kFastShort = 1;
+
+    const auto& api = GetFastPerfHintApi();
+    if (!api.loaded) return false;
+    void* builder = nullptr;
+    if (api.builderCreate(&builder) != 0 || !builder) return false;
+    void* config = nullptr;
+    const int state = begin ? kFastBegin : kFastEnd;
+    bool ok = (api.setSceneType(builder, kFastPageDrawing) == 0) &&
+              (api.setSceneState(builder, state) == 0) &&
+              (!begin || api.setDurationType(builder, kFastShort) == 0) &&
+              // Never pass SetTids so HMS_FAST_END cannot clear permanent QOS_USER_INTERACTIVE.
+              (api.build(builder, &config) == 0) &&
+              (config != nullptr);
+    int rc = ok ? api.perfHint(config) : -1;
+    if (config) api.configDestroy(config);
+    api.builderDestroy(builder);
+    return rc == 0;
+}
+
+std::atomic<bool> g_fastSceneActive{false};
+std::atomic<int64_t> g_lastFastBeginMs{0};
+std::atomic<bool> g_wasInBgCgroup{false};
+std::atomic<int64_t> g_lastAffinitySweepMs{0};
+std::atomic<bool> g_affinitySweepBusy{false};
+
+int64_t SteadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+void NotifyForegroundBurst(bool active) {
+    if (active) {
+        const int64_t now = SteadyNowMs();
+        const int64_t prev = g_lastFastBeginMs.load(std::memory_order_relaxed);
+        if (g_fastSceneActive.load(std::memory_order_relaxed) && (now - prev) < 3200) {
+            return;
+        }
+        if ((now - prev) < 3200) {
+            return;
+        }
+        g_lastFastBeginMs.store(now, std::memory_order_relaxed);
+        if (EmitFastPerfHint(true)) {
+            g_fastSceneActive.store(true, std::memory_order_release);
+        }
+    } else {
+        if (g_fastSceneActive.exchange(false, std::memory_order_acq_rel)) {
+            EmitFastPerfHint(false);
+        }
+    }
+}
+
+int ReassertFastAffinity(const std::string& profile,
+                         const std::string& customCpuset,
+                         bool forceSweep) {
+    std::string p;
+    p.reserve(profile.size());
+    for (unsigned char ch : profile) {
+        p.push_back(static_cast<char>(ch >= 'A' && ch <= 'Z' ? (ch - 'A' + 'a') : ch));
+    }
+    if (p == "eco" && customCpuset.empty()) {
+        return 0;
+    }
+
+    CoreTopology topo = GetCoreTopology();
+    if (!topo.probed) {
+        StartCoreTopologyProbeAsync();
+        return 0;
+    }
+
+    cpu_set_t fastMask, bigMask, littleMask;
+    CPU_ZERO(&fastMask);
+    CPU_ZERO(&bigMask);
+    CPU_ZERO(&littleMask);
+    std::vector<int32_t> fastCpus;
+
+    if (!customCpuset.empty()) {
+        if (!ParseCpuListToMask(customCpuset, fastMask)) return 0;
+        bigMask = fastMask;
+        for (int c = 0; c < topo.totalCores && c < 64; ++c) {
+            if (!CPU_ISSET(c, &fastMask)) CPU_SET(c, &littleMask);
+            else fastCpus.push_back(c);
+        }
+    } else {
+        if (topo.littleCores.empty() || topo.bigCores.empty()) {
+            return 0; // homogeneous or tiny topology
+        }
+        for (int32_t c : topo.littleCores) {
+            if (c >= 0 && c < 64) CPU_SET(c, &littleMask);
+        }
+        for (int32_t c : topo.bigCores) {
+            if (c >= 0 && c < 64) {
+                CPU_SET(c, &bigMask);
+                CPU_SET(c, &fastMask);
+                fastCpus.push_back(c);
+            }
+        }
+        if (!topo.mediumCores.empty()) {
+            // Include medium cores alongside big cores: on HarmonyOS Kirin kernels,
+            // requesting big-only triggers silent kernel fallback, whereas big + mid
+            // is honored verbatim while strictly excluding the 5-10x slower little cores.
+            size_t takeMid = (p == "balanced")
+                                 ? topo.mediumCores.size()
+                                 : std::max<size_t>(std::min<size_t>(2, topo.mediumCores.size()),
+                                                    topo.mediumCores.size() / 2);
+            for (size_t i = 0; i < takeMid && i < topo.mediumCores.size(); ++i) {
+                int32_t c = topo.mediumCores[i];
+                if (c >= 0 && c < 64 && !CPU_ISSET(c, &fastMask)) {
+                    CPU_SET(c, &fastMask);
+                    fastCpus.push_back(c);
+                }
+            }
+        }
+    }
+    if (fastCpus.empty()) return 0;
+    for (int32_t c : fastCpus) {
+        if (c >= 0 && c < 64) CPU_CLR(c, &littleMask);
+    }
+    if (!HasAnyCpuOverlap(littleMask, littleMask)) return 0;
+
+    cpu_set_t curSelf;
+    CPU_ZERO(&curSelf);
+    if (sched_getaffinity(getpid(), sizeof(curSelf), &curSelf) != 0) {
+        return 0;
+    }
+    // If HarmonyOS currently has us in /key-background (big cores stripped),
+    // remember that we entered background and do not fight system throttling.
+    if (!HasAnyCpuOverlap(curSelf, bigMask)) {
+        g_wasInBgCgroup.store(true, std::memory_order_relaxed);
+        return 0;
+    }
+
+    const bool wokeFromBg = g_wasInBgCgroup.exchange(false, std::memory_order_acq_rel);
+    const bool selfHasLittle = HasAnyCpuOverlap(curSelf, littleMask);
+    const int64_t nowMs = SteadyNowMs();
+    const int64_t lastMs = g_lastAffinitySweepMs.load(std::memory_order_relaxed);
+    if (!forceSweep && !wokeFromBg && !selfHasLittle && (nowMs - lastMs) < 2000) {
+        return 0;
+    }
+
+    bool expected = false;
+    if (!g_affinitySweepBusy.compare_exchange_strong(expected, true)) {
+        return 0;
+    }
+    g_lastAffinitySweepMs.store(nowMs, std::memory_order_relaxed);
+
+    auto maybePinTid = [&](pid_t tid) -> bool {
+        cpu_set_t cur;
+        CPU_ZERO(&cur);
+        if (sched_getaffinity(tid, sizeof(cur), &cur) != 0) return false;
+        if (!HasAnyCpuOverlap(cur, bigMask)) return false;
+        if (!HasAnyCpuOverlap(cur, littleMask)) return false;
+        return sched_setaffinity(tid, sizeof(fastMask), &fastMask) == 0;
+    };
+
+    int repinned = 0;
+    // 1. Host process threads (UI, RenderThread, gfx-epoll, gfx-present, audio/input)
+    if (DIR* td = opendir("/proc/self/task")) {
+        struct dirent* tent = nullptr;
+        while ((tent = readdir(td)) != nullptr) {
+            if (tent->d_name[0] < '1' || tent->d_name[0] > '9') continue;
+            pid_t tid = static_cast<pid_t>(std::atoi(tent->d_name));
+            if (tid <= 0) continue;
+            char commPath[64];
+            snprintf(commPath, sizeof(commPath), "/proc/self/task/%d/comm", static_cast<int>(tid));
+            char comm[32] = {};
+            if (FILE* f = fopen(commPath, "r")) {
+                if (fgets(comm, sizeof(comm), f)) {
+                    size_t n = std::strlen(comm);
+                    while (n > 0 && (comm[n - 1] == '\n' || comm[n - 1] == '\r')) comm[--n] = '\0';
+                }
+                fclose(f);
+            }
+            if (IsHostBackgroundThreadComm(comm)) continue;
+            if (maybePinTid(tid)) ++repinned;
+        }
+        closedir(td);
+    }
+
+    // 2. Same-UID child container processes (svbox / surfaceflinger / hwcomposer / games)
+    const uid_t myUid = getuid();
+    const pid_t myPid = getpid();
+    if (DIR* pd = opendir("/proc")) {
+        struct dirent* pent = nullptr;
+        while ((pent = readdir(pd)) != nullptr) {
+            if (pent->d_name[0] < '1' || pent->d_name[0] > '9') continue;
+            pid_t pid = static_cast<pid_t>(std::atoi(pent->d_name));
+            if (pid <= 0 || pid == myPid) continue;
+            char ppath[64];
+            snprintf(ppath, sizeof(ppath), "/proc/%d", static_cast<int>(pid));
+            struct stat st = {};
+            if (stat(ppath, &st) != 0 || st.st_uid != myUid) continue;
+            char tdirPath[80];
+            snprintf(tdirPath, sizeof(tdirPath), "/proc/%d/task", static_cast<int>(pid));
+            if (DIR* td = opendir(tdirPath)) {
+                struct dirent* tent = nullptr;
+                while ((tent = readdir(td)) != nullptr) {
+                    if (tent->d_name[0] < '1' || tent->d_name[0] > '9') continue;
+                    pid_t tid = static_cast<pid_t>(std::atoi(tent->d_name));
+                    if (tid > 0 && maybePinTid(tid)) ++repinned;
+                }
+                closedir(td);
+            }
+        }
+        closedir(pd);
+    }
+
+    g_affinitySweepBusy.store(false, std::memory_order_release);
+
+    if (repinned > 0 || wokeFromBg) {
+        OB_LOG_INFO("SvboxQos",
+                    "ReassertFastAffinity: repinned " QOS_FMT_D " threads -> " QOS_FMT_S
+                    " (wokeFromBg=" QOS_FMT_D ", force=" QOS_FMT_D ")",
+                    repinned, FormatCpuList(fastCpus).c_str(),
+                    wokeFromBg ? 1 : 0, forceSweep ? 1 : 0);
+        if (wokeFromBg || forceSweep) {
+            NotifyForegroundBurst(true);
+        }
+    }
+    return repinned;
 }
 
 static Telemetry ComputeTelemetryNow(const std::vector<pid_t>& rootPids) {

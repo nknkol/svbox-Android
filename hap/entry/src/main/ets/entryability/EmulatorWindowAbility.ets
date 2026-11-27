@@ -77,7 +77,7 @@ export default class EmulatorWindowAbility extends UIAbility {
     hilog.info(0x0000, TAG, 'EmulatorWindowAbility onNewWant');
     this.applyWant(want);
     try {
-      native.setDisplayVisible(0, true);
+      native.notifyWindowActive(0, true);
       hostImeManager.setWindowActive(0, true);
       if (native.isWmAgentReady()) {
         native.wmRpcAsync('FOCUS_DISPLAY 0');
@@ -88,7 +88,7 @@ export default class EmulatorWindowAbility extends UIAbility {
 
   onForeground(): void {
     try {
-      native.setDisplayVisible(0, true);
+      native.notifyWindowActive(0, true);
       hostImeManager.setWindowActive(0, true);
       if (native.isWmAgentReady()) {
         native.wmRpcAsync('FOCUS_DISPLAY 0');
@@ -101,6 +101,7 @@ export default class EmulatorWindowAbility extends UIAbility {
   onBackground(): void {
     try {
       hostImeManager.setWindowActive(0, false);
+      native.notifyWindowActive(0, false);
       native.setDisplayVisible(0, false);
     } catch (_e) {
     }
@@ -124,9 +125,17 @@ export default class EmulatorWindowAbility extends UIAbility {
       this.localStorage.setOrCreate<number>('decorRightAvoidVp', 136);
       win.on('windowEvent', (ev: window.WindowEventType) => {
         if (ev === window.WindowEventType.WINDOW_ACTIVE) {
+          try {
+            native.notifyWindowActive(0, true);
+          } catch (_e) {
+          }
           hostImeManager.setWindowActive(0, true);
           syncHostClipboardToAndroid(false);
         } else if (ev === window.WindowEventType.WINDOW_INACTIVE) {
+          try {
+            native.notifyWindowActive(0, false);
+          } catch (_e) {
+          }
           hostImeManager.setWindowActive(0, false);
         }
       });

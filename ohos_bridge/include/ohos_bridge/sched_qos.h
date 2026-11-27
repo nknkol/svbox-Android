@@ -49,6 +49,18 @@ std::string ResolveCpuset(const std::string& profile,
                           int32_t* outNice,
                           std::string* outSched);
 
+// Re-apply fast-cluster CPU affinity (excluding slow little cores) to host
+// interactive/GPU threads and same-UID container child threads when HarmonyOS
+// CgroupSched/APP_NAP transitions (/key-background -> /top-app) overwrite
+// sched_setaffinity masks back to all cores (0..N-1). Returns count of repinned threads.
+int ReassertFastAffinity(const std::string& profile,
+                         const std::string& customCpuset,
+                         bool forceSweep = false);
+
+// HarmonyOS API 26 FASTKit process-level scene PerfHint (never passes SetTids so
+// permanent OH_QoS_SetThreadQoS levels are untouched).
+void NotifyForegroundBurst(bool active);
+
 Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync = false);
 
 } // namespace SchedQos

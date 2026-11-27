@@ -1379,6 +1379,68 @@ void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
     GfxstreamBridge::Instance().SetDisplayVisible(displaySlot, show);
 }
 
+void AndroidRuntime::OnWindowActiveChanged(int32_t displaySlot, bool active) {
+    if (displaySlot < 0 || displaySlot >= 16) return;
+    const uint32_t bit = 1u << static_cast<uint32_t>(displaySlot);
+    uint32_t prev = activeDisplayMask_.load();
+    uint32_t next = active ? (prev | bit) : (prev & ~bit);
+    while (!activeDisplayMask_.compare_exchange_weak(prev, next)) {
+        next = active ? (prev | bit) : (prev & ~bit);
+    }
+    if (active) {
+        SetDisplayVisible(displaySlot, true);
+        if (!running_.load() || paused_.load()) return;
+        std::string prof, custom;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            prof = profile_;
+            custom = customCpuset_;
+        }
+        const uint64_t seq = fgBoostSeq_.fetch_add(1) + 1;
+        // Run immediately + at +150ms + +500ms off the UI thread so we catch
+        // HarmonyOS CgroupSched's asynchronous /key-background -> /top-app migration
+        // that overwrites thread CPU affinity back to 0..N-1 (including slow little cores).
+        std::thread([this, seq, prof, custom]() {
+            SchedQos::NotifyForegroundBurst(true);
+            SchedQos::ReassertFastAffinity(prof, custom, true);
+            const int delaysMs[] = { 150, 350 };
+            for (int d : delaysMs) {
+                if (!SleepCancelableMs(d)) return;
+                if (fgBoostSeq_.load() != seq || !running_.load() || paused_.load()) return;
+                SchedQos::ReassertFastAffinity(prof, custom, true);
+            }
+        }).detach();
+    } else {
+        if (next == 0) {
+            SchedQos::NotifyForegroundBurst(false);
+        }
+    }
+}
+
+void AndroidRuntime::MaybeReassertForegroundAffinityAsync() {
+    if (!running_.load() || paused_.load() || visibleDisplayMask_.load() == 0) return;
+    static std::atomic<int64_t> sLastCheckMs{0};
+    static std::atomic<bool> sBusy{false};
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count();
+    int64_t prev = sLastCheckMs.load(std::memory_order_relaxed);
+    if ((nowMs - prev) < 1000) return;
+    if (!sLastCheckMs.compare_exchange_strong(prev, nowMs)) return;
+    bool expected = false;
+    if (!sBusy.compare_exchange_strong(expected, true)) return;
+    std::string prof, custom;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        prof = profile_;
+        custom = customCpuset_;
+    }
+    std::thread([prof, custom]() {
+        SchedQos::ReassertFastAffinity(prof, custom, false);
+        sBusy.store(false, std::memory_order_release);
+    }).detach();
+}
+
 void AndroidRuntime::ReapBootAnimation() {
     pid_t pid = bootanimPid_.exchange(-1);
     if (pid <= 0) return;

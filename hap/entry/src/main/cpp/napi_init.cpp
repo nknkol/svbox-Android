@@ -408,6 +408,32 @@ napi_value SetDisplayVisibleNapi(napi_env env, napi_callback_info info) {
     int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
     bool visible = argc > 1 ? GetBoolArg(env, args[1], true) : true;
     AndroidRuntime::Instance().SetDisplayVisible(slot, visible);
+    if (visible && slot >= 0 && slot < SVBOX_GFX_MAX_DISPLAYS) {
+        std::lock_guard<std::mutex> lk(g_xcMu);
+        if (g_xcBySlot[slot]) {
+            int32_t hz = (slot == 0) ? AndroidRuntime::Instance().RefreshRate() : g_slotHz[slot];
+            ApplyExpectedFrameRateLocked(g_xcBySlot[slot], hz);
+        }
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value NotifyWindowActiveNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    bool active = argc > 1 ? GetBoolArg(env, args[1], true) : true;
+    if (active && slot >= 0 && slot < SVBOX_GFX_MAX_DISPLAYS) {
+        std::lock_guard<std::mutex> lk(g_xcMu);
+        if (g_xcBySlot[slot]) {
+            int32_t hz = (slot == 0) ? AndroidRuntime::Instance().RefreshRate() : g_slotHz[slot];
+            ApplyExpectedFrameRateLocked(g_xcBySlot[slot], hz);
+        }
+    }
+    AndroidRuntime::Instance().OnWindowActiveChanged(slot, active);
     napi_value out = nullptr;
     napi_get_boolean(env, true, &out);
     return out;
@@ -1171,6 +1197,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     auto& gfx = GfxstreamBridge::Instance();
     auto& inp = InputBridge::Instance();
     auto& aud = AudioBridge::Instance();
+    rt.MaybeReassertForegroundAffinityAsync();
     auto tel = rt.GetTelemetry();
     auto topo = SchedQos::GetCoreTopology();
     const bool useGfx = rt.UseGfxstream();
@@ -1365,6 +1392,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "getImeState", nullptr, GetImeStateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setHostImeActive", nullptr, SetHostImeActiveNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setDisplay0Rotation", nullptr, SetDisplay0RotationNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "notifyWindowActive", nullptr, NotifyWindowActiveNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

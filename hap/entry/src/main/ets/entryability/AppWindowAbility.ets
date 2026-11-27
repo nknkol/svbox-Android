@@ -70,7 +70,7 @@ export default class AppWindowAbility extends UIAbility {
   onForeground(): void {
     if (this.displaySlot >= 1) {
       try {
-        native.setDisplayVisible(this.displaySlot, true);
+        native.notifyWindowActive(this.displaySlot, true);
         hostImeManager.setWindowActive(this.displaySlot, true);
         if (native.isWmAgentReady()) {
           native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
@@ -85,6 +85,7 @@ export default class AppWindowAbility extends UIAbility {
     if (this.displaySlot >= 1) {
       try {
         hostImeManager.setWindowActive(this.displaySlot, false);
+        native.notifyWindowActive(this.displaySlot, false);
         native.setDisplayVisible(this.displaySlot, false);
       } catch (_e) {
       }
@@ -148,7 +149,7 @@ export default class AppWindowAbility extends UIAbility {
       win.on('windowEvent', (ev: window.WindowEventType) => {
         if (ev === window.WindowEventType.WINDOW_ACTIVE && this.displaySlot >= 1) {
           try {
-            native.setDisplayVisible(this.displaySlot, true);
+            native.notifyWindowActive(this.displaySlot, true);
             hostImeManager.setWindowActive(this.displaySlot, true);
             if (native.isWmAgentReady()) {
               native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
@@ -157,6 +158,10 @@ export default class AppWindowAbility extends UIAbility {
           } catch (_e) {
           }
         } else if (ev === window.WindowEventType.WINDOW_INACTIVE && this.displaySlot >= 1) {
+          try {
+            native.notifyWindowActive(this.displaySlot, false);
+          } catch (_e) {
+          }
           hostImeManager.setWindowActive(this.displaySlot, false);
         }
       });
