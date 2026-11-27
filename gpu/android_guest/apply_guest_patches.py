@@ -994,32 +994,39 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
     }""",
     )
 
-    # 8. Make OP_vkBindBufferMemory, OP_vkResetFences, and OP_vkResetCommandPool
-    #    async fire-and-forget (paired with host VkDecoder.cpp on __OHOS__) to avoid
-    #    >1,100 unnecessary synchronous IPC round-trips every 2 seconds.
+    # 8. Make OP_vkBindBufferMemory, OP_vkBindImageMemory, OP_vkResetFences, and
+    #    OP_vkResetCommandPool async fire-and-forget (paired with host VkDecoder.cpp on
+    #    __OHOS__) to avoid >1,100 unnecessary synchronous IPC round-trips every 2 seconds.
+    #    CRITICAL: must call stream->flush() after encoding because nextSeqno() already
+    #    consumed a process-wide sequence number; leaving the packet buffered in a thread-local
+    #    VulkanStream deadlocks any peer RenderThread spinning on seqno ordering.
     patch_file(
         "system/vulkan_enc/VkEncoder.cpp",
         """    VkResult vkBindBufferMemory_VkResult_return = (VkResult)0;
     stream->read(&vkBindBufferMemory_VkResult_return, sizeof(VkResult));""",
-        """    VkResult vkBindBufferMemory_VkResult_return = VK_SUCCESS;""",
+        """    VkResult vkBindBufferMemory_VkResult_return = VK_SUCCESS;
+    stream->flush();""",
     )
     patch_file(
         "system/vulkan_enc/VkEncoder.cpp",
         """    VkResult vkBindImageMemory_VkResult_return = (VkResult)0;
     stream->read(&vkBindImageMemory_VkResult_return, sizeof(VkResult));""",
-        """    VkResult vkBindImageMemory_VkResult_return = VK_SUCCESS;""",
+        """    VkResult vkBindImageMemory_VkResult_return = VK_SUCCESS;
+    stream->flush();""",
     )
     patch_file(
         "system/vulkan_enc/VkEncoder.cpp",
         """    VkResult vkResetFences_VkResult_return = (VkResult)0;
     stream->read(&vkResetFences_VkResult_return, sizeof(VkResult));""",
-        """    VkResult vkResetFences_VkResult_return = VK_SUCCESS;""",
+        """    VkResult vkResetFences_VkResult_return = VK_SUCCESS;
+    stream->flush();""",
     )
     patch_file(
         "system/vulkan_enc/VkEncoder.cpp",
         """    VkResult vkResetCommandPool_VkResult_return = (VkResult)0;
     stream->read(&vkResetCommandPool_VkResult_return, sizeof(VkResult));""",
-        """    VkResult vkResetCommandPool_VkResult_return = VK_SUCCESS;""",
+        """    VkResult vkResetCommandPool_VkResult_return = VK_SUCCESS;
+    stream->flush();""",
     )
 
     # 9. Cache on_vkGetBufferMemoryRequirements2 / KHR from vkCreateBufferWithRequirementsGOOGLE
@@ -1302,17 +1309,6 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
             if (it != info_VkFence.end()) {
                 if (res == VK_SUCCESS) {
                     it->second.signaledCached = true;
-                    // FIFO queue guarantee: all older fences submitted to the same queue are also signaled.
-                    if (queriedFenceQueue != VK_NULL_HANDLE && queriedFenceSubmitNs > 0) {
-                        for (auto& kv : info_VkFence) {
-                            if (!kv.second.external && !kv.second.signaledCached &&
-                                kv.second.lastSubmitQueue == queriedFenceQueue &&
-                                kv.second.lastSubmitNs > 0 &&
-                                kv.second.lastSubmitNs <= queriedFenceSubmitNs) {
-                                kv.second.signaledCached = true;
-                            }
-                        }
-                    }
                 } else if (res == VK_NOT_READY) {
                     mDeviceNotReadyQueryNs[device] = t1Ns;
                     if (queriedFenceSubmitNs > 0) {
@@ -1439,6 +1435,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         uint64_t cgen_var_3 = cgen_var_2;
         stream->handleMapping()->mapHandles_u64_VkBuffer(&cgen_var_3, (VkBuffer*)pBuffer, 1);
         stream->unsetHandleMapping();
+        stream->flush();
     }
     else
     {
@@ -1486,6 +1483,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         uint64_t cgen_var_3 = cgen_var_2;
         stream->handleMapping()->mapHandles_u64_VkSemaphore(&cgen_var_3, (VkSemaphore*)pSemaphore, 1);
         stream->unsetHandleMapping();
+        stream->flush();
     }
     else
     {
@@ -1643,6 +1641,87 @@ VkResult ResourceTracker::on_vkGetFenceStatus(
             int32_t* openCountPtr = getOpenCountPtr(cb);
             if (!*openCountPtr) *openCountPtr = 1;
         }""",
+    )
+    # 14. Align external YUV AHardwareBuffer Vulkan imports with gralloc_old's actual
+    #     single-plane VK_FORMAT_R8G8B8A8_UNORM ColorBuffer backing: gralloc_old converts
+    #     YV12 / YCbCr_420_888 to RGB888 on unlock into a 1-plane RGBA8 OH_NativeBuffer.
+    #     Creating a 3-plane VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM VkImage over a 1-plane
+    #     RGBA8 OH_NativeBuffer causes an immediate Maleoon 916 GPU MMU page fault
+    #     (DMD_HIGPU_PAGE_FAULT / VK_ERROR_DEVICE_LOST) when Unity Vulkan samples video frames.
+    patch_file(
+        "system/vulkan_enc/vk_format_info.h",
+        """   case HAL_PIXEL_FORMAT_NV12_Y_TILED_INTEL:
+   case AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420:
+      return VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   case HAL_PIXEL_FORMAT_YV12:
+   case OMX_COLOR_FormatYUV420Planar:
+      return VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+   case AHARDWAREBUFFER_FORMAT_BLOB:
+#endif""",
+        """   case HAL_PIXEL_FORMAT_NV12_Y_TILED_INTEL:
+   case AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   case HAL_PIXEL_FORMAT_YV12:
+   case OMX_COLOR_FormatYUV420Planar:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+   case AHARDWAREBUFFER_FORMAT_BLOB:
+#endif""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """            if (extFormatAndroidPtr->externalFormat) {
+                localCreateInfo.format =
+                    vk_format_from_android(extFormatAndroidPtr->externalFormat);
+                if (localCreateInfo.format == VK_FORMAT_UNDEFINED)
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+            }""",
+        """            if (extFormatAndroidPtr->externalFormat) {
+                localCreateInfo.format =
+                    vk_format_from_android(extFormatAndroidPtr->externalFormat);
+                if (localCreateInfo.format == VK_FORMAT_UNDEFINED)
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                if (android_format_is_yuv(extFormatAndroidPtr->externalFormat)) {
+                    localCreateInfo.flags &= ~VK_IMAGE_CREATE_DISJOINT_BIT;
+                }
+            }""",
+    )
+    patch_file(
+        "system/vulkan_enc/ResourceTracker.cpp",
+        """        if (extFormatAndroidPtr) {
+            if (extFormatAndroidPtr->externalFormat == AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM) {
+                // We don't support external formats on host and it causes RGB565
+                // to fail in CtsGraphicsTestCases android.graphics.cts.BasicVulkanGpuTest
+                // when passed as an external format.
+                // We may consider doing this for all external formats.
+                // See b/134771579.
+                *pYcbcrConversion = VK_YCBCR_CONVERSION_DO_NOTHING;
+                return VK_SUCCESS;
+            } else if (extFormatAndroidPtr->externalFormat) {""",
+        """        if (extFormatAndroidPtr) {
+            if (extFormatAndroidPtr->externalFormat == AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM ||
+                (extFormatAndroidPtr->externalFormat &&
+                 android_format_is_yuv(extFormatAndroidPtr->externalFormat))) {
+                // We don't support external formats on host and it causes RGB565
+                // to fail in CtsGraphicsTestCases android.graphics.cts.BasicVulkanGpuTest
+                // when passed as an external format.
+                // Furthermore, gralloc_old converts YUV AHardwareBuffers to RGB888 on unlock
+                // into single-plane VK_FORMAT_R8G8B8A8_UNORM ColorBuffers, so no host YCbCr
+                // sampler conversion should be attached.
+                *pYcbcrConversion = VK_YCBCR_CONVERSION_DO_NOTHING;
+                return VK_SUCCESS;
+            } else if (extFormatAndroidPtr->externalFormat) {""",
+        replace_all=True,
+    )
+    patch_file(
+        "system/vulkan_enc/AndroidHardwareBuffer.cpp",
+        """        ahbFormatProps->suggestedYcbcrModel =
+            android_format_is_yuv(desc.format) ?
+                VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601 :
+                VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;""",
+        """        ahbFormatProps->suggestedYcbcrModel =
+            VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;""",
     )
 
 if __name__ == "__main__":

@@ -1983,6 +1983,123 @@ def main() -> None:
         "ColorBufferGl::readPixels fix GL_RGB tmpPixels leak",
     )
 
+    # 24. VkDecoder.cpp: cooperative ARM64 yield/backoff in seqno ordering spinloop so a
+    #     RenderThread waiting for a peer thread's seqno does not starve cores on aarch64.
+    patch_file(
+        vkdec,
+        "#include <functional>\n#include <optional>\n#include <unordered_map>\n",
+        "#include <functional>\n#include <optional>\n#include <thread>\n#include <unordered_map>\n",
+        "VkDecoder include <thread> for ARM64 seqno backoff",
+    )
+    patch_file(
+        vkdec,
+        "                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {\n"
+        "#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))\n"
+        "                        _mm_pause();\n"
+        "#elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))\n"
+        "                        __asm__ __volatile__(\"pause;\");\n"
+        "#endif\n"
+        "                    }\n",
+        "                    uint32_t seqnoSpins = 0;\n"
+        "                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {\n"
+        "#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))\n"
+        "                        _mm_pause();\n"
+        "#elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))\n"
+        "                        __asm__ __volatile__(\"pause;\");\n"
+        "#elif defined(__aarch64__)\n"
+        "                        if (++seqnoSpins < 256) {\n"
+        "                            __asm__ __volatile__(\"yield\");\n"
+        "                        } else {\n"
+        "                            std::this_thread::yield();\n"
+        "                        }\n"
+        "#endif\n"
+        "                    }\n",
+        "VkDecoder ARM64 seqno spinloop yield backoff",
+    )
+
+    # 25. VkCommonOperations.cpp: clean up & erase mColorBuffers entry whenever
+    #     createVkColorBufferLocked fails (prevents leaking unbound VkImage entries
+    #     that can trigger GPU MMU page faults on subsequent copy/import), and guard
+    #     readColorBufferToBytesLocked / updateColorBufferFromBytesLocked on initialized.
+    patch_file(
+        vkco,
+        "    mColorBuffers[colorBufferHandle] = res;\n"
+        "    auto infoPtr = &mColorBuffers[colorBufferHandle];\n",
+        "    mColorBuffers[colorBufferHandle] = res;\n"
+        "    auto infoPtr = &mColorBuffers[colorBufferHandle];\n"
+        "    struct FailedCbCleanup {\n"
+        "        VkEmulation* self;\n"
+        "        uint32_t cb;\n"
+        "        bool armed = true;\n"
+        "        ~FailedCbCleanup() {\n"
+        "            if (!armed) return;\n"
+        "            auto it = self->mColorBuffers.find(cb);\n"
+        "            if (it != self->mColorBuffers.end()) {\n"
+        "                auto& info = it->second;\n"
+        "                if (info.imageView) {\n"
+        "                    self->mDvk->vkDestroyImageView(self->mDevice, info.imageView, nullptr);\n"
+        "                }\n"
+        "                if (info.ycbcrConversion && self->mDeviceInfo.hasSamplerYcbcrConversionExtension) {\n"
+        "                    self->mDvk->vkDestroySamplerYcbcrConversion(self->mDevice, info.ycbcrConversion, nullptr);\n"
+        "                }\n"
+        "                if (info.image) {\n"
+        "                    self->mDvk->vkDestroyImage(self->mDevice, info.image, nullptr);\n"
+        "                }\n"
+        "                if (info.memory.memory) {\n"
+        "                    self->freeExternalMemoryLocked(self->mDvk, &info.memory);\n"
+        "                }\n"
+        "                self->mColorBuffers.erase(it);\n"
+        "            }\n"
+        "        }\n"
+        "    } failedCbCleanup{this, colorBufferHandle};\n",
+        "VkCommonOperations RAII cleanup on createVkColorBufferLocked failure",
+    )
+    patch_file(
+        vkco,
+        "        if (!allocRes) {\n"
+        "            ERR(\"Failed to allocate ColorBuffer with Vulkan backing.\");\n"
+        "            return false;\n"
+        "        }\n",
+        "        if (!allocRes) {\n"
+        "            ERR(\"Failed to allocate ColorBuffer %u (%ux%u, glFmt=0x%x, fwFmt=%d, vkFmt=%d, tiling=%d, memType=%u, size=%llu) with Vulkan backing.\",\n"
+        "                colorBufferHandle, infoPtr->width, infoPtr->height, infoPtr->internalFormat,\n"
+        "                (int)infoPtr->frameworkFormat, (int)imageVkFormat, (int)tiling,\n"
+        "                infoPtr->memory.typeIndex, (unsigned long long)infoPtr->memory.size);\n"
+        "            return false;\n"
+        "        }\n",
+        "VkCommonOperations detailed log on ColorBuffer Vulkan alloc failure",
+    )
+    patch_file(
+        vkco,
+        "    infoPtr->initialized = true;\n\n    return true;",
+        "    infoPtr->initialized = true;\n    failedCbCleanup.armed = false;\n\n    return true;",
+        "VkCommonOperations disarm cleanup guard on success",
+    )
+    patch_file(
+        vkco,
+        "    if (!colorBufferInfo->image) {\n"
+        "        ERR(\"Failed to read from ColorBuffer:%d, no VkImage.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n",
+        "    if (!colorBufferInfo->initialized || !colorBufferInfo->image || !colorBufferInfo->memory.memory) {\n"
+        "        ERR(\"Failed to read from ColorBuffer:%d, no initialized VkImage.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n",
+        "VkCommonOperations guard readColorBufferToBytesLocked on initialized",
+    )
+    patch_file(
+        vkco,
+        "    if (!colorBufferInfo->image) {\n"
+        "        ERR(\"Failed to update ColorBuffer:%d, no VkImage.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n",
+        "    if (!colorBufferInfo->initialized || !colorBufferInfo->image || !colorBufferInfo->memory.memory) {\n"
+        "        ERR(\"Failed to update ColorBuffer:%d, no initialized VkImage.\", colorBufferHandle);\n"
+        "        return false;\n"
+        "    }\n",
+        "VkCommonOperations guard updateColorBufferFromBytesLocked on initialized",
+    )
+
 
 if __name__ == "__main__":
     main()

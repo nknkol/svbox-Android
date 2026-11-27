@@ -1194,6 +1194,19 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - `binderd/svbox_binderd.c`：严格对齐 Linux 内核 `drivers/android/binder.c` 死亡通知状态机——`struct bhandle` 新增 `death_clear_pending`；收到 `SV_BC_CLEAR_DEATH_NOTIFICATION` 时先调用 `remove_pending_dead_binder()` 清除 `proc->inbox` 与各线程 `direct` 队列中尚未送达用户态的 `SV_BR_DEAD_BINDER(cookie)`，若已送达用户态正在执行 `sendObituary()` 则挂起 `death_clear_pending=true`，延后至收到 `SV_BC_DEAD_BINDER_DONE` 时再下发 `SV_BR_CLEAR_DEATH_NOTIFICATION_DONE`。
     - `hap/entry/src/main/cpp/android_runtime.h` + `android_runtime.cpp`：新增 `swcodecThread_` 守护线程，效仿 Android `init` 监控 `mediaswcodec` 意外退出并在 500ms 后自动拉起（`Stop()` 时安全回收 join）。
   - **真机实测（`HAD-W32`）**：完整压测 **启动《棕色尘埃 2》弹出下载弹窗 → 点击多任务“全部清除”（`LAUNCHER_TASK_CLEAR_ALL`）杀死进程 → 校验 `mediaswcodec` 同 PID（`34046`）零崩溃存活（零 `F/DEBUG` / `sendObituary` 异常）→ 二次重新启动《棕色尘埃 2》**：再次顺利越过 100% 并弹出下载弹窗（`15,531 MB / 100,956 MB`）。
+- **2026-11-27 修复《棕色尘埃 2》点击“下载”卡死与随后触发 Maleoon 916 GPU Page Fault（Vulkan 跨线程 `seqno` 死锁 + YUV AHardwareBuffer 平面不匹配）**：
+  - **两层串联根因（`hiperf` + Host Vulkan 诊断实证）**：
+    1. **点击“下载”瞬间触发宿主机 `RenderThread` 100% CPU 永久 `seqno` 自旋死锁**：`hiperf` 采样式 100.00% 命中 `VkDecoder::Impl::decode+0x814`（`0x44feec`：`while (seqno - seqnoPtr->load() != 1)`）。溯源为 `gpu/android_guest/apply_guest_patches.py` Patch #8/#11 将 6 个 `VkEncoder` 方法（`vkBindBufferMemory`、`vkBindImageMemory`、`vkResetFences`、`vkResetCommandPool` 及 `vkCreateBufferWithRequirementsGOOGLE` / `vkCreateSemaphore` 的 client-alias 异步分支）改为 fire-and-forget 去掉 `stream->read()` 时遗漏了 `stream->flush()`；每条调用仍消耗了进程全局原子 `seqno = ResourceTracker::nextSeqno()`，却把包滞留在调用线程私有 `VulkanStream` 写缓冲中。点击“下载”时 `on_vkCreateSemaphore`（`exportSyncFd` → `allocClientHandle()` → `ensureSyncDeviceFd`）消耗 `seqno=N` 未冲刷，而同进程另一线程 `UnityGfxDeviceWorker` 立即冲刷 `seqno=N+1`，宿主机 `RenderThread` 永久苦等 `N` 导致画面彻底冻结。
+    2. **解开死锁进入 `IntroUI::Downloading` 约 1 秒后触发 Maleoon 916 `DMD_HIGPU_PAGE_FAULT` / `VK_ERROR_DEVICE_LOST (-4)`**：Host 日志捕获到崩溃前 1 秒导入了 `on_vkCreateImage importAHB fmt=1000156002 (VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) 1280x720` 并绑定了 `OH_NativeBuffer`（`size=3719168`）。根因在于 `gralloc_old.cpp` 已在 `gralloc_unlock` 中将 `HAL_PIXEL_FORMAT_YV12` / `YCbCr_420_888` 转为单平面 RGBA8 存入宿主机 `OH_NativeBuffer`（`VK_FORMAT_R8G8B8A8_UNORM`），但 `vk_format_info.h` / `ResourceTracker.cpp` / `AndroidHardwareBuffer.cpp` 仍将外部 YUV `AHardwareBuffer` 按 3 平面/2 平面 YUV `VkImage` 建图并挂载 YCbCr 转换器，导致 Maleoon 916 采样 PV 视频纹理时访问未映射的 1/2 平面直接触发 GPU MMU 缺页重置。
+  - **修复与加固**：
+    - `gpu/android_guest/apply_guest_patches.py`：
+      - Patch #8/#11 为全部 6 个 fire-and-forget `VkEncoder` 分支补齐 `stream->flush();`（对全部 537 个 `VkEncoder::vk*` 方法做全量脚本审计，遗漏数归零）；
+      - Patch #10 移除 `on_vkGetFenceStatus` 违反 Vulkan 规范的跨 Fence FIFO 级联假定（禁止仅因某 Fence 已 signal 就将队列内更早 Fence 标为 `signaledCached=true`）；
+      - Patch #14 在 `vk_format_info.h` 将 `HAL_PIXEL_FORMAT_NV12_Y_TILED_INTEL` / `AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420` / `HAL_PIXEL_FORMAT_YV12` / `OMX_COLOR_FormatYUV420Planar` 对齐为 `VK_FORMAT_R8G8B8A8_UNORM`，在 `ResourceTracker.cpp` 为外部 YUV AHB 清除 `VK_IMAGE_CREATE_DISJOINT_BIT` 并在 `on_vkCreateSamplerYcbcrConversion` 与 `on_vkCreateSamplerYcbcrConversionKHR` 均返回 `VK_YCBCR_CONVERSION_DO_NOTHING`，在 `AndroidHardwareBuffer.cpp` 返回 `VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY`。
+    - `gpu/ohos_host/apply_host_patches.py`：
+      - Patch #24 为 `VkDecoder.cpp` `seqno` 等待循环加入 ARM64 `yield` 与 256 次自旋后 `std::this_thread::yield()` 退让；
+      - Patch #25 为 `VkCommonOperations.cpp` `createVkColorBufferLocked` 失败路径增加 RAII `FailedCbCleanup` 销毁残缺 Vulkan 对象并移出 `mColorBuffers`，并在 `readColorBufferToBytesLocked` / `updateColorBufferFromBytesLocked` 中守卫 `initialized && image && memory`。
+  - **真机实测（`HAD-W32`）**：重编 guest/host Vulkan 动态库与 HAP/HNP 并热覆盖安装后启动《棕色尘埃 2》→ 24 秒弹出下载弹窗 → 点击“下载”立即关闭弹窗进入 `IntroUI::Downloading` 并流畅播放背景动画（40–42/120Hz）；5 秒内进度从 **`正在下载 0.70%`** 推进至 **`1.22%`**（logcat `DownLoadBytes : 0 -> .1 -> .2 -> .3/15.2 GB`，约 20 MB/s），`org.svbox.android` 全程存活，零 `VK_ERROR_DEVICE_LOST`、零 `DMD_HIGPU_PAGE_FAULT`、零自旋 `RenderThread`。
 
 
 
