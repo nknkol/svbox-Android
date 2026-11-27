@@ -61,6 +61,7 @@ public class SvboxWmAgent {
         EXEMPT_CROSS_APP_PKGS.add("com.android.launcher3");
         EXEMPT_CROSS_APP_PKGS.add("com.android.quickstep");
         EXEMPT_CROSS_APP_PKGS.add("com.android.inputmethod.latin");
+        EXEMPT_CROSS_APP_PKGS.add("org.svbox.ime");
     }
 
     private static final class DisplaySlot {
@@ -93,6 +94,10 @@ public class SvboxWmAgent {
     private final Object slotLock = new Object();
     private final Object resizeLock = new Object();
     private final Object clipLock = new Object();
+    private final Object imeLock = new Object();
+    private volatile int imeFd = -1;
+    private volatile boolean imeFocused = false;
+    private volatile int imeFocusSlot = 0;
     private volatile String lastClipText = "";
     private final Map<Integer, DisplaySlot> slotsByIdx = new HashMap<Integer, DisplaySlot>();
     private final Map<Integer, DisplaySlot> slotsByAndroidId = new HashMap<Integer, DisplaySlot>();
@@ -141,6 +146,24 @@ public class SvboxWmAgent {
             }, "svbox-clip-watch");
             clipThread.setDaemon(true);
             clipThread.start();
+
+            Thread imeThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    serveImeLoop();
+                }
+            }, "svbox-ime-server");
+            imeThread.setDaemon(true);
+            imeThread.start();
+
+            Thread imeEnsureThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    ensureHostImeActiveLoop();
+                }
+            }, "svbox-ime-ensure");
+            imeEnsureThread.setDaemon(true);
+            imeEnsureThread.start();
 
             log("SvboxWmAgent ready: ctrl=" + ctrlSockPath + " present=" + presentSockPath);
             looperCls.getMethod("loop").invoke(null);
@@ -520,6 +543,38 @@ public class SvboxWmAgent {
             } else if ("INPUT_TEXT".equals(cmd) && parts.length >= 3) {
                 int slot = Integer.parseInt(parts[1]);
                 return cmdInputText(slot, parts[2]);
+            } else if ("IME_COMMIT".equals(cmd) && parts.length >= 2) {
+                int slot = parts.length >= 3 ? parseIntSafe(parts[2], imeFocusSlot) : imeFocusSlot;
+                return cmdImeCommit(parts[1], slot);
+            } else if ("IME_PREEDIT".equals(cmd)) {
+                String b64 = parts.length >= 2 ? parts[1] : "-";
+                return cmdImeSend("PREEDIT " + b64);
+            } else if ("IME_FINISH_PREEDIT".equals(cmd)) {
+                return cmdImeSend("FINISH_PREEDIT");
+            } else if ("IME_DELETE".equals(cmd) && parts.length >= 3) {
+                int left = Integer.parseInt(parts[1]);
+                int right = Integer.parseInt(parts[2]);
+                return cmdImeDelete(left, right);
+            } else if ("IME_ACTION".equals(cmd)) {
+                int enterType = parts.length >= 2 ? Integer.parseInt(parts[1]) : 0;
+                return cmdImeAction(enterType);
+            } else if ("IME_MOVE".equals(cmd) && parts.length >= 2) {
+                int dir = Integer.parseInt(parts[1]);
+                return cmdImeSend("MOVE " + dir);
+            } else if ("IME_EXTEND".equals(cmd) && parts.length >= 2) {
+                int act = Integer.parseInt(parts[1]);
+                return cmdImeSend("EXTEND " + act);
+            } else if ("IME_HIDE".equals(cmd)) {
+                return cmdImeSend("HIDE");
+            } else if ("IME_STATUS".equals(cmd)) {
+                return "{\"ok\":true,\"connected\":" + (imeFd >= 0 ? "true" : "false")
+                        + ",\"focused\":" + (imeFocused ? "true" : "false")
+                        + ",\"slot\":" + imeFocusSlot + "}";
+            } else if ("SET_DISPLAY_ROTATION".equals(cmd) && parts.length >= 2) {
+                int rot = Integer.parseInt(parts[1]);
+                return cmdSetDisplayRotation(rot);
+            } else if ("GET_DISPLAY_ROTATION".equals(cmd)) {
+                return cmdGetDisplayRotation();
             } else if ("CLOSE_APP".equals(cmd) && parts.length >= 2) {
                 int slot = Integer.parseInt(parts[1]);
                 String pkg = parts.length >= 3 ? parts[2] : "";
@@ -1190,6 +1245,10 @@ public class SvboxWmAgent {
         String text = new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8);
         if (text.isEmpty()) return "{\"ok\":true,\"len\":0}";
 
+        if (sendToIme("COMMIT " + b64)) {
+            return "{\"ok\":true,\"mode\":\"host_ime\",\"len\":" + text.length() + "}";
+        }
+
         boolean pureAscii = text.length() <= 64;
         if (pureAscii) {
             for (int i = 0; i < text.length(); i++) {
@@ -1228,6 +1287,262 @@ public class SvboxWmAgent {
         try { Thread.sleep(20); } catch (InterruptedException ignored) {}
         injectSingleKey(displayId, 279 /* KEYCODE_PASTE */, 0);
         return "{\"ok\":true,\"mode\":\"paste\",\"len\":" + text.length() + "}";
+    }
+
+    private int mapAndroidDisplayToSlot(int androidDisplayId) {
+        if (androidDisplayId <= 0) return 0;
+        synchronized (slotLock) {
+            DisplaySlot ds = slotsByAndroidId.get(androidDisplayId);
+            if (ds != null) return ds.slot;
+        }
+        return 0;
+    }
+
+    private void serveImeLoop() {
+        int listenFd = nativeListenUnix("@svbox_ime");
+        if (listenFd < 0) {
+            log("Failed to listen on @svbox_ime");
+            return;
+        }
+        log("Listening on @svbox_ime for SvboxHostImeService");
+        while (true) {
+            final int cfd = nativeAcceptUnix(listenFd);
+            if (cfd < 0) continue;
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    handleImeClient(cfd);
+                }
+            }, "svbox-ime-cli");
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    private void ensureHostImeActiveLoop() {
+        // Android 14 InputMethodManagerService.onUnlockUser(0) reloads persisted settings_secure.xml
+        // right after user unlock, which can temporarily revert default_input_method back to LatinIME.
+        // Re-assert org.svbox.ime/.SvboxHostImeService once user 0 is unlocked so it stays connected.
+        int[] delaysMs = new int[] { 2000, 3000, 5000, 8000 };
+        for (int delay : delaysMs) {
+            try { Thread.sleep(delay); } catch (InterruptedException ignored) { return; }
+            boolean booted = false;
+            try {
+                Class<?> spCls = Class.forName("android.os.SystemProperties");
+                String v = (String) spCls.getMethod("get", String.class, String.class)
+                        .invoke(null, "sys.boot_completed", "0");
+                booted = "1".equals(v);
+            } catch (Throwable ignored) {}
+            if (imeFd >= 0 && booted) {
+                return;
+            }
+            try {
+                Process p = new ProcessBuilder("/system/bin/sh", "-c",
+                        "ime enable org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1; "
+                                + "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1")
+                        .redirectErrorStream(true).start();
+                p.waitFor();
+            } catch (Throwable t) {
+                log("ensureHostImeActiveLoop warn: " + t);
+            }
+        }
+    }
+
+    private void handleImeClient(int fd) {
+        synchronized (imeLock) {
+            if (imeFd >= 0 && imeFd != fd) {
+                nativeCloseFd(imeFd);
+            }
+            imeFd = fd;
+        }
+        log("SvboxHostIme connected (fd=" + fd + ")");
+        try {
+            while (true) {
+                String line = nativeReadLine(fd);
+                if (line == null) break;
+                line = line.trim();
+                if (line.isEmpty() || "IME_REGISTER".equals(line)) continue;
+                String[] p = line.split("\\s+");
+                if ("IME_FOCUS".equals(p[0]) && p.length >= 6) {
+                    boolean active = "1".equals(p[1]);
+                    int did = parseIntSafe(p[2], 0);
+                    int inputType = parseIntSafe(p[3], 0);
+                    int imeOptions = parseIntSafe(p[4], 0);
+                    int showView = parseIntSafe(p[5], 0);
+                    String pkg = p.length >= 7 ? p[6] : "";
+                    if ("-".equals(pkg)) pkg = "";
+                    int slot = mapAndroidDisplayToSlot(did);
+                    imeFocused = active;
+                    imeFocusSlot = slot;
+                    String ev = "{\"event\":\"IME_FOCUS\""
+                            + ",\"active\":" + (active ? "true" : "false")
+                            + ",\"slot\":" + slot
+                            + ",\"displayId\":" + did
+                            + ",\"inputType\":" + inputType
+                            + ",\"imeOptions\":" + imeOptions
+                            + ",\"showView\":" + showView
+                            + ",\"packageName\":" + jsonStr(pkg)
+                            + "}";
+                    broadcastEvent(ev);
+                } else if ("IME_CURSOR".equals(p[0]) && p.length >= 5) {
+                    int did = parseIntSafe(p[1], 0);
+                    int x = parseIntSafe(p[2], 0);
+                    int y = parseIntSafe(p[3], 0);
+                    int h = parseIntSafe(p[4], 24);
+                    int slot = mapAndroidDisplayToSlot(did);
+                    String ev = "{\"event\":\"IME_CURSOR\""
+                            + ",\"slot\":" + slot
+                            + ",\"x\":" + x
+                            + ",\"y\":" + y
+                            + ",\"h\":" + h
+                            + "}";
+                    broadcastEvent(ev);
+                }
+            }
+        } catch (Throwable t) {
+            log("handleImeClient error: " + t);
+        } finally {
+            boolean wasActive = false;
+            int prevSlot = 0;
+            synchronized (imeLock) {
+                if (imeFd == fd) {
+                    imeFd = -1;
+                    wasActive = imeFocused;
+                    prevSlot = imeFocusSlot;
+                    imeFocused = false;
+                }
+            }
+            nativeCloseFd(fd);
+            log("SvboxHostIme disconnected (fd=" + fd + ")");
+            if (wasActive) {
+                broadcastEvent("{\"event\":\"IME_FOCUS\",\"active\":false,\"slot\":" + prevSlot
+                        + ",\"displayId\":0,\"inputType\":0,\"imeOptions\":0,\"showView\":0,\"packageName\":\"\"}");
+            }
+        }
+    }
+
+    private boolean sendToIme(String line) {
+        synchronized (imeLock) {
+            if (imeFd < 0) return false;
+            if (!nativeWriteLine(imeFd, line)) {
+                nativeCloseFd(imeFd);
+                imeFd = -1;
+                imeFocused = false;
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private String cmdImeSend(String msg) {
+        if (sendToIme(msg)) {
+            return "{\"ok\":true}";
+        }
+        return "{\"ok\":false,\"error\":\"ime not connected\"}";
+    }
+
+    private String cmdImeCommit(String b64, int fallbackSlot) throws Exception {
+        if (imeFocused && sendToIme("COMMIT " + b64)) {
+            return "{\"ok\":true,\"via\":\"ime\"}";
+        }
+        // Fallback to direct INPUT_TEXT if SvboxHostIme has no active InputConnection
+        // (e.g. user manually attached host IME on a custom game canvas).
+        return cmdInputText(fallbackSlot >= 0 ? fallbackSlot : imeFocusSlot, b64);
+    }
+
+    private String cmdImeDelete(int left, int right) throws Exception {
+        if (sendToIme("DELETE " + left + " " + right)) {
+            return "{\"ok\":true,\"via\":\"ime\"}";
+        }
+        int did = resolveDisplayIdForSlot(imeFocusSlot);
+        if (did >= 0) {
+            for (int i = 0; i < Math.min(left, 32); i++) injectSingleKey(did, 67 /* KEYCODE_DEL */, 0);
+            for (int i = 0; i < Math.min(right, 32); i++) injectSingleKey(did, 112 /* KEYCODE_FORWARD_DEL */, 0);
+            return "{\"ok\":true,\"via\":\"key\"}";
+        }
+        return "{\"ok\":false,\"error\":\"ime not connected\"}";
+    }
+
+    private String cmdImeAction(int enterType) throws Exception {
+        if (sendToIme("ACTION " + enterType)) {
+            return "{\"ok\":true,\"via\":\"ime\"}";
+        }
+        int did = resolveDisplayIdForSlot(imeFocusSlot);
+        if (did >= 0) {
+            injectSingleKey(did, 66 /* KEYCODE_ENTER */, 0);
+            return "{\"ok\":true,\"via\":\"key\"}";
+        }
+        return "{\"ok\":false,\"error\":\"ime not connected\"}";
+    }
+
+    private String cmdSetDisplayRotation(int rot) {
+        try {
+            if (windowMgr != null) {
+                if (rot < 0) {
+                    try {
+                        windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
+                                .invoke(windowMgr, 0, 0 /* DEFAULT */);
+                    } catch (Throwable ignored) {}
+                    try {
+                        windowMgr.getClass().getMethod("thawDisplayRotation", int.class)
+                                .invoke(windowMgr, 0);
+                    } catch (Throwable ignored) {}
+                    return "{\"ok\":true,\"rotation\":0,\"locked\":false}";
+                }
+                int r = rot & 3;
+                try {
+                    windowMgr.getClass().getMethod("setFixedToUserRotation", int.class, int.class)
+                            .invoke(windowMgr, 0, 2 /* ENABLED */);
+                } catch (Throwable t) {
+                    log("setFixedToUserRotation warning: " + t);
+                }
+                boolean frozen = false;
+                try {
+                    windowMgr.getClass().getMethod("freezeDisplayRotation", int.class, int.class)
+                            .invoke(windowMgr, 0, r);
+                    frozen = true;
+                } catch (Throwable ignored) {}
+                if (!frozen) {
+                    try {
+                        windowMgr.getClass().getMethod("freezeRotation", int.class)
+                                .invoke(windowMgr, r);
+                        frozen = true;
+                    } catch (Throwable ignored) {}
+                }
+                if (frozen) {
+                    return "{\"ok\":true,\"rotation\":" + r + ",\"locked\":true}";
+                }
+            }
+            // Fallback via wm shell command
+            int r = rot < 0 ? 0 : (rot & 3);
+            String cmd = rot < 0
+                    ? "wm fixed-to-user-rotation default; wm user-rotation free"
+                    : ("wm fixed-to-user-rotation enabled; wm user-rotation lock " + r);
+            Process p = new ProcessBuilder("/system/bin/sh", "-c", cmd).redirectErrorStream(true).start();
+            p.waitFor();
+            return "{\"ok\":true,\"rotation\":" + r + ",\"via\":\"shell\"}";
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + jsonStr(String.valueOf(t)) + "}";
+        }
+    }
+
+    private String cmdGetDisplayRotation() {
+        int rot = 0;
+        try {
+            if (windowMgr != null) {
+                Object val = windowMgr.getClass().getMethod("getDefaultDisplayRotation").invoke(windowMgr);
+                if (val instanceof Integer) rot = ((Integer) val).intValue();
+            }
+        } catch (Throwable ignored) {}
+        return "{\"ok\":true,\"rotation\":" + rot + "}";
+    }
+
+    private static int parseIntSafe(String s, int def) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Throwable ignored) {
+            return def;
+        }
     }
 
     private void clipboardWatchLoop() {

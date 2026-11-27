@@ -1505,9 +1505,56 @@ void AndroidRuntime::WmEventLoop(std::string sockPath) {
             for (ssize_t i = 0; i < r; ++i) {
                 if (buf[i] == '\n') {
                     if (!lineBuf.empty() && lineBuf.find("\"event\"") != std::string::npos) {
-                        std::lock_guard<std::mutex> lk(wmEventMu_);
-                        if (wmEventQueue_.size() < 64) {
-                            wmEventQueue_.push_back(lineBuf);
+                        auto parseJsonInt = [](const std::string& s, const char* key, int32_t def) -> int32_t {
+                            std::string pat = std::string("\"") + key + "\":";
+                            size_t pos = s.find(pat);
+                            if (pos == std::string::npos) return def;
+                            pos += pat.size();
+                            return static_cast<int32_t>(std::strtol(s.c_str() + pos, nullptr, 10));
+                        };
+                        auto parseJsonStr = [](const std::string& s, const char* key) -> std::string {
+                            std::string pat = std::string("\"") + key + "\":\"";
+                            size_t pos = s.find(pat);
+                            if (pos == std::string::npos) return "";
+                            pos += pat.size();
+                            size_t end = s.find('"', pos);
+                            return end == std::string::npos ? "" : s.substr(pos, end - pos);
+                        };
+                        if (lineBuf.find("\"IME_FOCUS\"") != std::string::npos) {
+                            bool act = lineBuf.find("\"active\":true") != std::string::npos;
+                            int32_t sl = parseJsonInt(lineBuf, "slot", 0);
+                            int32_t it = parseJsonInt(lineBuf, "inputType", 0);
+                            int32_t io = parseJsonInt(lineBuf, "imeOptions", 0);
+                            int32_t sv = parseJsonInt(lineBuf, "showView", 0);
+                            std::string pk = parseJsonStr(lineBuf, "packageName");
+                            std::lock_guard<std::mutex> ilk(imeStateMu_);
+                            imeState_.seq++;
+                            imeState_.active = act;
+                            imeState_.slot = sl;
+                            imeState_.inputType = it;
+                            imeState_.imeOptions = io;
+                            imeState_.showView = sv;
+                            imeState_.pkg = pk;
+                            if (!act) {
+                                imeState_.cursorX = -1;
+                                imeState_.cursorY = -1;
+                            }
+                        } else if (lineBuf.find("\"IME_CURSOR\"") != std::string::npos) {
+                            int32_t sl = parseJsonInt(lineBuf, "slot", 0);
+                            int32_t cx = parseJsonInt(lineBuf, "x", -1);
+                            int32_t cy = parseJsonInt(lineBuf, "y", -1);
+                            int32_t ch = parseJsonInt(lineBuf, "h", 24);
+                            std::lock_guard<std::mutex> ilk(imeStateMu_);
+                            imeState_.cursorSeq++;
+                            imeState_.cursorSlot = sl;
+                            imeState_.cursorX = cx;
+                            imeState_.cursorY = cy;
+                            imeState_.cursorH = ch;
+                        } else {
+                            std::lock_guard<std::mutex> lk(wmEventMu_);
+                            if (wmEventQueue_.size() < 64) {
+                                wmEventQueue_.push_back(lineBuf);
+                            }
                         }
                     }
                     lineBuf.clear();
@@ -1519,6 +1566,11 @@ void AndroidRuntime::WmEventLoop(std::string sockPath) {
         close(fd);
         if (!SleepCancelableMs(500)) return;
     }
+}
+
+AndroidRuntime::ImeState AndroidRuntime::GetImeState() const {
+    std::lock_guard<std::mutex> lk(imeStateMu_);
+    return imeState_;
 }
 
 SchedQos::Telemetry AndroidRuntime::GetTelemetry() {
@@ -3405,9 +3457,26 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
             MkdirP(injectLayer_ + "/system/xbin");
             WriteFile(injectLayer_ + "/system/xbin/.wh.su", "");
         }
+        // Stage headless WSA-style Host IME APK into /system/app/SvboxHostIme (zero edits to rootfs14)
+        bool hasHostIme = false;
+        {
+            const std::string imeApkSrc =
+                FileExists(hnpBin + "/SvboxHostIme.apk")
+                    ? (hnpBin + "/SvboxHostIme.apk")
+                    : (androidDir_ + "/ime_bridge/SvboxHostIme.apk");
+            if (FileExists(imeApkSrc)) {
+                MkdirP(injectLayer_ + "/system/app/SvboxHostIme");
+                const std::string imeDst = injectLayer_ + "/system/app/SvboxHostIme/SvboxHostIme.apk";
+                if (CopyRegularFile(imeApkSrc, imeDst)) {
+                    chmod(imeDst.c_str(), 0644);
+                    hasHostIme = true;
+                }
+            }
+        }
         logLine("Staged injectLayer=" + injectLayer_ + " (gpuLibs=" + std::to_string(gpuCopied) +
                 ", audioHal=" + std::to_string(!audioHalPath_.empty()) +
                 ", cameraStub=" + std::to_string(!cameraSvcPath_.empty()) +
+                ", hostIme=" + std::to_string(hasHostIme) +
                 ", root=" + std::to_string(allowRoot) + ")");
     }
 
@@ -3790,7 +3859,9 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                     std::to_string(maxCachedProcs) + "; "
                     "settings put global bluetooth_on 0; "
                     "settings put global ble_scan_always_enabled 0; "
-                    "pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true; ";
+                    "pm disable-user --user 0 com.android.bluetooth >/dev/null 2>&1 || true; "
+                    "ime enable org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
+                    "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; ";
                 if (!allowRoot) {
                     initCmd += "settings put global adb_enabled 0; "
                                "settings put global development_settings_enabled 0; ";
@@ -3846,6 +3917,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
                             wmAgentReady_.store(true);
                             OH_LOG_INFO(LOG_APP, "SvboxWmAgent online (%s)", wmSockCopy.c_str());
                             wmEventThread_ = std::thread(&AndroidRuntime::WmEventLoop, this, wmSockCopy);
+                            // Ensure WSA-style SvboxHostIme is enabled & active once IMMS is ready
+                            {
+                                std::vector<std::string> imeArgv = BaseSvboxArgs();
+                                imeArgv.push_back("--");
+                                imeArgv.push_back("system/bin/sh");
+                                imeArgv.push_back("-c");
+                                imeArgv.push_back(
+                                    "ime enable org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true; "
+                                    "ime set org.svbox.ime/.SvboxHostImeService >/dev/null 2>&1 || true");
+                                Spawn(imeArgv, true);
+                            }
                             break;
                         }
                     }
@@ -3950,6 +4032,17 @@ std::string AndroidRuntime::Stop() {
     bootanimPid_.store(-1);
     visibleDisplayMask_.store(0);
     hideSeq_.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> ilk(imeStateMu_);
+        imeState_.seq++;
+        imeState_.active = false;
+        imeState_.cursorX = -1;
+        imeState_.cursorY = -1;
+        imeState_.pkg.clear();
+    }
+    for (int s = 0; s <= InputBridge::kMaxSecondaryDisplays; ++s) {
+        InputBridge::Instance().SetHostImeActive(s, false);
+    }
 
     auto killAndReapPids = [&]() {
         std::vector<pid_t> pidsCopy;

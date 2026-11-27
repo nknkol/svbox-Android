@@ -15,9 +15,9 @@ import {
 } from '../common/AppWindowPrefs';
 import {
   pasteHostClipboardToAndroid,
-  sendTextToAndroid,
   syncHostClipboardToAndroid
 } from '../common/InputBridgeHelper';
+import { hostImeManager } from '../common/HostImeController';
 import { supportsPcKeymap } from '../common/DeviceProfile';
 import {
   applyKeymapToNative,
@@ -62,6 +62,7 @@ struct AppWindowPage {
   @LocalStorageProp('winPxH') @Watch('onWindowSizeChanged') winPxH: number = 1380;
   @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 136;
   @LocalStorageProp('iconSetupStarted') iconSetupStarted: boolean = false;
+  @StorageProp('hostImeAttachedSlot') hostImeAttachedSlot: number = -1;
 
   @State private winMode: string = 'adaptive';
   @State private presetKey: string = '720x1280';
@@ -70,6 +71,7 @@ struct AppWindowPage {
   @State private dispH: number = 1080;
   @State private stageVpW: number = 0;
   @State private stageVpH: number = 0;
+  @State private barVpW: number = 430;
   @State private stageReady: boolean = false;
   @State private ready: boolean = false;
   @State private launchError: boolean = false;
@@ -77,8 +79,6 @@ struct AppWindowPage {
   @State private iconUri: string = '';
   @State private topBarHex: string = '#161920';
   @State private isDarkBar: boolean = true;
-  @State private showImeBar: boolean = false;
-  @State private imeDraft: string = '';
   @State private keymapProfile: KeymapProfile = { pkg: '', enabled: false, showHints: true, items: [] };
   @State private showKeymapEditor: boolean = false;
   @State private showMacroPanel: boolean = false;
@@ -373,16 +373,37 @@ struct AppWindowPage {
     }
   }
 
-  private async handleSubmitImeText(): Promise<void> {
-    const txt: string = this.imeDraft;
-    if (txt.length === 0 || !this.ready) return;
-    this.imeDraft = '';
-    await sendTextToAndroid(this.displaySlot, txt);
+  private async handleToggleHostIme(): Promise<void> {
+    if (!this.ready) return;
+    const attachedNow: boolean = await hostImeManager.toggleManualAttach(this.displaySlot);
+    if (attachedNow) {
+      syncHostClipboardToAndroid(false);
+    }
   }
 
   private async handlePasteClipboard(): Promise<void> {
     if (!this.ready) return;
     await pasteHostClipboardToAndroid(this.displaySlot);
+  }
+
+  private availBarVp(): number {
+    return Math.max(0, this.barVpW - Math.max(152, this.decorRightAvoidVp) - 18);
+  }
+
+  private showModePillInBar(): boolean {
+    return this.availBarVp() >= 250;
+  }
+
+  private showImeInBar(): boolean {
+    return this.availBarVp() >= 290;
+  }
+
+  private showKeymapInBar(): boolean {
+    return supportsPcKeymap() && this.availBarVp() >= 330;
+  }
+
+  private showMacroInBar(): boolean {
+    return supportsPcKeymap() && this.availBarVp() >= 366;
   }
 
   @Builder
@@ -394,6 +415,25 @@ struct AppWindowPage {
         .onClick(() => { this.switchWindowMode('fixed_portrait'); })
       MenuItem({ content: this.winMode === 'fixed_landscape' ? '✓ 兼容模式 · 横屏（等比缩放）' : '兼容模式 · 横屏（等比缩放）' })
         .onClick(() => { this.switchWindowMode('fixed_landscape'); })
+      MenuItem({
+        content: this.hostImeAttachedSlot === this.displaySlot
+          ? '关闭鸿蒙共享输入法'
+          : '手动唤起鸿蒙共享输入法'
+      })
+        .enabled(this.ready)
+        .onClick(() => { this.handleToggleHostIme(); })
+      if (supportsPcKeymap()) {
+        MenuItem({ content: this.showKeymapEditor ? '关闭键鼠映射编辑' : '键鼠映射布局...' })
+          .onClick(() => {
+            this.showMacroPanel = false;
+            this.showKeymapEditor = !this.showKeymapEditor;
+          })
+        MenuItem({ content: this.showMacroPanel ? '关闭自动化宏面板' : '自动化脚本 / 宏录制...' })
+          .onClick(() => {
+            this.showKeymapEditor = false;
+            this.showMacroPanel = !this.showMacroPanel;
+          })
+      }
       MenuItem({ content: '粘贴鸿蒙剪贴板到此窗口' })
         .enabled(this.ready)
         .onClick(() => { this.handlePasteClipboard(); })
@@ -640,7 +680,7 @@ struct AppWindowPage {
 
   build() {
     Column() {
-      // Single Immersive System-Integrated Title Bar (38vp, dynamically tinted to Android app top bar)
+      // Single Immersive System-Integrated Title Bar (38vp, dynamically tinted & responsive overflow into ⋮)
       Row({ space: 6 }) {
         // Back button (native HarmonyOS SymbolGlyph)
         Button({ type: ButtonType.Normal }) {
@@ -650,6 +690,7 @@ struct AppWindowPage {
         }
         .width(28)
         .height(28)
+        .flexShrink(0)
         .borderRadius(6)
         .backgroundColor(Color.Transparent)
         .stateStyles({
@@ -665,6 +706,7 @@ struct AppWindowPage {
           Image(this.iconUri)
             .width(18)
             .height(18)
+            .flexShrink(0)
             .borderRadius(4)
             .objectFit(ImageFit.Contain)
         }
@@ -677,21 +719,23 @@ struct AppWindowPage {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
-        // Support Mode vs Compat Mode switcher pill + Keymap + Automation + IME Bridge + Orientation toggle
-        Button({ type: ButtonType.Normal }) {
-          Text(this.modePillLabel())
-            .fontSize(11)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(this.titleInkColor())
-            .maxLines(1)
+        if (this.showModePillInBar()) {
+          Button({ type: ButtonType.Normal }) {
+            Text(this.modePillLabel())
+              .fontSize(11)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.titleInkColor())
+              .maxLines(1)
+          }
+          .height(24)
+          .flexShrink(0)
+          .padding({ left: 8, right: 8 })
+          .borderRadius(12)
+          .backgroundColor(this.buttonHoverBg())
+          .bindMenu(this.modeMenuBuilder())
         }
-        .height(24)
-        .padding({ left: 8, right: 8 })
-        .borderRadius(12)
-        .backgroundColor(this.buttonHoverBg())
-        .bindMenu(this.modeMenuBuilder())
 
-        if (supportsPcKeymap()) {
+        if (this.showKeymapInBar()) {
           Button({ type: ButtonType.Normal }) {
             SymbolGlyph($r('sys.symbol.gamecontroller'))
               .fontSize(15)
@@ -699,6 +743,7 @@ struct AppWindowPage {
           }
           .width(28)
           .height(28)
+          .flexShrink(0)
           .borderRadius(6)
           .backgroundColor(Color.Transparent)
           .stateStyles({
@@ -708,7 +753,9 @@ struct AppWindowPage {
             this.showMacroPanel = false;
             this.showKeymapEditor = !this.showKeymapEditor;
           })
+        }
 
+        if (this.showMacroInBar()) {
           Button({ type: ButtonType.Normal }) {
             SymbolGlyph($r('sys.symbol.bolt_fill'))
               .fontSize(15)
@@ -716,6 +763,7 @@ struct AppWindowPage {
           }
           .width(28)
           .height(28)
+          .flexShrink(0)
           .borderRadius(6)
           .backgroundColor(Color.Transparent)
           .stateStyles({
@@ -727,26 +775,26 @@ struct AppWindowPage {
           })
         }
 
-        Button({ type: ButtonType.Normal }) {
-          SymbolGlyph($r('sys.symbol.keyboard'))
-            .fontSize(15)
-            .fontColor([this.showImeBar ? '#38BDF8' : this.titleInkColor()])
-        }
-        .width(28)
-        .height(28)
-        .borderRadius(6)
-        .backgroundColor(Color.Transparent)
-        .stateStyles({
-          pressed: { .backgroundColor(this.buttonHoverBg()) }
-        })
-        .onClick(() => {
-          this.showImeBar = !this.showImeBar;
-          if (this.showImeBar) {
-            syncHostClipboardToAndroid(false);
+        if (this.showImeInBar()) {
+          Button({ type: ButtonType.Normal }) {
+            SymbolGlyph($r('sys.symbol.keyboard'))
+              .fontSize(15)
+              .fontColor([this.hostImeAttachedSlot === this.displaySlot ? '#38BDF8' : this.titleInkColor()])
           }
-        })
+          .width(28)
+          .height(28)
+          .flexShrink(0)
+          .borderRadius(6)
+          .backgroundColor(Color.Transparent)
+          .stateStyles({
+            pressed: { .backgroundColor(this.buttonHoverBg()) }
+          })
+          .onClick(() => {
+            this.handleToggleHostIme();
+          })
+        }
 
-        // Single Portrait/Landscape toggle button placed directly left of system 3-button area
+        // Single Portrait/Landscape toggle button
         Button({ type: ButtonType.Normal }) {
           SymbolGlyph($r('sys.symbol.screen_rotation'))
             .fontSize(16)
@@ -754,6 +802,7 @@ struct AppWindowPage {
         }
         .width(28)
         .height(28)
+        .flexShrink(0)
         .borderRadius(6)
         .backgroundColor(Color.Transparent)
         .stateStyles({
@@ -762,6 +811,24 @@ struct AppWindowPage {
         .onClick(() => {
           this.toggleOrientation();
         })
+
+        // Overflow More menu (always accessible even at narrow window widths)
+        if (!this.showModePillInBar() || !this.showMacroInBar()) {
+          Button({ type: ButtonType.Normal }) {
+            SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
+              .fontSize(15)
+              .fontColor([this.titleInkColor()])
+          }
+          .width(28)
+          .height(28)
+          .flexShrink(0)
+          .borderRadius(6)
+          .backgroundColor(Color.Transparent)
+          .stateStyles({
+            pressed: { .backgroundColor(this.buttonHoverBg()) }
+          })
+          .bindMenu(this.modeMenuBuilder())
+        }
       }
       .width('100%')
       .height(38)
@@ -769,6 +836,12 @@ struct AppWindowPage {
       .backgroundColor(this.topBarHex)
       .animation({ duration: 220, curve: Curve.EaseOut })
       .alignItems(VerticalAlign.Center)
+      .onAreaChange((_oldVal: Area, newVal: Area) => {
+        const w: number = Number(newVal.width);
+        if (w > 100 && Math.abs(w - this.barVpW) >= 1) {
+          this.barVpW = w;
+        }
+      })
 
       // Zero-copy Vulkan surface viewport for this Android VirtualDisplay
       Stack({ alignContent: Alignment.Center }) {
@@ -882,46 +955,6 @@ struct AppWindowPage {
           }
         }
       })
-
-      if (this.showImeBar) {
-        Row({ space: 8 }) {
-          TextInput({ placeholder: '鸿蒙中文输入法桥接：输入后回车发送至当前窗口', text: this.imeDraft })
-            .layoutWeight(1)
-            .height(32)
-            .fontSize(13)
-            .fontColor('#F3F4F6')
-            .placeholderColor('#9CA3AF')
-            .backgroundColor('#262B36')
-            .borderRadius(8)
-            .enterKeyType(EnterKeyType.Send)
-            .onChange((val: string) => { this.imeDraft = val; })
-            .onSubmit(() => { this.handleSubmitImeText(); })
-
-          Button('发送', { type: ButtonType.Capsule })
-            .height(30)
-            .padding({ left: 12, right: 12 })
-            .fontSize(12)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#0A59F7')
-            .enabled(this.imeDraft.length > 0 && this.ready)
-            .onClick(() => { this.handleSubmitImeText(); })
-
-          PasteButton({ text: PasteDescription.PASTE })
-            .height(30)
-            .fontSize(12)
-            .fontColor('#F3F4F6')
-            .backgroundColor('#374151')
-            .onClick((_ev: ClickEvent, res: PasteButtonOnClickResult) => {
-              if (res === PasteButtonOnClickResult.SUCCESS) {
-                this.handlePasteClipboard();
-              }
-            })
-        }
-        .width('100%')
-        .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-        .backgroundColor('#161920')
-        .alignItems(VerticalAlign.Center)
-      }
     }
     .width('100%')
     .height('100%')

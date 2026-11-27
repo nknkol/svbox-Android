@@ -26,6 +26,9 @@ sensors_hal/svbox-sensors-service: sensors_hal/svbox_sensors_service.c
 	$(CC) -O2 -Wall -Wextra -fPIE -pie -nostdlib -fno-stack-protector -fno-builtin -Wl,--dynamic-linker=/system/bin/linker64 -Wl,-e,_start -Wl,--no-as-needed -o $@ $< rootfs14/system/apex/com.android.runtime/lib64/bionic/libc.so rootfs14/system/apex/com.android.runtime/lib64/bionic/libdl.so
 
 stage-hnp: all
+	@if [ ! -f ime_bridge/SvboxHostIme.apk ]; then \
+		python3 ime_bridge/build.py; \
+	fi
 	rm -rf hap/entry/libs/arm64-v8a/libsvbox*.so
 	@if [ -f gpu/build_host/libgfxstream_host.so ]; then \
 		mkdir -p hap/entry/libs/arm64-v8a; \

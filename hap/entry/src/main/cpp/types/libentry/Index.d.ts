@@ -42,6 +42,23 @@ export interface DisplayStats {
   topBarColor: number;
 }
 
+export interface ImeState {
+  seq: number;
+  active: boolean;
+  slot: number;
+  inputType: number;
+  imeOptions: number;
+  showView: number;
+  cursorSeq: number;
+  cursorSlot: number;
+  cursorX: number;
+  cursorY: number;
+  cursorH: number;
+  lastTapX: number;
+  lastTapY: number;
+  pkg: string;
+}
+
 export const startContainer: (
   sandboxTempDir: string,
   svboxPath: string,
@@ -116,4 +133,7 @@ export const findDisplaySlot: (pkg: string) => number;
 export const releaseDisplaySlot: (slot: number) => boolean;
 export const pollWmEvents: () => string;
 export const getDisplayStats: (slot: number) => DisplayStats;
+export const getImeState: () => ImeState;
+export const setHostImeActive: (slot: number, active: boolean) => boolean;
+export const setDisplay0Rotation: (rotation: number) => boolean;
 export const getStatus: () => RuntimeStatus;

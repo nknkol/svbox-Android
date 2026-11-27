@@ -346,6 +346,14 @@ void InputBridge::Start(const std::string& touchSockPath,
     Stop();
     displayW_.store(displayW > 0 ? displayW : 720);
     displayH_.store(displayH > 0 ? displayH : 1280);
+    display0Rotation_.store(0);
+    hostCtrlHeld_.store(false);
+    hostAltHeld_.store(false);
+    for (int i = 0; i <= kMaxSecondaryDisplays; ++i) {
+        hostImeActive_[i].store(false);
+        lastPtrX_[i].store(-1.0f);
+        lastPtrY_[i].store(-1.0f);
+    }
     mapEscToBack_.store(mapEscToBack);
     eventsSent_.store(0);
     touchClients_.store(0);
@@ -889,6 +897,8 @@ void InputBridge::InjectTouchForDisplay(int displaySlot, int32_t fingerId, int a
     }
 
     if (action == 0) {
+        lastPtrX_[displaySlot].store(x);
+        lastPtrY_[displaySlot].store(y);
         if (slot < 0) {
             for (int i = 0; i < 10; ++i) {
                 if (slotFinger[i] < 0) { slot = i; break; }
@@ -1130,11 +1140,87 @@ void InputBridge::InjectOhosKey(int32_t ohosKeyCode, bool down) {
     }
 }
 
+void InputBridge::SetHostImeActive(int displaySlot, bool active) {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
+    hostImeActive_[displaySlot].store(active);
+    if (!active) {
+        hostCtrlHeld_.store(false);
+        hostAltHeld_.store(false);
+    }
+}
+
+bool InputBridge::IsHostImeActive(int displaySlot) const {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
+    return hostImeActive_[displaySlot].load();
+}
+
+bool InputBridge::ShouldSuppressKeyForHostIme(int displaySlot, int32_t k, bool down) {
+    if (k == 2072 || k == 2073) {
+        hostCtrlHeld_.store(down);
+        return false;
+    }
+    if (k == 2045 || k == 2046) {
+        hostAltHeld_.store(down);
+        return false;
+    }
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return false;
+    if (!hostImeActive_[displaySlot].load()) return false;
+    // Allow Ctrl/Alt shortcuts (Ctrl+C/V/A/X/Z, etc.) to pass through cleanly
+    if (hostCtrlHeld_.load() || hostAltHeld_.load()) return false;
+    // Letters A-Z, digits 0-9
+    if ((k >= 2017 && k <= 2042) || (k >= 2000 && k <= 2009)) return true;
+    // Punctuation, Space, Backspace, Delete, Enter, Shift, CapsLock, Arrows
+    switch (k) {
+        case 2012: case 2013: case 2014: case 2015: // Arrow keys (candidate navigation / moveCursor)
+        case 2016: case 2054: case 2119:            // Enter / Numpad Enter
+        case 2043: case 2044:                       // Comma, Period
+        case 2047: case 2048: case 2074:            // Shift, CapsLock (CN/EN IME toggle)
+        case 2050: case 2055: case 2071:            // Space, Backspace, Delete
+        case 2056: case 2057: case 2058: case 2059:
+        case 2060: case 2061: case 2062: case 2063:
+        case 2064:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void InputBridge::SetDisplay0Rotation(int rotation) {
+    display0Rotation_.store(rotation & 3);
+}
+
+void InputBridge::GetLastPointerPos(int displaySlot, float& outX, float& outY) const {
+    if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) {
+        outX = -1.0f;
+        outY = -1.0f;
+        return;
+    }
+    outX = lastPtrX_[displaySlot].load();
+    outY = lastPtrY_[displaySlot].load();
+}
+
 void InputBridge::InjectNormalizedTouch(int displaySlot, int32_t fingerId, int action, float nx, float ny) {
     if (!running_.load()) return;
     if (displaySlot < 0 || displaySlot > kMaxSecondaryDisplays) return;
     float cx = std::clamp(nx, 0.0f, 1.0f);
     float cy = std::clamp(ny, 0.0f, 1.0f);
+    if (displaySlot == 0) {
+        int rot = display0Rotation_.load() & 3;
+        if (rot == 1) {
+            float px = 1.0f - cy;
+            float py = cx;
+            cx = px;
+            cy = py;
+        } else if (rot == 2) {
+            cx = 1.0f - cx;
+            cy = 1.0f - cy;
+        } else if (rot == 3) {
+            float px = cy;
+            float py = 1.0f - cx;
+            cx = px;
+            cy = py;
+        }
+    }
     float spanW = 0.0f;
     float spanH = 0.0f;
     if (displaySlot == 0) {

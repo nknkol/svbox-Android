@@ -1136,6 +1136,16 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - 黑屏根因：`cmdLaunchApp` 未检测目标应用是否已有存活 Task 位于 `displayId=0` 或其他屏（`ActivityStarter` 复用旧 Task 留在原屏导致新屏 `frames=0` 黑屏），且 `AppWindowPage.ets` 未检查 `LAUNCH_APP`/`MOVE_TASK` 返回值（如卸载缓存残留 `rc=-92`），失败时仍隐藏加载遮罩裸露黑屏。
     - 修复：`SvboxWmAgent.java` + `libsvbox_wm_jni.cpp` 新增 `nativeGetReaderFrames()`、`handleTaskEvent` 校验独立 RootTask 避免误拆宿主内嵌页、`moveTaskCleanly()` 等待源屏 Shell Transition 动画落稳后再搬迁并刷新源屏+目标屏焦点（附 700ms 帧数自愈看门狗）、`cmdLaunchApp()` 优先查找并搬迁已有存活 Task + 失效组件自动重解析 + 启动后跨屏校验；`AppWindowPage.ets` 增加 `MOVE_TASK -> LAUNCH_APP` 自动降级及失败态重试/关闭提示层。
     - 真机实测：同时运行 Play 商店（`slot=1, 1782x1770`）、64 位 Chrome（`slot=2, 2116x1582`）及由 Play 商店跨应用拉起的 Instagram（`slot=3, 1462x1522`），`dumpsys SurfaceFlinger` 验证 3 个 VirtualDisplay `layerStack=2/3/4` 输出图层 100% 独立零串画，三屏均持续输出帧且 `Fatal signal = 0`。
+- **2026-11-27 WSA 风格鸿蒙共享输入法 + 传统模拟器等比锁定 / 旋转 / 标题栏响应式折叠**：
+  - **WSA 风格直接共用鸿蒙系统输入法（零底部独立桥接输入框）**：
+    - Android 侧新增无界面系统 IME `ime_bridge/SvboxHostIme.apk`（纯 Python AXML + `resources.arsc` + APK Signature Scheme v2 签名，零修改只读 `rootfs14/`，运行期注入 `injectLayer_/system/app/SvboxHostIme/SvboxHostIme.apk`），通过抽象 Unix Socket `@svbox_ime` 与 `SvboxWmAgent` 保持长连接。
+    - 实测踩坑 1：Android 14 `InputMethodManagerService.onUnlockUser(0)` 解锁时会重载 `settings_secure.xml` 覆盖早期启动时设置的默认输入法回退至 `LatinIME`；在 `SvboxWmAgent.java` 增加 `ensureHostImeActiveLoop()` 于用户解锁并 `sys.boot_completed=1` 后再次确认启用/选中 `org.svbox.ime/.SvboxHostImeService`，确保常驻生效。
+    - 实测踩坑 2：HarmonyOS `@kit.IMEKit` `InputMethodController` 要求 `setPreviewText` / `finishTextPreview` 必须在 `attach()` **之前**注册，而 `insertText` / `deleteLeft` / `deleteRight` / `sendFunctionKey` / `moveCursor` / `handleExtendAction` 必须在 `attach()` **之后**注册（否则报 `12800009: input method client detached. need to be attached first`）。`HostImeController.ets` 拆分 `bindPreAttachListeners()` / `bindPostAttachListeners()` 并在 `InputBridge::ShouldSuppressKeyForHostIme()` + `DispatchKeyEventCB` 中于宿主 IME 接管时返回 `false` 交由鸿蒙 IMF 消费，彻底杜绝中英双打与游戏键位误触发；同时将 Android `CursorAnchorInfo` 换算为鸿蒙物理屏幕坐标，令小艺拼音候选浮窗精准贴合 Android 输入框正下方。
+  - **传统模拟器等比例缩放锁定 + 屏幕横竖屏旋转 + 标题栏防裁剪溢出折叠**：
+    - `EmulatorWindowAbility.ets` 与 `EmulatorWindowPage.ets` 先执行 `applyImmersiveDecor(win, 40)` 再调用 `win.setContentAspectRatio(ratio, false, false)` 后 `win.resize(targetW, targetH)`（规避 `needUpdateRect=true` 覆盖目标宽度的系统行为），竖屏精确锁定 `760×1427`、横屏精确锁定 `1480×909`，零黑边且禁止自由拉伸宽高比。
+    - 新增 Display 0 横竖屏旋转（`SvboxWmAgent` `SET_DISPLAY_ROTATION` 通过 `IWindowManager.setFixedToUserRotation(0, 2)` + `freezeDisplayRotation(0, rot)` 驱动 Android 旋转，ArkUI `XComponent` 使用 `.rotate({ angle: -90 })` 配合 `svbox-touchscreen.idc` `orientationAware=1` 实现零闪烁硬件旋转与像素级精准触控，同时 `InputBridge::SetDisplay0Rotation()` 同步旋转归一化键鼠映射层坐标）。
+    - `EmulatorWindowPage.ets` 与 `AppWindowPage.ets` 标题栏通过 `.onAreaChange` 实时测量 `barVpW` 并为图标添加 `.flexShrink(0)`，窄屏时自动将 FPS 徽章、多任务、输入法、拆出、键鼠映射、宏录制按优先级收入 `更多 ⋮` 菜单，宽屏自动展开，彻底消除左侧图标裁剪。
+  - **真机实测（`HAD-W32`）**：冷启动 `Fatal signal = 0`；竖屏 `760×1427` 零裁剪零黑边 -> 点击旋转切换横屏 `1480×909`（`105/120Hz` + 完整工具栏展开 + 点击精准启动 WebView）-> 点击 `about:blank` 输入框自动触发 `Host IME attached`（零警告）并弹出原生小艺拼音候选框 -> 实测物理键盘 `nihao`+空格上屏 `你好`、`shijie`+空格+退格变为 `你好世` -> 回主页自动 `Host IME detached` -> 旋转回竖屏 `760×1427` 完整闭环。
 
 
 

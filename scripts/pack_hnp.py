@@ -40,6 +40,7 @@ def main() -> None:
         (os.path.join(repo, "sensors_hal", "svbox-sensors-service"), "svbox_0.1.0/bin/svbox-sensors-service"),
         (os.path.join(repo, "wm_agent", "libsvbox_wm_jni.so"), "svbox_0.1.0/bin/libsvbox_wm_jni.so"),
         (os.path.join(repo, "wm_agent", "svbox-wm-agent.jar"), "svbox_0.1.0/bin/svbox-wm-agent.jar"),
+        (os.path.join(repo, "ime_bridge", "SvboxHostIme.apk"), "svbox_0.1.0/bin/SvboxHostIme.apk"),
     ]
 
     guest_gpu_dir = os.path.join(repo, "gpu", "build_guest", "out", "lib64")

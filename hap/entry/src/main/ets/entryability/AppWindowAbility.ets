@@ -5,6 +5,7 @@ import native from 'libentry.so';
 import { AndroidAppItem, AppWindowPref, appWindowPrefs, loadCachedAppList } from '../common/AppWindowPrefs';
 import { getDeviceFormFactor } from '../common/DeviceProfile';
 import { syncHostClipboardToAndroid } from '../common/InputBridgeHelper';
+import { hostImeManager } from '../common/HostImeController';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 import {
   applyImmersiveDecor,
@@ -70,6 +71,7 @@ export default class AppWindowAbility extends UIAbility {
     if (this.displaySlot >= 1) {
       try {
         native.setDisplayVisible(this.displaySlot, true);
+        hostImeManager.setWindowActive(this.displaySlot, true);
         if (native.isWmAgentReady()) {
           native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
           syncHostClipboardToAndroid(false);
@@ -82,6 +84,7 @@ export default class AppWindowAbility extends UIAbility {
   onBackground(): void {
     if (this.displaySlot >= 1) {
       try {
+        hostImeManager.setWindowActive(this.displaySlot, false);
         native.setDisplayVisible(this.displaySlot, false);
       } catch (_e) {
       }
@@ -93,6 +96,9 @@ export default class AppWindowAbility extends UIAbility {
       const win: window.Window = windowStage.getMainWindowSync();
       this.mainWindow = win;
       registerSlotWindow(this.displaySlot, win);
+      if (this.displaySlot >= 1) {
+        hostImeManager.registerWindow(this.displaySlot, win, 38);
+      }
 
       const globalHz: number = AppStorage.get<number>('refreshRate') ?? 60;
       let appMeta: AndroidAppItem | undefined = undefined;
@@ -143,12 +149,15 @@ export default class AppWindowAbility extends UIAbility {
         if (ev === window.WindowEventType.WINDOW_ACTIVE && this.displaySlot >= 1) {
           try {
             native.setDisplayVisible(this.displaySlot, true);
+            hostImeManager.setWindowActive(this.displaySlot, true);
             if (native.isWmAgentReady()) {
               native.wmRpcAsync(`FOCUS_DISPLAY ${this.displaySlot}`);
               syncHostClipboardToAndroid(false);
             }
           } catch (_e) {
           }
+        } else if (ev === window.WindowEventType.WINDOW_INACTIVE && this.displaySlot >= 1) {
+          hostImeManager.setWindowActive(this.displaySlot, false);
         }
       });
     } catch (err) {
@@ -195,6 +204,7 @@ export default class AppWindowAbility extends UIAbility {
     if (this.displaySlot >= 1) {
       const slot: number = this.displaySlot;
       const pkg: string = this.androidPkg;
+      hostImeManager.unregisterWindow(slot);
       unregisterSlotWindow(slot);
       try {
         if (native.isWmAgentReady()) {

@@ -46,3 +46,8 @@ gpu/out/
 
 # Step 7 Layer 2 ohos_bridge CLI build outputs
 ohos_bridge/build/
+
+# WSA-style Host IME bridge signing keys & intermediate build artifacts
+ime_bridge/.tools/
+ime_bridge/build/
+ime_bridge/SvboxHostIme.apk

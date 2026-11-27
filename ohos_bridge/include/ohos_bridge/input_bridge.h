@@ -48,6 +48,15 @@ public:
     void InjectScrollForDisplay(int displaySlot, float x, float y, float deltaY);
     // HarmonyOS OH_NativeXComponent_KeyCode -> Linux KEY_*
     void InjectOhosKey(int32_t ohosKeyCode, bool down);
+    // WSA-style shared host IME guard (prevents double-typing while HarmonyOS IME owns text input)
+    void SetHostImeActive(int displaySlot, bool active);
+    bool IsHostImeActive(int displaySlot) const;
+    bool ShouldSuppressKeyForHostIme(int displaySlot, int32_t ohosKeyCode, bool down);
+    // Display 0 logical rotation (0=0°, 1=90° CCW, 2=180°, 3=270°) for normalized overlay touch mapping
+    void SetDisplay0Rotation(int rotation);
+    int Display0Rotation() const { return display0Rotation_.load(); }
+    // Last pointer down coordinate in XComponent local px (for positioning HarmonyOS IME candidate bar)
+    void GetLastPointerPos(int displaySlot, float& outX, float& outY) const;
     // Direct Linux evdev KEY_* injection
     void InjectLinuxKey(uint16_t linuxKey, bool down);
     void TapLinuxKey(uint16_t linuxKey);
@@ -111,6 +120,12 @@ private:
     std::atomic<int32_t> displayH_{1280};
     std::atomic<int32_t> surfaceW_{720};
     std::atomic<int32_t> surfaceH_{1280};
+    std::atomic<int32_t> display0Rotation_{0};
+    std::atomic<bool> hostImeActive_[kMaxSecondaryDisplays + 1]{};
+    std::atomic<bool> hostCtrlHeld_{false};
+    std::atomic<bool> hostAltHeld_{false};
+    std::atomic<float> lastPtrX_[kMaxSecondaryDisplays + 1]{};
+    std::atomic<float> lastPtrY_[kMaxSecondaryDisplays + 1]{};
     std::atomic<int32_t> touchClients_{0};
     std::atomic<int32_t> kbdClients_{0};
     std::atomic<int32_t> gamepadClients_{0};

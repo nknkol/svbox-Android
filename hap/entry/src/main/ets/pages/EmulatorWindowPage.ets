@@ -1,5 +1,6 @@
 import { common, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { window } from '@kit.ArkUI';
 import native, { RuntimeStatus } from 'libentry.so';
 import {
   AndroidAppItem,
@@ -16,10 +17,10 @@ import {
 } from '../common/DesignTokens';
 import {
   pasteHostClipboardToAndroid,
-  sendTextToAndroid,
   syncHostClipboardToAndroid
 } from '../common/InputBridgeHelper';
-import { supportsPcKeymap } from '../common/DeviceProfile';
+import { hostImeManager } from '../common/HostImeController';
+import { getDeviceFormFactor, supportsPcKeymap } from '../common/DeviceProfile';
 import {
   applyKeymapToNative,
   KeymapProfile,
@@ -30,6 +31,7 @@ import {
   KeymapHintLayer,
   MacroAutomationOverlay
 } from '../components/KeymapOverlay';
+import { getSlotWindow } from '../common/WindowHelper';
 import { DeviceInstance, instanceManager } from '../model/InstanceModel';
 
 const TAG: string = 'SvboxEmuPage';
@@ -43,6 +45,11 @@ interface PopOutReply {
   error?: string;
 }
 
+interface RotationReply {
+  ok?: boolean;
+  rotation?: number;
+}
+
 @Entry({ useSharedStorage: true })
 @Component
 struct EmulatorWindowPage {
@@ -51,23 +58,25 @@ struct EmulatorWindowPage {
   @LocalStorageProp('decorRightAvoidVp') decorRightAvoidVp: number = 152;
   @LocalStorageProp('emuInstanceName') emuInstanceName: string = '';
   @LocalStorageProp('emuInstanceId') emuInstanceId: string = '';
+  @StorageProp('hostImeAttachedSlot') hostImeAttachedSlot: number = -1;
 
   @State private running: boolean = false;
   @State private wmAgentReady: boolean = false;
   @State private dispW: number = 720;
   @State private dispH: number = 1280;
+  @State private displayRotation: number = 0; // 0 = natural, 1 = rotated 90 deg CCW
   @State private fps: number = 0;
   @State private refreshRate: number = 120;
   @State private statusText: string = '正在连接 Android 14 模拟器屏幕...';
-  @State private stageW: number = 420;
-  @State private stageH: number = 720;
-  @State private showImeBar: boolean = false;
-  @State private imeDraft: string = '';
+  @State private stageW: number = 380;
+  @State private stageH: number = 675;
+  @State private barVpW: number = 380;
   @State private keymapProfile: KeymapProfile = { pkg: '__emulator__', enabled: false, showHints: true, items: [] };
   @State private showKeymapEditor: boolean = false;
   @State private showMacroPanel: boolean = false;
 
   private pollTimer: number = -1;
+  private rotSynced: boolean = false;
   private svboxPath: string = '/storage/Users/currentUser/Workspace/svbox/build/svbox';
   private androidDir: string = '/storage/Users/currentUser/Workspace/svbox-Android';
 
@@ -78,10 +87,22 @@ struct EmulatorWindowPage {
     }
   }
 
+  private isRotated90(): boolean {
+    return (this.displayRotation & 1) === 1;
+  }
+
+  private visualW(): number {
+    return this.isRotated90() ? this.dispH : this.dispW;
+  }
+
+  private visualH(): number {
+    return this.isRotated90() ? this.dispW : this.dispH;
+  }
+
   private computeFitWidth(): number {
     const padW: number = Math.max(120, this.stageW);
     const padH: number = Math.max(120, this.stageH);
-    const aspect: number = this.dispW / Math.max(1, this.dispH);
+    const aspect: number = this.visualW() / Math.max(1, this.visualH());
     if (padW / padH > aspect) {
       return Math.floor(padH * aspect);
     }
@@ -91,11 +112,128 @@ struct EmulatorWindowPage {
   private computeFitHeight(): number {
     const padW: number = Math.max(120, this.stageW);
     const padH: number = Math.max(120, this.stageH);
-    const aspect: number = this.dispW / Math.max(1, this.dispH);
+    const aspect: number = this.visualW() / Math.max(1, this.visualH());
     if (padW / padH > aspect) {
       return Math.floor(padH);
     }
     return Math.floor(padW / aspect);
+  }
+
+  // Unrotated XComponent dimensions (when rotated -90 deg, width/height swap visually to fitW x fitH)
+  private surfaceBoxW(): number {
+    return this.isRotated90() ? this.computeFitHeight() : this.computeFitWidth();
+  }
+
+  private surfaceBoxH(): number {
+    return this.isRotated90() ? this.computeFitWidth() : this.computeFitHeight();
+  }
+
+  private availBarVp(): number {
+    return Math.max(0, this.barVpW - Math.max(152, this.decorRightAvoidVp) - 24);
+  }
+
+  private showRecentsInBar(): boolean {
+    return this.availBarVp() >= 256;
+  }
+
+  private showImeInBar(): boolean {
+    return this.availBarVp() >= 292;
+  }
+
+  private showPopOutInBar(): boolean {
+    return this.availBarVp() >= 328;
+  }
+
+  private showKeymapInBar(): boolean {
+    return supportsPcKeymap() && this.availBarVp() >= 364;
+  }
+
+  private showMacroInBar(): boolean {
+    return supportsPcKeymap() && this.availBarVp() >= 400;
+  }
+
+  private showFpsInBar(): boolean {
+    return this.availBarVp() >= 468;
+  }
+
+  private async applyEmulatorAspectLock(resizeWindow: boolean): Promise<void> {
+    if (getDeviceFormFactor() === 'phone') return;
+    const win: window.Window | undefined = getSlotWindow(0);
+    if (!win) return;
+    let barPx: number = 80;
+    try {
+      barPx = Math.round(this.getUIContext().vp2px(ControlSize.EMU_BAR_H));
+    } catch (_e) {
+    }
+    const vw: number = this.visualW();
+    const vh: number = this.visualH();
+    const isLand: boolean = vw > vh;
+    const targetW: number = isLand ? 1480 : 760;
+    const stageH: number = Math.round(targetW * (vh / Math.max(1, vw)));
+    const targetH: number = stageH + barPx;
+    const ratio: number = targetW / Math.max(1, targetH);
+    try {
+      await win.setContentAspectRatio(ratio, false, false);
+      if (resizeWindow) {
+        await win.resize(targetW, targetH);
+      }
+    } catch (err) {
+      hilog.warn(0x0000, TAG, 'applyEmulatorAspectLock warn: %{public}s', String(err));
+    }
+  }
+
+  private async syncDisplayRotationFromGuest(): Promise<void> {
+    if (this.rotSynced || !native.isWmAgentReady()) return;
+    this.rotSynced = true;
+    try {
+      const raw: string = await native.wmRpcAsync('GET_DISPLAY_ROTATION');
+      const rep: RotationReply = JSON.parse(raw) as RotationReply;
+      if (rep.ok && rep.rotation !== undefined) {
+        const rot: number = rep.rotation & 3;
+        if (rot !== this.displayRotation) {
+          this.displayRotation = rot;
+          native.setDisplay0Rotation(rot);
+          await this.applyEmulatorAspectLock(true);
+        }
+      }
+    } catch (_e) {
+    }
+  }
+
+  private async handleToggleRotation(): Promise<void> {
+    if (!this.wmAgentReady) {
+      this.showToast('等待 Android 14 窗口服务就绪后再旋转');
+      return;
+    }
+    const nextRot: number = this.isRotated90() ? 0 : 1;
+    try {
+      const raw: string = await native.wmRpcAsync(`SET_DISPLAY_ROTATION ${nextRot}`);
+      const rep: RotationReply = JSON.parse(raw) as RotationReply;
+      if (!rep.ok) {
+        this.showToast('屏幕旋转失败');
+        return;
+      }
+      this.displayRotation = nextRot;
+      native.setDisplay0Rotation(nextRot);
+      await this.applyEmulatorAspectLock(true);
+    } catch (err) {
+      hilog.warn(0x0000, TAG, 'handleToggleRotation failed: %{public}s', String(err));
+      this.showToast(`旋转异常：${String(err)}`);
+    }
+  }
+
+  private async handleToggleHostIme(): Promise<void> {
+    if (!this.wmAgentReady) {
+      this.showToast('等待 Android 14 窗口服务就绪');
+      return;
+    }
+    const attachedNow: boolean = await hostImeManager.toggleManualAttach(0);
+    if (attachedNow) {
+      syncHostClipboardToAndroid(false);
+      this.showToast('已直接接管鸿蒙系统输入法，可直接打字');
+    } else {
+      this.showToast('已释放鸿蒙输入法，恢复键鼠直通');
+    }
   }
 
   aboutToAppear(): void {
@@ -136,6 +274,7 @@ struct EmulatorWindowPage {
       native.setDisplayVisible(0, true);
       if (native.isWmAgentReady()) {
         native.wmRpcAsync('FOCUS_DISPLAY 0');
+        this.syncDisplayRotationFromGuest();
       }
       if (supportsPcKeymap()) {
         this.keymapProfile = keymapStore.getProfile(filesDir, '__emulator__');
@@ -148,11 +287,17 @@ struct EmulatorWindowPage {
       try {
         const cur: RuntimeStatus = native.getStatus();
         if (this.running !== cur.running) this.running = cur.running;
-        if (this.wmAgentReady !== cur.wmAgentReady) this.wmAgentReady = cur.wmAgentReady;
+        if (this.wmAgentReady !== cur.wmAgentReady) {
+          this.wmAgentReady = cur.wmAgentReady;
+          if (cur.wmAgentReady) {
+            this.syncDisplayRotationFromGuest();
+          }
+        }
         if (this.fps !== cur.fps) this.fps = cur.fps;
         if (cur.width > 0 && cur.height > 0 && (this.dispW !== cur.width || this.dispH !== cur.height)) {
           this.dispW = cur.width;
           this.dispH = cur.height;
+          this.applyEmulatorAspectLock(false);
         }
         if ((cur.refreshRate === 60 || cur.refreshRate === 90 || cur.refreshRate === 120) &&
             this.refreshRate !== cur.refreshRate) {
@@ -170,6 +315,7 @@ struct EmulatorWindowPage {
       this.pollTimer = -1;
     }
     try {
+      hostImeManager.setWindowActive(0, false);
       native.setKeymapConfig(0, false, '');
       native.setDisplayVisible(0, false);
     } catch (_e) {
@@ -239,12 +385,31 @@ struct EmulatorWindowPage {
   @Builder
   private emuMoreMenuBuilder() {
     Menu() {
-      MenuItem({ content: '音量加' })
-        .onClick(() => { native.sendNavKey('vol_up'); })
-      MenuItem({ content: '音量减' })
-        .onClick(() => { native.sendNavKey('vol_down'); })
-      MenuItem({ content: '电源键 / 锁屏唤醒' })
-        .onClick(() => { native.sendNavKey('power'); })
+      if (!this.showFpsInBar()) {
+        MenuItem({ content: `实时帧率：${this.fps}/${this.refreshRate}Hz` })
+          .enabled(false)
+      }
+      if (!this.showRecentsInBar()) {
+        MenuItem({ content: '多任务视图' })
+          .onClick(() => { native.sendNavKey('recents'); })
+      }
+      if (!this.showImeInBar()) {
+        MenuItem({
+          content: this.hostImeAttachedSlot === 0
+            ? '关闭鸿蒙共享输入法'
+            : '手动唤起鸿蒙共享输入法'
+        })
+          .enabled(this.wmAgentReady)
+          .onClick(() => { this.handleToggleHostIme(); })
+      }
+      MenuItem({ content: this.isRotated90() ? '旋转回竖屏' : '旋转为横屏' })
+        .enabled(this.wmAgentReady)
+        .onClick(() => { this.handleToggleRotation(); })
+      if (!this.showPopOutInBar()) {
+        MenuItem({ content: '拆出前台应用到独立窗口' })
+          .enabled(this.wmAgentReady)
+          .onClick(() => { this.handlePopOutCurrentApp(); })
+      }
       MenuItem({ content: '粘贴鸿蒙剪贴板到 Android' })
         .enabled(this.wmAgentReady)
         .onClick(() => { this.handlePasteClipboard(); })
@@ -262,23 +427,12 @@ struct EmulatorWindowPage {
             this.showMacroPanel = !this.showMacroPanel;
           })
       }
-      MenuItem({ content: '拆出前台应用到独立窗口' })
-        .enabled(this.wmAgentReady)
-        .onClick(() => { this.handlePopOutCurrentApp(); })
-    }
-  }
-
-  private async handleSubmitImeText(): Promise<void> {
-    const txt: string = this.imeDraft;
-    if (txt.length === 0) return;
-    if (!this.wmAgentReady) {
-      this.showToast('等待窗口代理就绪后再发送文本');
-      return;
-    }
-    this.imeDraft = '';
-    const ok: boolean = await sendTextToAndroid(0, txt);
-    if (!ok) {
-      this.showToast('文本提交失败，请确认 Android 输入框已获焦');
+      MenuItem({ content: '音量加' })
+        .onClick(() => { native.sendNavKey('vol_up'); })
+      MenuItem({ content: '音量减' })
+        .onClick(() => { native.sendNavKey('vol_down'); })
+      MenuItem({ content: '电源键 / 锁屏唤醒' })
+        .onClick(() => { native.sendNavKey('power'); })
     }
   }
 
@@ -325,16 +479,17 @@ struct EmulatorWindowPage {
   }
 
   @Builder
-  private topIconBtn(iconRes: Resource, onTap: () => void) {
+  private topIconBtn(iconRes: Resource, active: boolean, onTap: () => void) {
     Button({ type: ButtonType.Normal }) {
       SymbolGlyph(iconRes)
         .fontSize(IconSize.SM)
-        .fontColor([$r('sys.color.icon_primary')])
+        .fontColor([active ? $r('sys.color.brand') : $r('sys.color.icon_primary')])
     }
     .width(ControlSize.BTN_SM)
     .height(ControlSize.BTN_SM)
+    .flexShrink(0)
     .borderRadius(Radius.SM)
-    .backgroundColor(Color.Transparent)
+    .backgroundColor(active ? $r('sys.color.comp_emphasize_tertiary') : Color.Transparent)
     .hoverEffect(HoverEffect.Highlight)
     .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
     .onClick(onTap)
@@ -342,7 +497,7 @@ struct EmulatorWindowPage {
 
   build() {
     Column({ space: 0 }) {
-      // MuMu-Style Ultra-Clean HarmonyOS PC Top Toolbar (40vp, ZERO bottom chrome!)
+      // Responsive HarmonyOS PC Top Toolbar (40vp): collapses secondary items into More (⋮) to prevent clipping
       Row({ space: Spacing.XS }) {
         Row({ space: Spacing.SM }) {
           Stack({ alignContent: Alignment.Center }) {
@@ -355,6 +510,9 @@ struct EmulatorWindowPage {
               .fontSize(IconSize.XS)
               .fontColor([$r('sys.color.icon_on_primary')])
           }
+          .width(24)
+          .height(24)
+          .flexShrink(0)
 
           Text(this.emuInstanceName.length > 0 ? this.emuInstanceName : 'Android 14 · 默认设备')
             .fontSize(FontSize.BODY_MD)
@@ -364,39 +522,51 @@ struct EmulatorWindowPage {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .layoutWeight(1)
 
-          Text(`${this.fps}/${this.refreshRate}Hz`)
-            .fontSize(FontSize.BADGE)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.font_emphasize'))
-            .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
-            .borderRadius(Radius.BADGE)
-            .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
-            .maxLines(1)
+          if (this.showFpsInBar()) {
+            Text(`${this.fps}/${this.refreshRate}Hz`)
+              .fontSize(FontSize.BADGE)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_emphasize'))
+              .padding({ left: Spacing.SM, right: Spacing.SM, top: 2, bottom: 2 })
+              .borderRadius(Radius.BADGE)
+              .backgroundColor($r('sys.color.comp_emphasize_tertiary'))
+              .maxLines(1)
+              .flexShrink(0)
+          }
         }
         .layoutWeight(1)
+        .clip(true)
         .alignItems(VerticalAlign.Center)
 
         Row({ space: Spacing.XS }) {
-          if (supportsPcKeymap()) {
-            this.topIconBtn($r('sys.symbol.gamecontroller'), () => {
+          if (this.showKeymapInBar()) {
+            this.topIconBtn($r('sys.symbol.gamecontroller'), this.keymapProfile.enabled || this.showKeymapEditor, () => {
               this.showMacroPanel = false;
               this.showKeymapEditor = !this.showKeymapEditor;
             })
-            this.topIconBtn($r('sys.symbol.bolt_fill'), () => {
+          }
+          if (this.showMacroInBar()) {
+            this.topIconBtn($r('sys.symbol.bolt_fill'), this.showMacroPanel, () => {
               this.showKeymapEditor = false;
               this.showMacroPanel = !this.showMacroPanel;
             })
           }
-          this.topIconBtn($r('sys.symbol.keyboard'), () => {
-            this.showImeBar = !this.showImeBar;
-            if (this.showImeBar) {
-              syncHostClipboardToAndroid(false);
-            }
+          if (this.showImeInBar()) {
+            this.topIconBtn($r('sys.symbol.keyboard'), this.hostImeAttachedSlot === 0, () => {
+              this.handleToggleHostIme();
+            })
+          }
+          this.topIconBtn($r('sys.symbol.chevron_left'), false, () => { native.sendNavKey('back'); })
+          this.topIconBtn($r('sys.symbol.house'), false, () => { native.sendNavKey('home'); })
+          if (this.showRecentsInBar()) {
+            this.topIconBtn($r('sys.symbol.rectangle_on_rectangle'), false, () => { native.sendNavKey('recents'); })
+          }
+          this.topIconBtn($r('sys.symbol.screen_rotation'), this.isRotated90(), () => {
+            this.handleToggleRotation();
           })
-          this.topIconBtn($r('sys.symbol.chevron_left'), () => { native.sendNavKey('back'); })
-          this.topIconBtn($r('sys.symbol.house'), () => { native.sendNavKey('home'); })
-          this.topIconBtn($r('sys.symbol.rectangle_on_rectangle'), () => { native.sendNavKey('recents'); })
-          this.topIconBtn($r('sys.symbol.arrow_up_right'), () => { this.handlePopOutCurrentApp(); })
+          if (this.showPopOutInBar()) {
+            this.topIconBtn($r('sys.symbol.arrow_up_right'), false, () => { this.handlePopOutCurrentApp(); })
+          }
 
           Button({ type: ButtonType.Normal }) {
             SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
@@ -405,12 +575,14 @@ struct EmulatorWindowPage {
           }
           .width(ControlSize.BTN_SM)
           .height(ControlSize.BTN_SM)
+          .flexShrink(0)
           .borderRadius(Radius.SM)
           .backgroundColor(Color.Transparent)
           .hoverEffect(HoverEffect.Highlight)
           .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
           .bindMenu(this.emuMoreMenuBuilder())
         }
+        .flexShrink(0)
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
@@ -419,8 +591,14 @@ struct EmulatorWindowPage {
       .backgroundColor($r('sys.color.comp_background_primary'))
       .border({ width: { bottom: 0.6 }, color: $r('sys.color.comp_divider') })
       .alignItems(VerticalAlign.Center)
+      .onAreaChange((_oldVal: Area, newVal: Area) => {
+        const w: number = Number(newVal.width);
+        if (w > 100 && Math.abs(w - this.barVpW) >= 1) {
+          this.barVpW = w;
+        }
+      })
 
-      // Full-Height Zero-Copy Vulkan Viewport
+      // Full-Height Zero-Copy Vulkan Viewport (with native RS hardware rotation support)
       Stack({ alignContent: Alignment.Center }) {
         XComponent({
           id: 'svbox_display_0',
@@ -429,8 +607,9 @@ struct EmulatorWindowPage {
         })
           .focusable(true)
           .defaultFocus(true)
-          .width(this.computeFitWidth())
-          .height(this.computeFitHeight())
+          .width(this.surfaceBoxW())
+          .height(this.surfaceBoxH())
+          .rotate({ angle: this.isRotated90() ? -90 : 0 })
           .backgroundColor('#000000')
 
         if (this.keymapProfile.enabled && this.keymapProfile.showHints &&
@@ -483,6 +662,7 @@ struct EmulatorWindowPage {
       }
       .width('100%')
       .layoutWeight(1)
+      .clip(true)
       .backgroundColor('#0D0F14')
       .onAreaChange((_oldVal: Area, newVal: Area) => {
         const w: number = Number(newVal.width);
@@ -492,47 +672,6 @@ struct EmulatorWindowPage {
           this.stageH = h;
         }
       })
-
-      if (this.showImeBar) {
-        Row({ space: Spacing.SM }) {
-          TextInput({ placeholder: '鸿蒙中文输入法桥接：输入后按回车直接上屏到 Android', text: this.imeDraft })
-            .layoutWeight(1)
-            .height(34)
-            .fontSize(FontSize.BODY_MD)
-            .fontColor($r('sys.color.font_primary'))
-            .placeholderColor($r('sys.color.font_tertiary'))
-            .backgroundColor($r('sys.color.background_secondary'))
-            .borderRadius(Radius.MD)
-            .enterKeyType(EnterKeyType.Send)
-            .onChange((val: string) => { this.imeDraft = val; })
-            .onSubmit(() => { this.handleSubmitImeText(); })
-
-          Button('发送', { type: ButtonType.Capsule })
-            .height(32)
-            .padding({ left: Spacing.MD, right: Spacing.MD })
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_on_primary'))
-            .backgroundColor($r('sys.color.brand'))
-            .enabled(this.imeDraft.length > 0 && this.wmAgentReady)
-            .onClick(() => { this.handleSubmitImeText(); })
-
-          PasteButton({ text: PasteDescription.PASTE })
-            .height(32)
-            .fontSize(FontSize.CAPTION)
-            .fontColor($r('sys.color.font_primary'))
-            .backgroundColor($r('sys.color.comp_background_tertiary'))
-            .onClick((_ev: ClickEvent, res: PasteButtonOnClickResult) => {
-              if (res === PasteButtonOnClickResult.SUCCESS) {
-                this.handlePasteClipboard();
-              }
-            })
-        }
-        .width('100%')
-        .padding({ left: Spacing.MD, right: Spacing.MD, top: Spacing.XS + 2, bottom: Spacing.XS + 2 })
-        .backgroundColor($r('sys.color.comp_background_primary'))
-        .border({ width: { top: 0.6 }, color: $r('sys.color.comp_divider') })
-        .alignItems(VerticalAlign.Center)
-      }
     }
     .width('100%')
     .height('100%')

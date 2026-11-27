@@ -75,6 +75,22 @@ public:
     std::string PollWmEventsJson();
     SvboxGfxDisplayStats GetDisplayStats(int32_t displaySlot) const;
 
+    struct ImeState {
+        uint64_t seq = 0;
+        bool active = false;
+        int32_t slot = 0;
+        int32_t inputType = 0;
+        int32_t imeOptions = 0;
+        int32_t showView = 0;
+        uint64_t cursorSeq = 0;
+        int32_t cursorSlot = 0;
+        int32_t cursorX = -1;
+        int32_t cursorY = -1;
+        int32_t cursorH = 24;
+        std::string pkg;
+    };
+    ImeState GetImeState() const;
+
     bool IsRunning() const { return running_.load(); }
     bool IsPaused() const { return paused_.load(); }
     std::string StatusText() const;
@@ -178,6 +194,8 @@ private:
     std::thread wmEventThread_;
     std::mutex wmEventMu_;
     std::vector<std::string> wmEventQueue_;
+    mutable std::mutex imeStateMu_;
+    ImeState imeState_;
     mutable std::mutex slotMapMu_;
     std::string slotPkg_[9];
 };

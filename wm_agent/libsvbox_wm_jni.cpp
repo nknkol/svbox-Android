@@ -290,19 +290,33 @@ Java_org_svbox_wm_SvboxWmAgent_nativeListenUnix(JNIEnv* env, jclass, jstring jPa
     std::string p(path);
     env->ReleaseStringUTFChars(jPath, path);
 
-    unlink(p.c_str());
+    const bool isAbstract = (!p.empty() && p[0] == '@');
+    if (!isAbstract) {
+        unlink(p.c_str());
+    }
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     struct sockaddr_un sa = {};
     sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, p.c_str(), sizeof(sa.sun_path) - 1);
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0 ||
+    socklen_t saLen = sizeof(sa);
+    if (isAbstract) {
+        size_t len = p.size() - 1;
+        if (len > sizeof(sa.sun_path) - 2) len = sizeof(sa.sun_path) - 2;
+        sa.sun_path[0] = '\0';
+        memcpy(sa.sun_path + 1, p.c_str() + 1, len);
+        saLen = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 + len);
+    } else {
+        strncpy(sa.sun_path, p.c_str(), sizeof(sa.sun_path) - 1);
+    }
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&sa), saLen) < 0 ||
         listen(fd, 16) < 0) {
         ALOGE("bind/listen(%s) failed: errno=%d", p.c_str(), errno);
         close(fd);
         return -1;
     }
-    chmod(p.c_str(), 0666);
+    if (!isAbstract) {
+        chmod(p.c_str(), 0666);
+    }
     return fd;
 }
 

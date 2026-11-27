@@ -211,6 +211,11 @@ bool DispatchKeyEventCB(OH_NativeXComponent* component, void*) {
     OH_NativeXComponent_GetKeyEventCode(kev, &code);
     if (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN || act == OH_NATIVEXCOMPONENT_KEY_ACTION_UP) {
         bool down = (act == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN);
+        if (InputBridge::Instance().ShouldSuppressKeyForHostIme(slot, static_cast<int32_t>(code), down)) {
+            // Return false so HarmonyOS InputMethodFramework handles this key cleanly
+            // without double-typing or firing keymap touch macros inside text fields.
+            return false;
+        }
         if (InputBridge::Instance().HandleKeymapKey(slot, static_cast<int32_t>(code), down)) {
             return true;
         }
@@ -1238,6 +1243,72 @@ napi_value InstallLocalApkAsyncNapi(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+napi_value GetImeStateNapi(napi_env env, napi_callback_info) {
+    auto st = AndroidRuntime::Instance().GetImeState();
+    float tapX = -1.0f, tapY = -1.0f;
+    InputBridge::Instance().GetLastPointerPos(st.slot, tapX, tapY);
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    auto setI32 = [&](const char* k, int32_t v) {
+        napi_value nv = nullptr;
+        napi_create_int32(env, v, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    auto setI64 = [&](const char* k, int64_t v) {
+        napi_value nv = nullptr;
+        napi_create_int64(env, v, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    auto setBool = [&](const char* k, bool v) {
+        napi_value nv = nullptr;
+        napi_get_boolean(env, v, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    auto setStr = [&](const char* k, const std::string& v) {
+        napi_value nv = nullptr;
+        napi_create_string_utf8(env, v.c_str(), NAPI_AUTO_LENGTH, &nv);
+        napi_set_named_property(env, obj, k, nv);
+    };
+    setI64("seq", static_cast<int64_t>(st.seq));
+    setBool("active", st.active);
+    setI32("slot", st.slot);
+    setI32("inputType", st.inputType);
+    setI32("imeOptions", st.imeOptions);
+    setI32("showView", st.showView);
+    setI64("cursorSeq", static_cast<int64_t>(st.cursorSeq));
+    setI32("cursorSlot", st.cursorSlot);
+    setI32("cursorX", st.cursorX);
+    setI32("cursorY", st.cursorY);
+    setI32("cursorH", st.cursorH);
+    setI32("lastTapX", static_cast<int32_t>(tapX));
+    setI32("lastTapY", static_cast<int32_t>(tapY));
+    setStr("pkg", st.pkg);
+    return obj;
+}
+
+napi_value SetHostImeActiveNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t slot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    bool active = argc > 1 ? GetBoolArg(env, args[1], false) : false;
+    InputBridge::Instance().SetHostImeActive(slot, active);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
+napi_value SetDisplay0RotationNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t rot = argc > 0 ? GetInt32Arg(env, args[0], 0) : 0;
+    InputBridge::Instance().SetDisplay0Rotation(rot);
+    napi_value out = nullptr;
+    napi_get_boolean(env, true, &out);
+    return out;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     SchedQos::StartCoreTopologyProbeAsync();
 
@@ -1285,6 +1356,9 @@ napi_value Init(napi_env env, napi_value exports) {
         { "setKeymapConfig", nullptr, SetKeymapConfigNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectGamepadButton", nullptr, InjectGamepadButtonNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "injectGamepadAxis", nullptr, InjectGamepadAxisNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getImeState", nullptr, GetImeStateNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setHostImeActive", nullptr, SetHostImeActiveNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setDisplay0Rotation", nullptr, SetDisplay0RotationNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStatus", nullptr, GetStatusNapi, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
