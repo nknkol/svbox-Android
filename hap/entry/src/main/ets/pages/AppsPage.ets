@@ -77,14 +77,14 @@ struct AppsPage {
   aboutToAppear(): void {
     this.iconsDir = native.getIconsDir();
     this.wmAgentReady = native.isWmAgentReady();
-    this.running = native.getStatus().running;
+    this.running = native.getStatus(false).running;
     this.refreshPinnedShortcuts();
     if (this.wmAgentReady && this.appList.length === 0) {
       this.refreshApps(false);
     }
     this.pollTimer = setInterval(() => {
       try {
-        const st = native.getStatus();
+        const st = native.getStatus(false);
         this.running = st.running;
         this.wmAgentReady = st.wmAgentReady;
         if (this.iconsDir.length === 0) {

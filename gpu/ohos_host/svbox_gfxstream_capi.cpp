@@ -1242,8 +1242,12 @@ void svbox_gfx_repaint(void) {
 
 void svbox_gfx_set_visible(int visible) {
     HostState& st = State();
-    st.visible.store(visible != 0);
-    if (visible) {
+    const bool vis = (visible != 0);
+    st.visible.store(vis);
+    if (auto* fb = gfxstream::FrameBuffer::getFB()) {
+        fb->setDisplayVisible(vis);
+    }
+    if (vis) {
         svbox_gfx_repaint();
     }
 }

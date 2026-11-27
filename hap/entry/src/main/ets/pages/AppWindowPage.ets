@@ -291,7 +291,7 @@ struct AppWindowPage {
           this.refreshIconUri();
           this.createAndLaunchDisplay();
         } else {
-          const st: RuntimeStatus = native.getStatus();
+          const st: RuntimeStatus = native.getStatus(false);
           this.bannerText = st.running
             ? `等待 Android 14 窗口服务就绪 (${st.statusText})...`
             : '正在启动 Android 14...';

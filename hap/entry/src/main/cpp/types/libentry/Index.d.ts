@@ -138,4 +138,4 @@ export const getImeState: () => ImeState;
 export const setHostImeActive: (slot: number, active: boolean) => boolean;
 export const setDisplay0Rotation: (rotation: number) => boolean;
 export const notifyWindowActive: (slot: number, active: boolean) => boolean;
-export const getStatus: () => RuntimeStatus;
+export const getStatus: (includeTelemetry?: boolean) => RuntimeStatus;

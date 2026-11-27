@@ -103,10 +103,11 @@ public:
     uint32_t DiskLimitGb() const { return diskLimitGb_.load(); }
     bool IsGmsEnabled() const { return enableGms_.load(); }
     bool IsGmsAvailable() const;
-    SchedQos::Telemetry GetTelemetry();
+    SchedQos::Telemetry GetTelemetry(bool allowRefresh = true);
 
 private:
     AndroidRuntime() = default;
+    void PulseGuestRefreshRate();
     void FlushGuestStateBeforeStop();
     void ReapBootAnimation();
     void BootWorker(std::string mode, int32_t width, int32_t height);
@@ -195,6 +196,10 @@ private:
     std::atomic<uint32_t> activeDisplayMask_{0};
     std::atomic<uint64_t> hideSeq_{0};
     std::atomic<uint64_t> fgBoostSeq_{0};
+    std::atomic<bool> wasHiddenOrBg_{false};
+    std::atomic<bool> pendingRefreshPulse_{false};
+    std::atomic<int64_t> inactiveSinceMs_{0};
+    std::atomic<int64_t> lastRefreshPulseMs_{0};
     std::atomic<bool> trimBusy_{false};
     std::string wmSockPath_;
     std::string iconsHostDir_;

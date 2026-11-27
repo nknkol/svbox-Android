@@ -274,7 +274,7 @@ struct EmulatorWindowPage {
       this.dispH = preset.h;
     }
 
-    const st: RuntimeStatus = native.getStatus();
+    const st: RuntimeStatus = native.getStatus(false);
     if (!st.running && inst) {
       const tempDir: string = this.sandboxTempDir.length > 0
         ? this.sandboxTempDir : '/data/storage/el2/base/haps/entry/temp';
@@ -307,7 +307,7 @@ struct EmulatorWindowPage {
 
     this.pollTimer = setInterval(() => {
       try {
-        const cur: RuntimeStatus = native.getStatus();
+        const cur: RuntimeStatus = native.getStatus(false);
         if (this.running !== cur.running) this.running = cur.running;
         if (this.wmAgentReady !== cur.wmAgentReady) {
           this.wmAgentReady = cur.wmAgentReady;

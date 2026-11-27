@@ -590,7 +590,9 @@ void NotifyForegroundBurst(bool active) {
 
 int ReassertFastAffinity(const std::string& profile,
                          const std::string& customCpuset,
-                         bool forceSweep) {
+                         bool forceSweep,
+                         bool* outWokeFromBg) {
+    if (outWokeFromBg) *outWokeFromBg = false;
     std::string p;
     p.reserve(profile.size());
     for (unsigned char ch : profile) {
@@ -669,6 +671,9 @@ int ReassertFastAffinity(const std::string& profile,
     }
 
     const bool wokeFromBg = g_wasInBgCgroup.exchange(false, std::memory_order_acq_rel);
+    if (wokeFromBg && outWokeFromBg) {
+        *outWokeFromBg = true;
+    }
     const bool selfHasLittle = HasAnyCpuOverlap(curSelf, littleMask);
     const int64_t nowMs = SteadyNowMs();
     const int64_t lastMs = g_lastAffinitySweepMs.load(std::memory_order_relaxed);
@@ -765,7 +770,9 @@ static Telemetry ComputeTelemetryNow(const std::vector<pid_t>& rootPids) {
     if (hd.getAppCpu) t.appCpuPercent = hd.getAppCpu() * 100.0;
     if (hd.getNativeMem) {
         HiDebugNativeMemInfoCompat nmem = {};
-        hd.getNativeMem(&nmem, false);
+        // Use HarmonyOS cached native memory info so polling never walks our
+        // 2+ GB host Vulkan address space and blocks mmap_lock.
+        hd.getNativeMem(&nmem, true);
         uint32_t hostKb = nmem.pss > 0 ? nmem.pss : nmem.rss;
         t.hostNativeRssMb = static_cast<uint32_t>(hostKb / 1024u);
     }
@@ -817,11 +824,16 @@ static Telemetry ComputeTelemetryNow(const std::vector<pid_t>& rootPids) {
     return t;
 }
 
-Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync) {
+Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync, bool allowRefresh) {
     static std::mutex g_telMu;
     static Telemetry g_cachedTel;
     static int64_t g_lastSampleMs = 0;
     static std::atomic<bool> g_sampling{false};
+
+    if (!sync && !allowRefresh) {
+        std::lock_guard<std::mutex> lk(g_telMu);
+        return g_cachedTel;
+    }
 
     auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now().time_since_epoch())
@@ -842,7 +854,7 @@ Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync) {
     {
         std::lock_guard<std::mutex> lk(g_telMu);
         snap = g_cachedTel;
-        needRefresh = (g_lastSampleMs == 0 || (nowMs - g_lastSampleMs) >= 3000);
+        needRefresh = (g_lastSampleMs == 0 || (nowMs - g_lastSampleMs) >= 10000);
     }
     if (needRefresh) {
         bool expected = false;

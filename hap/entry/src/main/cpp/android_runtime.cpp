@@ -1353,18 +1353,23 @@ void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
         }
         if (visible) {
             hideSeq_.fetch_add(1);
-        } else if (prev != 0 && next == 0 && running_.load() && !paused_.load()) {
-            const uint64_t seq = hideSeq_.fetch_add(1) + 1;
-            std::thread([this, seq]() {
-                for (int i = 0; i < 40 && running_.load(); ++i) {
-                    if (hideSeq_.load() != seq || visibleDisplayMask_.load() != 0 || paused_.load()) return;
-                    if (!SleepCancelableMs(500)) return;
-                }
-                if (running_.load() && !paused_.load() &&
-                    hideSeq_.load() == seq && visibleDisplayMask_.load() == 0) {
-                    TrimMemory();
-                }
-            }).detach();
+        } else {
+            if (displaySlot == 0) {
+                wasHiddenOrBg_.store(true, std::memory_order_release);
+            }
+            if (prev != 0 && next == 0 && running_.load() && !paused_.load()) {
+                const uint64_t seq = hideSeq_.fetch_add(1) + 1;
+                std::thread([this, seq]() {
+                    for (int i = 0; i < 40 && running_.load(); ++i) {
+                        if (hideSeq_.load() != seq || visibleDisplayMask_.load() != 0 || paused_.load()) return;
+                        if (!SleepCancelableMs(500)) return;
+                    }
+                    if (running_.load() && !paused_.load() &&
+                        hideSeq_.load() == seq && visibleDisplayMask_.load() == 0) {
+                        TrimMemory();
+                    }
+                }).detach();
+            }
         }
     }
     if (displaySlot == 0) {
@@ -1379,6 +1384,31 @@ void AndroidRuntime::SetDisplayVisible(int32_t displaySlot, bool visible) {
     GfxstreamBridge::Instance().SetDisplayVisible(displaySlot, show);
 }
 
+void AndroidRuntime::PulseGuestRefreshRate() {
+    if (!running_.load() || paused_.load() || !wmAgentReady_.load()) return;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    int64_t prev = lastRefreshPulseMs_.load(std::memory_order_relaxed);
+    if (prev != 0 && (nowMs - prev) < 2500) return;
+    if (!lastRefreshPulseMs_.compare_exchange_strong(prev, nowMs)) return;
+
+    const int32_t hz = refreshRate_.load();
+    const int32_t cfgIdx = (hz >= 105) ? 2 : ((hz >= 75) ? 1 : 0);
+    const int32_t altCfg = (cfgIdx == 0) ? 1 : 0;
+    // Seamlessly toggle Display 0 through an alternate same-group HWC2 refresh config
+    // (60/90/120Hz share CONFIG_GROUP=0 in hwcomposer_ranchu) and back to cfgIdx.
+    // SurfaceFlinger dispatches AChoreographer refresh-rate callbacks so games using
+    // Android GameSDK Swappy immediately rebuild ChoreographerFilter::Timer and reset
+    // mAutoSwapInterval/mFrameDurations upon returning from HarmonyOS background throttling.
+    std::ostringstream cmd;
+    cmd << "service call SurfaceFlinger 1035 i32 " << altCfg
+        << "; sleep 0.12; service call SurfaceFlinger 1035 i32 " << cfgIdx;
+    bool ok = RunGuestCmd(cmd.str(), androidDir_ + "/hap_logs/refresh_pulse.log");
+    OH_LOG_INFO(LOG_APP, "PulseGuestRefreshRate(hz=%{public}d, alt=%{public}d->cfg=%{public}d) -> %{public}d",
+                hz, altCfg, cfgIdx, ok ? 1 : 0);
+}
+
 void AndroidRuntime::OnWindowActiveChanged(int32_t displaySlot, bool active) {
     if (displaySlot < 0 || displaySlot >= 16) return;
     const uint32_t bit = 1u << static_cast<uint32_t>(displaySlot);
@@ -1387,7 +1417,21 @@ void AndroidRuntime::OnWindowActiveChanged(int32_t displaySlot, bool active) {
     while (!activeDisplayMask_.compare_exchange_weak(prev, next)) {
         next = active ? (prev | bit) : (prev & ~bit);
     }
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
     if (active) {
+        const bool wasHidden = (displaySlot == 0)
+                                   ? wasHiddenOrBg_.exchange(false, std::memory_order_acq_rel)
+                                   : false;
+        const int64_t inactiveSince = (displaySlot == 0)
+                                          ? inactiveSinceMs_.exchange(0, std::memory_order_acq_rel)
+                                          : 0;
+        const bool longInactive = (inactiveSince > 0 && (nowMs - inactiveSince) >= 1500);
+        if (displaySlot == 0 && (wasHidden || longInactive)) {
+            pendingRefreshPulse_.store(true, std::memory_order_release);
+        }
+
         SetDisplayVisible(displaySlot, true);
         if (!running_.load() || paused_.load()) return;
         std::string prof, custom;
@@ -1400,17 +1444,45 @@ void AndroidRuntime::OnWindowActiveChanged(int32_t displaySlot, bool active) {
         // Run immediately + at +150ms + +500ms off the UI thread so we catch
         // HarmonyOS CgroupSched's asynchronous /key-background -> /top-app migration
         // that overwrites thread CPU affinity back to 0..N-1 (including slow little cores).
-        std::thread([this, seq, prof, custom]() {
+        // Latch pendingRefreshPulse_ across back-to-back onForeground + WINDOW_ACTIVE
+        // callbacks so a newer seq never drops the pulse after an earlier seq consumed
+        // wasHidden / inactiveSince / wokeFromBg.
+        std::thread([this, seq, prof, custom, displaySlot]() {
+            bool woke = false;
             SchedQos::NotifyForegroundBurst(true);
-            SchedQos::ReassertFastAffinity(prof, custom, true);
-            const int delaysMs[] = { 150, 350 };
-            for (int d : delaysMs) {
-                if (!SleepCancelableMs(d)) return;
+            SchedQos::ReassertFastAffinity(prof, custom, true, &woke);
+            if (woke) pendingRefreshPulse_.store(true, std::memory_order_release);
+
+            if (!SleepCancelableMs(150)) return;
+            if (fgBoostSeq_.load() != seq || !running_.load() || paused_.load()) return;
+            SchedQos::ReassertFastAffinity(prof, custom, true, &woke);
+            if (woke) pendingRefreshPulse_.store(true, std::memory_order_release);
+
+            bool pulsed = false;
+            if (displaySlot == 0 && pendingRefreshPulse_.load(std::memory_order_acquire)) {
+                if (!SleepCancelableMs(200)) return;
                 if (fgBoostSeq_.load() != seq || !running_.load() || paused_.load()) return;
-                SchedQos::ReassertFastAffinity(prof, custom, true);
+                SchedQos::ReassertFastAffinity(prof, custom, true, &woke);
+                if (pendingRefreshPulse_.exchange(false, std::memory_order_acq_rel)) {
+                    PulseGuestRefreshRate();
+                    pulsed = true;
+                }
+            }
+
+            if (!SleepCancelableMs(pulsed ? 150 : 350)) return;
+            if (fgBoostSeq_.load() != seq || !running_.load() || paused_.load()) return;
+            SchedQos::ReassertFastAffinity(prof, custom, true, &woke);
+            if (woke) pendingRefreshPulse_.store(true, std::memory_order_release);
+            if (!pulsed && displaySlot == 0 &&
+                pendingRefreshPulse_.exchange(false, std::memory_order_acq_rel)) {
+                PulseGuestRefreshRate();
             }
         }).detach();
     } else {
+        if (displaySlot == 0) {
+            int64_t expectedZero = 0;
+            inactiveSinceMs_.compare_exchange_strong(expectedZero, nowMs, std::memory_order_acq_rel);
+        }
         if (next == 0) {
             SchedQos::NotifyForegroundBurst(false);
         }
@@ -1435,8 +1507,12 @@ void AndroidRuntime::MaybeReassertForegroundAffinityAsync() {
         prof = profile_;
         custom = customCpuset_;
     }
-    std::thread([prof, custom]() {
-        SchedQos::ReassertFastAffinity(prof, custom, false);
+    std::thread([this, prof, custom]() {
+        bool wokeFromBg = false;
+        SchedQos::ReassertFastAffinity(prof, custom, false, &wokeFromBg);
+        if (wokeFromBg) {
+            PulseGuestRefreshRate();
+        }
         sBusy.store(false, std::memory_order_release);
     }).detach();
 }
@@ -1731,13 +1807,13 @@ AndroidRuntime::ImeState AndroidRuntime::GetImeState() const {
     return imeState_;
 }
 
-SchedQos::Telemetry AndroidRuntime::GetTelemetry() {
+SchedQos::Telemetry AndroidRuntime::GetTelemetry(bool allowRefresh) {
     std::vector<pid_t> pidsCopy;
-    {
+    if (allowRefresh) {
         std::lock_guard<std::mutex> lk(procMu_);
         pidsCopy = pids_;
     }
-    return SchedQos::SampleTelemetry(pidsCopy);
+    return SchedQos::SampleTelemetry(pidsCopy, false, allowRefresh);
 }
 
 bool AndroidRuntime::WaitForConditionMs(int maxMs, const std::function<bool()>& pred) const {

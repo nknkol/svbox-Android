@@ -1248,6 +1248,22 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
   - **真机实测（`HAD-W32` · 《棕色尘埃 2》3D 旅馆场景，全程不旋转屏幕）**：
     - 启动拓扑精准识别 `20c (sys: L=4 M=8 B=8) [L=0-3 M=4-11 B=12-19]`，前台锁定 **`8-19`** 稳跑 **`60.3 FPS`**；
     - 切至终端触发 `APP_NAP` 迁入 `3:cpuset:/key-background (0-11)` 后，直接切回 `EmulatorWindowAbility`（不点旋转）：`52 ms` 内自动重申 `SetExpectedFrameRateRange` 并重绑 **1,204 条** 宿主+容器线程至 `8-19`（`wokeFromBg=1`），稳态零重复刷屏，顶栏与实测帧率立回 **`60/120Hz`（`59.7–60.3 FPS`）**，3D 旅馆画面零瑕疵。
+- **2026-11-27 彻底根治后台掉至 30 FPS 后回归前台锁 30 / 缓爬 40–45 FPS 不回满 60 FPS（`Swappy` `ChoreographerFilter` 谐波混叠锁死 + 宿主机 `smaps_rollup` 55.7% 轮询抖动 + 最小化 `DisplayVk` 阻塞）**：
+  - **三层根因实证（`HAD-W32` · `SWAPPY_DIAG` + `hiperf` + GameSDK 源码交叉验证）**：
+    1. **Android GameSDK `Swappy` `ChoreographerFilter::Timer` 谐波混叠锁死（主因）**：容器在鸿蒙侧退至 `/key-background` 时，Android 侧 Activity 未触发 `onPause`，`SwappyChoreographer` 在受限核上持续以延迟壁钟时间（`steady_clock::now()`）触发回调；`ChoreographerFilter::Timer::addTimestamp()` 使用无上下界钳位的指数平滑 `mRefreshPeriod += delta / 25`，将内部 `mRefreshPeriod` 从 `8.333 ms`（120Hz）拉漂至 `16.667 ms`（`2×` 谐波固定点 → 锁死 `30.0 FPS`）或 `11.1–12.5 ms`（`40–45 FPS` 伪固定点）。切回前台后即使 `swGpu ≈ 5.4 ms`、`swCpuEst ≈ 8.5 ms`、且全核恢复 `8-19`，`Timer` 仍长期锁死在谐波点（实测可锁 150s+ 并沿 `30.0 → 36.4 → 44.9 → 47.5 → 49.6 → 53.1 → 60.0` 缓慢指数衰减）；此前唯有旋转屏幕重建 Swapchain / `ChoreographerFilter` 才能立即脱锁。
+    2. **宿主机 `SampleTelemetry()` 每 3 秒扫描全容器 `/proc/<pid>/smaps_rollup` 烧掉 55.7% CPU 并制造 22–34 ms `mmap_lock` 卡顿**：`EmulatorWindowPage.ets`（250ms）与后台常驻的 `Index.ets`（500ms）持续调用 `native.getStatus()`，反复触发 `ReadProcPssKb()` 遍历全部 63 个 Android 进程页表并传 `useCache=false` 调用 `OH_HiDebug_GetAppNativeMemInfoWithCache`；`hiperf` 实测 `fread_unlocked (28.34%) + fseeko (27.37%) = 55.71%` 宿主 CPU，对游戏进程单次 `smaps_rollup` 持锁 `22–34 ms`，持续破坏 `SwappyCommon::updateSwapInterval()` 的 `missedFramesPercent == 0` 升档门限。
+    3. **主屏 `svbox_gfx_set_visible(0)` 未接入 `FrameBuffer::postImpl()`**：最小化窗口触发 `onBackground()` 后，`FrameBuffer::postImpl()` 仍持续向已暂停的鸿蒙 `OHNativeWindow` 提交 `DisplayVk::post()` / `vkAcquireNextImageKHR(UINT64_MAX)`，约 10.9s 后触发 `<HM_GPU> # Wait fence all time out` 与 `[E/SwappyVk] Failed to wait for fence 2`，进一步拖垮 `SwappyVk` 状态机。
+  - **三项通用修复（零游戏特判，Layer 1 `svbox` 与只读 `rootfs14/` 0 字节改动）**：
+    - **前台回归无缝同组刷新率脉冲复位 `Swappy`**（`hap/entry/src/main/cpp/android_runtime.{h,cpp}` + `ohos_bridge/{include/ohos_bridge/sched_qos.h,src/sched_qos.cpp}`）：`ReassertFastAffinity()` 暴露 `outWokeFromBg`；在 `OnWindowActiveChanged(0, true)`（使用 `pendingRefreshPulse_` 原子锁存防止 `onForeground` 与 `WINDOW_ACTIVE` 连续触发时被新 `seq` 取消）及 `MaybeReassertForegroundAffinityAsync()` 检出 `wokeFromBg` 时，待快核亲和性恢复后（`+350ms`，2.5s 防抖）通过 `RunGuestCmd()` 以容器内 `root` 身份经 `SurfaceFlinger` 事务 `1035` 执行无缝同组（`CONFIG_GROUP=0`）刷新率脉冲（如 `120Hz → 60Hz (120ms) → 120Hz` / `60Hz → 90Hz → 60Hz`），零黑屏零重建地触发 `AChoreographer_registerRefreshRateCallback` → `ChoreographerFilter::onSettingsChanged()` 重建零漂移 `Timer` 并清零 `SwappyCommon::mFrameDurations` 与 `mAutoSwapInterval`。
+    - **游戏态零 `smaps_rollup` 轮询**（`ohos_bridge/src/sched_qos.cpp`、`napi_init.cpp`、`Index.d.ts`、`EntryAbility.ets`、`Index.ets`、`EmulatorWindowPage.ets`、`AppWindowPage.ets`、`AppsPage.ets`）：`getStatus(includeTelemetry?: boolean)` 支持按需跳过采样，游戏窗口及后台 `EntryAbility`（监听 `onForeground/onBackground` + `WINDOW_ACTIVE/WINDOW_INACTIVE`）均传 `false`；`HiDebug` 改传 `useCache=true`，面板异步采样间隔提至 `10s`。
+    - **主屏隐藏真正跳过 `DisplayVk::post()`**（`gpu/ohos_host/apply_host_patches.py` Patch #26 + `gpu/ohos_host/svbox_gfxstream_capi.cpp`）：为 `FrameBuffer` 新增 `m_displayVisible` 原子开关与 `setDisplayVisible()`，`postImpl()` 在隐藏态直接跳过 `PostWorkerVk` 并正确释放 `ColorBuffer` 引用计数，恢复可见时立即 `repost()` 刷出最新帧。
+  - **真机端到端验收（`HAD-W32` · 120Hz Vulkan · 《棕色尘埃 2》，无旋转、无人工干预）**：
+    - **`hiperf` 热点对比**：`org.svbox.android` 宿主 `fread_unlocked`/`fseeko` 由 **`55.71%` 降至 `0.00%`**；
+    - **连续 2 轮 `/key-background` + 10s 满核压降 → 零旋转自动回归前台**：
+      - 基线前台：**`60.2 FPS`**；
+      - 第 1 轮回归：`+0.4s` 自动完成 `60Hz → 120Hz` 无缝脉冲，首窗口即恢复 **`59.6 → 59.6 → 60.2 FPS`**；
+      - 第 2 轮回归：`+0.5s` 自动完成 `60Hz → 120Hz` 无缝脉冲，首窗口即恢复 **`57.9 → 59.7 → 59.7 FPS`**；
+      - 全程零 `<HM_GPU> # Wait fence all time out`，零 `[E/SwappyVk] Failed to wait for fence 2`，且临时 `SWAPPY_DIAG` 探针已完全回滚并核验二进制无残留。
 
 
 

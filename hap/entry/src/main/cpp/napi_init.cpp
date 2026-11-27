@@ -1162,7 +1162,12 @@ napi_value EnsureDirNapi(napi_env env, napi_callback_info info) {
     return out;
 }
 
-napi_value GetStatusNapi(napi_env env, napi_callback_info) {
+napi_value GetStatusNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    const bool includeTelemetry = (argc > 0) ? GetBoolArg(env, args[0], true) : true;
+
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
 
@@ -1198,7 +1203,7 @@ napi_value GetStatusNapi(napi_env env, napi_callback_info) {
     auto& inp = InputBridge::Instance();
     auto& aud = AudioBridge::Instance();
     rt.MaybeReassertForegroundAffinityAsync();
-    auto tel = rt.GetTelemetry();
+    auto tel = rt.GetTelemetry(includeTelemetry);
     auto topo = SchedQos::GetCoreTopology();
     const bool useGfx = rt.UseGfxstream();
 

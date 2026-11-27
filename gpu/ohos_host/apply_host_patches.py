@@ -2294,6 +2294,73 @@ def main() -> None:
         "VkCommonOperations guard updateColorBufferFromBytesLocked on initialized",
     )
 
+    # 26. FrameBuffer: honor display visibility on primary display slot 0 so
+    #     minimizing the OHOS window (onBackground -> svbox_gfx_set_visible(0))
+    #     skips host DisplayVk swapchain acquire/present instead of blocking on
+    #     a paused OHNativeWindow (which caused <HM_GPU> 10s fence timeouts and
+    #     SwappyVk fence stalls). On restore, setDisplayVisible(true) + repost()
+    #     immediately presents m_lastPostedColorBuffer.
+    fb_h = os.path.join(gfx, "host/FrameBuffer.h")
+    fb_cpp = os.path.join(gfx, "host/FrameBuffer.cpp")
+    patch_file(
+        fb_h,
+        "    bool repost(bool needLockAndBind = true);\n",
+        "    bool repost(bool needLockAndBind = true);\n"
+        "    void setDisplayVisible(bool visible) { m_displayVisible.store(visible, std::memory_order_release); }\n"
+        "    bool isDisplayVisible() const { return m_displayVisible.load(std::memory_order_acquire); }\n",
+        "FrameBuffer.h setDisplayVisible",
+    )
+    patch_file(
+        fb_h,
+        "    bool m_shuttingDown = false;\n",
+        "    bool m_shuttingDown = false;\n"
+        "    std::atomic<bool> m_displayVisible{true};\n",
+        "FrameBuffer.h m_displayVisible field",
+    )
+    patch_file(
+        fb_cpp,
+        "    colorBuffer->touch();\n"
+        "    if (m_subWin) {\n"
+        "        Post postCmd;\n"
+        "        postCmd.cmd = PostCmd::Post;\n"
+        "        postCmd.cb = colorBuffer.get();\n"
+        "        postCmd.cbHandle = p_colorbuffer;\n"
+        "        postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);\n"
+        "        sendPostWorkerCmd(std::move(postCmd));\n"
+        "        ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;\n"
+        "    } else {\n"
+        "        // If there is no sub-window, don't display anything, the client will\n"
+        "        // rely on m_onPost to get the pixels instead.\n"
+        "        ret = AsyncResult::OK_AND_CALLBACK_NOT_SCHEDULED;\n"
+        "    }\n",
+        "    colorBuffer->touch();\n"
+        "    const bool doDisplayPost = m_subWin && m_displayVisible.load(std::memory_order_acquire);\n"
+        "    if (doDisplayPost) {\n"
+        "        Post postCmd;\n"
+        "        postCmd.cmd = PostCmd::Post;\n"
+        "        postCmd.cb = colorBuffer.get();\n"
+        "        postCmd.cbHandle = p_colorbuffer;\n"
+        "        postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);\n"
+        "        sendPostWorkerCmd(std::move(postCmd));\n"
+        "        ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;\n"
+        "    } else {\n"
+        "        // Headless or hidden OHOS window: skip host DisplayVk post so a paused\n"
+        "        // OHNativeWindow never blocks SurfaceFlinger / SwappyVk fences.\n"
+        "        ret = AsyncResult::OK_AND_CALLBACK_NOT_SCHEDULED;\n"
+        "    }\n",
+        "FrameBuffer.cpp postImpl honor m_displayVisible",
+    )
+    patch_file(
+        fb_cpp,
+        "    if (!m_subWin) {  // m_subWin is supposed to be false\n"
+        "        decColorBufferRefCountLocked(p_colorbuffer);\n"
+        "    }\n",
+        "    if (!doDisplayPost) {  // Refcount is normally decremented by PostWorker\n"
+        "        decColorBufferRefCountLocked(p_colorbuffer);\n"
+        "    }\n",
+        "FrameBuffer.cpp postImpl decRefCount when hidden",
+    )
+
 
 if __name__ == "__main__":
     main()

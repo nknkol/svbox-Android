@@ -179,9 +179,11 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    AppStorage.setOrCreate<boolean>('entryForeground', true);
   }
 
   onBackground(): void {
+    AppStorage.setOrCreate<boolean>('entryForeground', false);
   }
 
   onDestroy(): void {
@@ -195,6 +197,13 @@ export default class EntryAbility extends UIAbility {
   onWindowStageCreate(windowStage: window.WindowStage): void {
     try {
       this.mainWindow = windowStage.getMainWindowSync();
+      this.mainWindow.on('windowEvent', (ev: window.WindowEventType) => {
+        if (ev === window.WindowEventType.WINDOW_ACTIVE) {
+          AppStorage.setOrCreate<boolean>('entryForeground', true);
+        } else if (ev === window.WindowEventType.WINDOW_INACTIVE) {
+          AppStorage.setOrCreate<boolean>('entryForeground', false);
+        }
+      });
     } catch (e) {
       hilog.error(0x0000, TAG, 'getMainWindowSync failed: %{public}s', String(e));
     }

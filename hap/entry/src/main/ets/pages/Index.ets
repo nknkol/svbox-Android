@@ -385,7 +385,8 @@ struct Index {
         }
       }
 
-      const st: RuntimeStatus = native.getStatus();
+      const entryFg: boolean = AppStorage.get<boolean>('entryForeground') ?? true;
+      const st: RuntimeStatus = native.getStatus(entryFg);
       const runningChanged: boolean = st.running !== this.running;
       if (runningChanged) {
         this.runAnimated(Motion.SPRING_SMOOTH, Motion.DUR_SHORT, () => {

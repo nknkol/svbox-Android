@@ -55,12 +55,15 @@ std::string ResolveCpuset(const std::string& profile,
 // sched_setaffinity masks back to all cores (0..N-1). Returns count of repinned threads.
 int ReassertFastAffinity(const std::string& profile,
                          const std::string& customCpuset,
-                         bool forceSweep = false);
+                         bool forceSweep = false,
+                         bool* outWokeFromBg = nullptr);
 
 // HarmonyOS API 26 FASTKit process-level scene PerfHint (never passes SetTids so
 // permanent OH_QoS_SetThreadQoS levels are untouched).
 void NotifyForegroundBurst(bool active);
 
-Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids, bool sync = false);
+Telemetry SampleTelemetry(const std::vector<pid_t>& rootPids,
+                          bool sync = false,
+                          bool allowRefresh = true);
 
 } // namespace SchedQos
