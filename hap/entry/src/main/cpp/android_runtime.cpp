@@ -553,12 +553,16 @@ inline uint64_t OwnerHash(uint64_t dev, uint64_t ino) {
 }
 
 void EnsureOwnerDb(const std::string& path) {
-    const off_t kExpectedSize = static_cast<off_t>(sizeof(OwnerHdr) + 65536u * sizeof(OwnerRec));
+    // 1M slots (~32 MiB sparse file, max 917,504 records at 7/8 load) avoids ENOSPC
+    // when large Unity/Unreal games create tens of thousands of cached asset files.
+    constexpr uint32_t kMinCapacity = 1048576u;
+    constexpr uint32_t kMaxCapacity = 16777216u;
+    const off_t kMinLegacySize = static_cast<off_t>(sizeof(OwnerHdr) + 65536u * sizeof(OwnerRec));
     int fd = open(path.c_str(), O_RDWR);
     if (fd >= 0) {
         struct stat st = {};
         OwnerHdr hdr = {};
-        if (fstat(fd, &st) == 0 && st.st_size >= kExpectedSize &&
+        if (fstat(fd, &st) == 0 && st.st_size >= kMinLegacySize &&
             pread(fd, &hdr, sizeof(hdr), 0) == static_cast<ssize_t>(sizeof(hdr)) &&
             std::memcmp(hdr.magic, "ELFOWN1\0", 8) == 0 && hdr.capacity >= 65536u &&
             (hdr.capacity & (hdr.capacity - 1u)) == 0 &&
@@ -570,8 +574,8 @@ void EnsureOwnerDb(const std::string& path) {
                 if (hdr.version & 1u) hdr.version += 1u;
                 (void)pwrite(fd, &hdr, sizeof(hdr), 0);
             }
-            // Compact tombstones before container boot if table exceeds 50% load.
-            if (hdr.count > hdr.capacity / 2u) {
+            // Grow legacy small tables or compact/grow before container boot if load > 50%.
+            if (hdr.capacity < kMinCapacity || hdr.count > hdr.capacity / 2u) {
                 const size_t mapLen = sizeof(OwnerHdr) + static_cast<size_t>(hdr.capacity) * sizeof(OwnerRec);
                 void* mem = mmap(nullptr, mapLen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                 if (mem != MAP_FAILED) {
@@ -583,6 +587,61 @@ void EnsureOwnerDb(const std::string& path) {
                         if (recs[i].flags != 0 && !(recs[i].flags & kOwnerDead)) {
                             live.push_back(recs[i]);
                         }
+                    }
+                    uint32_t targetCap = h->capacity < kMinCapacity ? kMinCapacity : h->capacity;
+                    while (static_cast<uint64_t>(live.size()) * 2ull >= targetCap && targetCap < kMaxCapacity) {
+                        targetCap <<= 1u;
+                    }
+                    if (targetCap > h->capacity) {
+                        const uint32_t oldCap = h->capacity;
+                        const uint32_t nextVer = (h->version & ~1u) + 2u;
+                        munmap(mem, mapLen);
+                        close(fd);
+                        const std::string tmpPath = path + ".grow.tmp";
+                        unlink(tmpPath.c_str());
+                        int nfd = open(tmpPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+                        if (nfd >= 0) {
+                            const size_t newLen = sizeof(OwnerHdr) + static_cast<size_t>(targetCap) * sizeof(OwnerRec);
+                            if (ftruncate(nfd, static_cast<off_t>(newLen)) == 0) {
+                                void* nmem = mmap(nullptr, newLen, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
+                                if (nmem != MAP_FAILED) {
+                                    auto* nh = static_cast<OwnerHdr*>(nmem);
+                                    std::memset(nh, 0, sizeof(OwnerHdr));
+                                    std::memcpy(nh->magic, "ELFOWN1\0", 8);
+                                    nh->capacity = targetCap;
+                                    auto* nrecs = reinterpret_cast<OwnerRec*>(nh + 1);
+                                    const uint32_t nmask = targetCap - 1u;
+                                    uint32_t newCount = 0;
+                                    uint32_t newSymlinks = 0;
+                                    for (const auto& r : live) {
+                                        uint32_t at = static_cast<uint32_t>(OwnerHash(r.dev, r.ino)) & nmask;
+                                        for (uint32_t n = 0; n <= nmask; ++n, at = (at + 1u) & nmask) {
+                                            if (nrecs[at].flags == 0) {
+                                                nrecs[at] = r;
+                                                ++newCount;
+                                                if (r.flags & kOwnerSymlink) ++newSymlinks;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    nh->count = newCount;
+                                    nh->symlinks = newSymlinks;
+                                    nh->version = nextVer;
+                                    munmap(nmem, newLen);
+                                    close(nfd);
+                                    if (rename(tmpPath.c_str(), path.c_str()) == 0) {
+                                        OH_LOG_INFO(LOG_APP, "EnsureOwnerDb: grew %s cap %u -> %u (live=%u)",
+                                                    path.c_str(), oldCap, targetCap, newCount);
+                                        return;
+                                    }
+                                    unlink(tmpPath.c_str());
+                                    return;
+                                }
+                            }
+                            close(nfd);
+                            unlink(tmpPath.c_str());
+                        }
+                        return;
                     }
                     std::memset(recs, 0, static_cast<size_t>(h->capacity) * sizeof(OwnerRec));
                     const uint32_t mask = h->capacity - 1u;
@@ -615,10 +674,43 @@ void EnsureOwnerDb(const std::string& path) {
     if (fd < 0) return;
     OwnerHdr hdr = {};
     std::memcpy(hdr.magic, "ELFOWN1\0", 8);
-    hdr.capacity = 65536u;
+    hdr.capacity = kMinCapacity;
     (void)write(fd, &hdr, sizeof(hdr));
-    (void)ftruncate(fd, kExpectedSize);
+    (void)ftruncate(fd, static_cast<off_t>(sizeof(OwnerHdr) + static_cast<size_t>(kMinCapacity) * sizeof(OwnerRec)));
     close(fd);
+}
+
+// One-time lossless migration for app external data that previously landed under
+// ephemeral runBase_/mnt/user/0/emulated/0 before /mnt/user/0/emulated was bound
+// to persistent dataBase_/data/media. Uses same-filesystem rename() so inodes and
+// owner.db entries stay intact and multi-GB game data moves in milliseconds.
+int MergeDirMove(const std::string& srcDir, const std::string& dstDir) {
+    DIR* d = opendir(srcDir.c_str());
+    if (!d) return 0;
+    MkdirP(dstDir);
+    int moved = 0;
+    while (struct dirent* e = readdir(d)) {
+        if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) continue;
+        std::string sp = srcDir + "/" + e->d_name;
+        std::string dp = dstDir + "/" + e->d_name;
+        struct stat sst = {};
+        if (lstat(sp.c_str(), &sst) != 0) continue;
+        struct stat dst = {};
+        if (lstat(dp.c_str(), &dst) != 0) {
+            if (rename(sp.c_str(), dp.c_str()) == 0) {
+                ++moved;
+            }
+        } else if (S_ISDIR(sst.st_mode) && S_ISDIR(dst.st_mode)) {
+            moved += MergeDirMove(sp, dp);
+            rmdir(sp.c_str());
+        } else if (!S_ISDIR(sst.st_mode) && !S_ISDIR(dst.st_mode)) {
+            if (rename(sp.c_str(), dp.c_str()) == 0) {
+                ++moved;
+            }
+        }
+    }
+    closedir(d);
+    return moved;
 }
 
 // Clear stale (st_dev, st_ino) records in persistent owner.db for host-created
@@ -1742,6 +1834,17 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
         mounts.push_back(dataBase_ + "/data/media/0:/storage/emulated/0");
         mounts.push_back("-v");
         mounts.push_back(dataBase_ + "/data/media/0:/storage/self/primary");
+        // Android 14 Zygote MountEmulatedStorage() bind-mounts /mnt/user/0/emulated onto
+        // /storage/emulated for every app process; bind all Android 14 scoped-storage views
+        // to persistent dataBase_/data/media so app external files never land in ephemeral runBase_.
+        mounts.push_back("-v");
+        mounts.push_back(dataBase_ + "/data/media:/mnt/user/0/emulated");
+        mounts.push_back("-v");
+        mounts.push_back(dataBase_ + "/data/media:/mnt/pass_through/0/emulated");
+        mounts.push_back("-v");
+        mounts.push_back(dataBase_ + "/data/media:/mnt/androidwritable/0/emulated");
+        mounts.push_back("-v");
+        mounts.push_back(dataBase_ + "/data/media:/mnt/installer/0/emulated");
     }
     if (!shareHostDir_.empty() && FileExists(shareHostDir_)) {
         mounts.push_back("-v");
@@ -1753,6 +1856,8 @@ std::vector<std::string> AndroidRuntime::BaseSvboxArgs(bool includeStorageSubmou
             mounts.push_back(shareHostDir_ + ":/storage/emulated/0/Download/HarmonyShare:rw,nomnt");
             mounts.push_back("-v");
             mounts.push_back(shareHostDir_ + ":/storage/self/primary/Download/HarmonyShare:rw,nomnt");
+            mounts.push_back("-v");
+            mounts.push_back(shareHostDir_ + ":/mnt/user/0/emulated/0/Download/HarmonyShare:rw,nomnt");
         }
     }
     args.insert(args.end(), mounts.begin(), mounts.end());
@@ -2744,7 +2849,7 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         "/sys_fs_bpf", "/sys_fs_bpf/netd_shared", "/sys_fs_bpf/net_shared",
         "/sys_power", "/dev_input", "/dev_bus_usb", "/dev_bus_usb/001", "/cpuset", "/cpuset/foreground", "/cpuset/background",
         "/cpuset/system-background", "/cpuset/top-app", "/stune", "/stune/foreground",
-        "/stune/background", "/stune/top-app", "/mnt/user/0", "/mnt/expand",
+        "/stune/background", "/stune/top-app", "/mnt/user/0", "/mnt/user/0/emulated", "/mnt/expand",
         "/mnt/runtime/default/emulated/0", "/mnt/runtime/read/emulated/0",
         "/mnt/runtime/write/emulated/0", "/mnt/runtime/full/emulated/0",
         "/mnt/pass_through/0/emulated/0", "/mnt/installer/0/emulated/0",
@@ -2801,6 +2906,17 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
     chmod((dataBase_ + "/data/misc/shared_relro").c_str(), 01777);
     if (!shareHostDir_.empty()) {
         MkdirP(shareHostDir_);
+    }
+    {
+        const std::string legacyEmulated = runBase_ + "/mnt/user/0/emulated/0";
+        if (FileExists(legacyEmulated)) {
+            int moved = MergeDirMove(legacyEmulated, dataBase_ + "/data/media/0");
+            rmdir(legacyEmulated.c_str());
+            if (moved > 0) {
+                OH_LOG_INFO(LOG_APP, "Migrated %d entries from ephemeral %s to persistent %s/data/media/0",
+                            moved, legacyEmulated.c_str(), dataBase_.c_str());
+            }
+        }
     }
 
     // Measure actual /data usage on host so svbox --disk-used-mb reflects real storage consumption
