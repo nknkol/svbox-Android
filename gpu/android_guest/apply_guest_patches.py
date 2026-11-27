@@ -172,6 +172,14 @@ def main() -> None:
         """        auto it = info_VkDeviceMemory.find(memory);
         if (it == info_VkDeviceMemory.end()) return;
         auto& info = it->second;
+        if (info.isMapped) {
+            const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
+            if (info.memoryTypeIndex < props.memoryTypeCount &&
+                (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                if (mMappedCoherentCount > 0) --mMappedCoherentCount;
+            }
+        }
         info.isMapped = false;
         if (info.flushShadowPtr && info.flushShadowSize > 0) {
             munmap(info.flushShadowPtr, info.flushShadowSize);
@@ -195,7 +203,15 @@ def main() -> None:
         VkDeviceMemory) {
         // no-op
     }""",
-        """        info.isMapped = true;
+        """        if (!info.isMapped) {
+            const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
+            if (info.memoryTypeIndex < props.memoryTypeCount &&
+                (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                ++mMappedCoherentCount;
+            }
+        }
+        info.isMapped = true;
         info.mapOffset = offset;
         info.mapSize = (size == VK_WHOLE_SIZE)
                            ? ((info.mappedSize > offset) ? (info.mappedSize - offset) : 0)
@@ -293,12 +309,17 @@ def main() -> None:
                 auto& info = it->second;
                 if (!usingDirectMapping() && info.isMapped && info.directMapped &&
                     info.mappedPtr && info.mappedSize > 0) {
+                    // Flush any unflushed dirty pages on unmap (also catches Unity's
+                    // staging uploads that unmap non-coherent memory without vkFlushMappedMemoryRanges).
+                    collectCoherentDirtyRangesLocked(
+                        memory, info, info.mapOffset, info.mapSize, unmapRanges);
+                }
+                if (info.isMapped) {
                     const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
                     if (info.memoryTypeIndex < props.memoryTypeCount &&
                         (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                        collectCoherentDirtyRangesLocked(
-                            memory, info, info.mapOffset, info.mapSize, unmapRanges);
+                        if (mMappedCoherentCount > 0) --mMappedCoherentCount;
                     }
                 }
                 info.isMapped = false;
@@ -344,8 +365,11 @@ def main() -> None:
                 if (qIt != info_VkQueue.end()) {
                     qDev = qIt->second.device;
                     const auto& props = mHostVisibleMemoryVirtInfo.guestMemoryProperties;
+                    const bool hasCoherent = (mMappedCoherentCount > 0);
                     std::unordered_map<VkDeviceMemory, std::vector<std::pair<VkDeviceSize, VkDeviceSize>>> memIntervals;
+                    std::unordered_map<VkDeviceMemory, std::vector<std::pair<VkDeviceSize, VkDeviceSize>>> copyMemIntervals;
                     for (const auto& ref : cmdBufRefs) {
+                        if (!hasCoherent && !ref.isCopy) continue;
                         auto bIt = info_VkBuffer.find(ref.buffer);
                         if (bIt == info_VkBuffer.end()) continue;
                         const auto& bInfo = bIt->second;
@@ -356,61 +380,88 @@ def main() -> None:
                         if (subLen == 0) continue;
                         VkDeviceSize s = bInfo.currentBackingOffset + subOff;
                         VkDeviceSize e = s + subLen;
-                        memIntervals[bInfo.currentBacking].emplace_back(s, e);
+                        if (ref.isCopy) {
+                            copyMemIntervals[bInfo.currentBacking].emplace_back(s, e);
+                        } else {
+                            memIntervals[bInfo.currentBacking].emplace_back(s, e);
+                        }
                     }
-                    constexpr uint32_t kCmdOnlyMask =
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
                     constexpr VkDeviceSize kPage = 4096;
-                    for (auto& kv : info_VkDeviceMemory) {
-                        auto& info = kv.second;
-                        if (info.ownerDevice == qDev && info.isMapped && info.directMapped &&
-                            info.mappedPtr && info.mappedSize > 0 &&
-                            info.memoryTypeIndex < props.memoryTypeCount &&
-                            (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                            auto& ivs = memIntervals[kv.first];
-                            for (const auto& bkv : info.boundObjects) {
-                                const auto& br = bkv.second;
-                                if (!br.isBuffer || (br.usage & ~kCmdOnlyMask) != 0) {
-                                    if (br.size > 0) {
-                                        ivs.emplace_back(br.offset, br.offset + br.size);
+                    auto scanIntervalsForMem = [&](VkDeviceMemory mem, VkDeviceMemory_Info& info,
+                                                   std::vector<std::pair<VkDeviceSize, VkDeviceSize>>& ivs) {
+                        if (ivs.empty()) return;
+                        VkDeviceSize mapLo = info.mapOffset;
+                        VkDeviceSize mapHi = info.mapOffset + info.mapSize;
+                        if (mapHi > info.mappedSize) mapHi = info.mappedSize;
+                        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> clipped;
+                        clipped.reserve(ivs.size());
+                        for (const auto& iv : ivs) {
+                            VkDeviceSize s = iv.first < mapLo ? mapLo : iv.first;
+                            VkDeviceSize e = iv.second > mapHi ? mapHi : iv.second;
+                            if (e <= s) continue;
+                            s = s & ~(kPage - 1);
+                            e = (e + kPage - 1) & ~(kPage - 1);
+                            if (e > info.mappedSize) e = info.mappedSize;
+                            clipped.emplace_back(s, e);
+                        }
+                        if (clipped.empty()) return;
+                        std::sort(clipped.begin(), clipped.end());
+                        VkDeviceSize curS = clipped[0].first;
+                        VkDeviceSize curE = clipped[0].second;
+                        for (size_t idx = 1; idx < clipped.size(); ++idx) {
+                            if (clipped[idx].first <= curE) {
+                                if (clipped[idx].second > curE) curE = clipped[idx].second;
+                            } else {
+                                collectCoherentDirtyRangesLocked(
+                                    mem, info, curS, curE - curS, coherentRanges);
+                                curS = clipped[idx].first;
+                                curE = clipped[idx].second;
+                            }
+                        }
+                        collectCoherentDirtyRangesLocked(
+                            mem, info, curS, curE - curS, coherentRanges);
+                    };
+                    if (hasCoherent) {
+                        constexpr uint32_t kCmdOnlyMask =
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                        for (auto& kv : info_VkDeviceMemory) {
+                            auto& info = kv.second;
+                            if (info.ownerDevice == qDev && info.isMapped && info.directMapped &&
+                                info.mappedPtr && info.mappedSize > 0 &&
+                                info.memoryTypeIndex < props.memoryTypeCount &&
+                                (props.memoryTypes[info.memoryTypeIndex].propertyFlags &
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                                auto& ivs = memIntervals[kv.first];
+                                auto cIt = copyMemIntervals.find(kv.first);
+                                if (cIt != copyMemIntervals.end()) {
+                                    ivs.insert(ivs.end(), cIt->second.begin(), cIt->second.end());
+                                    copyMemIntervals.erase(cIt);
+                                }
+                                for (const auto& bkv : info.boundObjects) {
+                                    const auto& br = bkv.second;
+                                    if (!br.isBuffer || (br.usage & ~kCmdOnlyMask) != 0) {
+                                        if (br.size > 0) {
+                                            ivs.emplace_back(br.offset, br.offset + br.size);
+                                        }
                                     }
                                 }
+                                scanIntervalsForMem(kv.first, info, ivs);
                             }
-                            if (ivs.empty()) continue;
-                            VkDeviceSize mapLo = info.mapOffset;
-                            VkDeviceSize mapHi = info.mapOffset + info.mapSize;
-                            if (mapHi > info.mappedSize) mapHi = info.mappedSize;
-                            std::vector<std::pair<VkDeviceSize, VkDeviceSize>> clipped;
-                            clipped.reserve(ivs.size());
-                            for (const auto& iv : ivs) {
-                                VkDeviceSize s = iv.first < mapLo ? mapLo : iv.first;
-                                VkDeviceSize e = iv.second > mapHi ? mapHi : iv.second;
-                                if (e <= s) continue;
-                                s = s & ~(kPage - 1);
-                                e = (e + kPage - 1) & ~(kPage - 1);
-                                if (e > info.mappedSize) e = info.mappedSize;
-                                clipped.emplace_back(s, e);
-                            }
-                            if (clipped.empty()) continue;
-                            std::sort(clipped.begin(), clipped.end());
-                            VkDeviceSize curS = clipped[0].first;
-                            VkDeviceSize curE = clipped[0].second;
-                            for (size_t idx = 1; idx < clipped.size(); ++idx) {
-                                if (clipped[idx].first <= curE) {
-                                    if (clipped[idx].second > curE) curE = clipped[idx].second;
-                                } else {
-                                    collectCoherentDirtyRangesLocked(
-                                        kv.first, info, curS, curE - curS, coherentRanges);
-                                    curS = clipped[idx].first;
-                                    curE = clipped[idx].second;
-                                }
-                            }
-                            collectCoherentDirtyRangesLocked(
-                                kv.first, info, curS, curE - curS, coherentRanges);
+                        }
+                    }
+                    // Also check exact vkCmdCopyBuffer / vkCmdCopyBufferToImage source slices
+                    // on mapped non-coherent staging buffers (catches Unity ASTC texture uploads
+                    // that omit vkFlushMappedMemoryRanges on non-coherent memory).
+                    for (auto& ckv : copyMemIntervals) {
+                        auto mIt = info_VkDeviceMemory.find(ckv.first);
+                        if (mIt == info_VkDeviceMemory.end()) continue;
+                        auto& info = mIt->second;
+                        if (info.ownerDevice == qDev && info.isMapped && info.directMapped &&
+                            info.mappedPtr && info.mappedSize > 0) {
+                            scanIntervalsForMem(ckv.first, info, ckv.second);
                         }
                     }
                 }
@@ -446,7 +497,8 @@ def main() -> None:
         VkCommandBuffer commandBuffer,
         VkBuffer buffer,
         VkDeviceSize offset,
-        VkDeviceSize size);
+        VkDeviceSize size,
+        bool isCopy = false);
 
     VkResult on_vkCreateImageView(""",
     )
@@ -460,6 +512,7 @@ def main() -> None:
         VkBuffer buffer;
         VkDeviceSize offset;
         VkDeviceSize size;
+        bool isCopy = false;
     };
 
     struct CommandBufferPendingDescriptorSets {
@@ -471,7 +524,8 @@ def main() -> None:
         VkCommandBuffer commandBuffer,
         VkBuffer buffer,
         VkDeviceSize offset,
-        VkDeviceSize size) {
+        VkDeviceSize size,
+        bool isCopy = false) {
         if (!commandBuffer || buffer == VK_NULL_HANDLE) return;
         struct goldfish_VkCommandBuffer* cb = as_goldfish_VkCommandBuffer(commandBuffer);
         if (!cb) return;
@@ -479,7 +533,7 @@ def main() -> None:
             cb->userPtr = new CommandBufferPendingDescriptorSets;
         }
         auto* pending = (CommandBufferPendingDescriptorSets*)cb->userPtr;
-        pending->bufRefs.push_back({buffer, offset, size});
+        pending->bufRefs.push_back({buffer, offset, size, isCopy});
     }
 
     void collectCmdBufRefsBottomUp(
@@ -772,8 +826,9 @@ def main() -> None:
     VkCommandBuffer commandBuffer,
     VkBuffer buffer,
     VkDeviceSize offset,
-    VkDeviceSize size) {
-    mImpl->recordCommandBufferBufferRef(commandBuffer, buffer, offset, size);
+    VkDeviceSize size,
+    bool isCopy) {
+    mImpl->recordCommandBufferBufferRef(commandBuffer, buffer, offset, size, isCopy);
 }
 
 void ResourceTracker::deviceMemoryTransform_tohost(""",
@@ -802,7 +857,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         """    ENCODER_DEBUG_LOG("vkCmdCopyBuffer(commandBuffer:%p, srcBuffer:%p, dstBuffer:%p, regionCount:%d, pRegions:%p)", commandBuffer, srcBuffer, dstBuffer, regionCount, pRegions);
     if (sResourceTracker && pRegions) {
         for (uint32_t _ri = 0; _ri < regionCount; ++_ri) {
-            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].srcOffset, pRegions[_ri].size);
+            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].srcOffset, pRegions[_ri].size, true);
         }
     }""",
     )
@@ -818,7 +873,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
             VkDeviceSize _lay = pRegions[_ri].imageSubresource.layerCount ? pRegions[_ri].imageSubresource.layerCount : 1;
             VkDeviceSize _maxB = _rowT * _imgH * _dep * _lay * 16ULL;
             if (_maxB < 4096ULL) _maxB = 4096ULL;
-            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].bufferOffset, _maxB);
+            sResourceTracker->recordCommandBufferBufferRef(commandBuffer, srcBuffer, pRegions[_ri].bufferOffset, _maxB, true);
         }
     }""",
     )
@@ -1118,7 +1173,11 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         const VkFence* pFences);
     VkResult on_vkGetFenceStatus(
         void* context, VkResult input_result,
-        VkDevice device, VkFence fence);""",
+        VkDevice device, VkFence fence);
+    VkResult on_vkFlushMappedMemoryRanges(
+        void* context, VkResult input_result,
+        VkDevice device, uint32_t memoryRangeCount,
+        const VkMappedMemoryRange* pMemoryRanges);""",
     )
     patch_file(
         "system/vulkan_enc/ResourceTracker.cpp",
@@ -1136,6 +1195,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         VkExportFenceCreateInfo exportFenceCreateInfo;
         bool signaledCached = false;
         uint64_t lastSubmitNs = 0;
+        uint64_t lastNotReadyNs = 0;
         VkQueue lastSubmitQueue = VK_NULL_HANDLE;
         uint32_t fastNotReadyCount = 0;
 #if defined(VK_USE_PLATFORM_ANDROID_KHR) || defined(__linux__)
@@ -1176,6 +1236,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
             auto& info = it->second;
             info.signaledCached = false;
             info.lastSubmitNs = 0;
+            info.lastNotReadyNs = 0;
             info.lastSubmitQueue = VK_NULL_HANDLE;
             info.fastNotReadyCount = 0;
             if (!info.external) continue;""",
@@ -1219,6 +1280,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
     std::unordered_map<VkDevice, uint64_t> mDeviceNotReadySubmitNs;
     std::unordered_map<VkDevice, uint64_t> mDeviceNotReadyQueryNs;
     std::unordered_map<VkDevice, uint64_t> mDeviceLastFencePollNs;
+    uint32_t mMappedCoherentCount = 0;
 
     struct BufferReqCacheKey {
         VkDevice device;
@@ -1252,6 +1314,45 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         return (1ULL << 63) | pidPart | seqPart;
     }
 
+    VkResult on_vkFlushMappedMemoryRanges(
+        void* context, VkResult,
+        VkDevice device, uint32_t memoryRangeCount,
+        const VkMappedMemoryRange* pMemoryRanges) {
+        VkEncoder* enc = (VkEncoder*)context;
+        if (!usingDirectMapping() && pMemoryRanges && memoryRangeCount > 0) {
+            AutoLock<RecursiveLock> lock(mLock);
+            constexpr VkDeviceSize kPage = 4096;
+            for (uint32_t i = 0; i < memoryRangeCount; ++i) {
+                auto it = info_VkDeviceMemory.find(pMemoryRanges[i].memory);
+                if (it == info_VkDeviceMemory.end()) continue;
+                auto& info = it->second;
+                if (!info.mappedPtr || info.mappedSize == 0) continue;
+                VkDeviceSize startOff = pMemoryRanges[i].offset < info.mappedSize
+                                            ? pMemoryRanges[i].offset : info.mappedSize;
+                VkDeviceSize endOff = (pMemoryRanges[i].size == VK_WHOLE_SIZE ||
+                                       pMemoryRanges[i].size > info.mappedSize - startOff)
+                                          ? info.mappedSize
+                                          : (startOff + pMemoryRanges[i].size);
+                if (endOff <= startOff) continue;
+                if (info.flushShadowPtr && info.flushShadowSize >= endOff) {
+                    memcpy(info.flushShadowPtr + startOff, info.mappedPtr + startOff,
+                           static_cast<size_t>(endOff - startOff));
+                    VkDeviceSize pStart = (startOff + kPage - 1) & ~(kPage - 1);
+                    VkDeviceSize pEnd = endOff & ~(kPage - 1);
+                    if (pEnd > info.mappedSize) pEnd = info.mappedSize;
+                    for (VkDeviceSize off = pStart; off < pEnd; off += kPage) {
+                        size_t pageIdx = static_cast<size_t>(off / kPage);
+                        if ((pageIdx >> 3) < info.flushPageSynced.size()) {
+                            info.flushPageSynced[pageIdx >> 3] |=
+                                static_cast<uint8_t>(1u << (pageIdx & 7));
+                        }
+                    }
+                }
+            }
+        }
+        return enc->vkFlushMappedMemoryRanges(device, memoryRangeCount, pMemoryRanges, true /* do lock */);
+    }
+
     VkResult on_vkGetFenceStatus(
         void* context, VkResult,
         VkDevice device, VkFence fence) {
@@ -1259,40 +1360,32 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
         clock_gettime(CLOCK_MONOTONIC, &nowTs);
         uint64_t nowNs = (uint64_t)nowTs.tv_sec * 1000000000ULL + (uint64_t)nowTs.tv_nsec;
         uint64_t queriedFenceSubmitNs = 0;
-        VkQueue queriedFenceQueue = VK_NULL_HANDLE;
         {
             AutoLock<RecursiveLock> lock(mLock);
             auto it = info_VkFence.find(fence);
             if (it != info_VkFence.end()) {
                 auto& info = it->second;
                 queriedFenceSubmitNs = info.lastSubmitNs;
-                queriedFenceQueue = info.lastSubmitQueue;
                 if (info.signaledCached) {
                     return VK_SUCCESS;
                 }
                 if (!info.external && info.lastSubmitNs > 0) {
                     uint64_t fenceAgeNs = (nowNs >= info.lastSubmitNs) ? (nowNs - info.lastSubmitNs) : 0;
-                    // Safety cap: always poll host once a fence is >= 24ms old so no spin-wait
-                    // or command-buffer recycling can ever stall.
-                    if (fenceAgeNs < 24000000ULL) {
-                        auto dIt = mDeviceLastSubmitNs.find(device);
-                        bool recentDeviceSubmit =
-                            (dIt != mDeviceLastSubmitNs.end() && nowNs >= dIt->second &&
-                             (nowNs - dIt->second) < 3500000ULL);
-                        bool recentFenceSubmit = (fenceAgeNs < 12000000ULL);
-                        auto lpIt = mDeviceLastFencePollNs.find(device);
-                        bool recentPoll =
-                            (lpIt != mDeviceLastFencePollNs.end() && nowNs >= lpIt->second &&
-                             (nowNs - lpIt->second) < 8000000ULL);
-                        auto nrIt = mDeviceNotReadySubmitNs.find(device);
-                        auto nqIt = mDeviceNotReadyQueryNs.find(device);
-                        bool fifoBlocked =
-                            (nrIt != mDeviceNotReadySubmitNs.end() && nqIt != mDeviceNotReadyQueryNs.end() &&
-                             nrIt->second > 0 && info.lastSubmitNs >= nrIt->second &&
-                             nowNs >= nqIt->second && (nowNs - nqIt->second) < 8000000ULL);
-                        if (recentDeviceSubmit || recentFenceSubmit || recentPoll || fifoBlocked) {
-                            return VK_NOT_READY;
-                        }
+                    // Sub-millisecond guard only: skip zero-age immediate post-submit poll (<0.5ms)
+                    // and tight spin-poll on a fence that just returned VK_NOT_READY (<1.0ms),
+                    // without ever delaying 60/120 FPS Vulkan game fence completion!
+                    bool tooFresh = (fenceAgeNs < 500000ULL);
+                    bool recentFenceNotReady =
+                        (info.lastNotReadyNs > 0 && nowNs >= info.lastNotReadyNs &&
+                         (nowNs - info.lastNotReadyNs) < 1000000ULL);
+                    auto nrIt = mDeviceNotReadySubmitNs.find(device);
+                    auto nqIt = mDeviceNotReadyQueryNs.find(device);
+                    bool fifoBlocked =
+                        (nrIt != mDeviceNotReadySubmitNs.end() && nqIt != mDeviceNotReadyQueryNs.end() &&
+                         nrIt->second > 0 && info.lastSubmitNs >= nrIt->second &&
+                         nowNs >= nqIt->second && (nowNs - nqIt->second) < 1000000ULL);
+                    if (tooFresh || recentFenceNotReady || fifoBlocked) {
+                        return VK_NOT_READY;
                     }
                 }
             }
@@ -1309,7 +1402,9 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
             if (it != info_VkFence.end()) {
                 if (res == VK_SUCCESS) {
                     it->second.signaledCached = true;
+                    it->second.lastNotReadyNs = 0;
                 } else if (res == VK_NOT_READY) {
+                    it->second.lastNotReadyNs = t1Ns;
                     mDeviceNotReadyQueryNs[device] = t1Ns;
                     if (queriedFenceSubmitNs > 0) {
                         mDeviceNotReadySubmitNs[device] = queriedFenceSubmitNs;
@@ -1350,6 +1445,7 @@ void ResourceTracker::deviceMemoryTransform_tohost(""",
                     auto& info = it->second;
                     info.signaledCached = false;
                     info.lastSubmitNs = subNs;
+                    info.lastNotReadyNs = 0;
                     info.lastSubmitQueue = queue;
                     info.fastNotReadyCount = 0;
                     if (info.syncFd >= 0) {
@@ -1521,6 +1617,37 @@ VkResult ResourceTracker::on_vkGetFenceStatus(
     VkDevice device, VkFence fence) {
     return mImpl->on_vkGetFenceStatus(
         context, input_result, device, fence);
+}
+VkResult ResourceTracker::on_vkFlushMappedMemoryRanges(
+    void* context, VkResult input_result,
+    VkDevice device, uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges) {
+    return mImpl->on_vkFlushMappedMemoryRanges(
+        context, input_result, device, memoryRangeCount, pMemoryRanges);
+}""",
+    )
+    patch_file(
+        "system/vulkan_enc/func_table.cpp",
+        """static VkResult entry_vkFlushMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges)
+{
+    AEMU_SCOPED_TRACE("vkFlushMappedMemoryRanges");
+    auto vkEnc = ResourceTracker::getThreadLocalEncoder();
+    VkResult vkFlushMappedMemoryRanges_VkResult_return = (VkResult)0;
+    vkFlushMappedMemoryRanges_VkResult_return = vkEnc->vkFlushMappedMemoryRanges(device, memoryRangeCount, pMemoryRanges, true /* do lock */);
+    return vkFlushMappedMemoryRanges_VkResult_return;
+}""",
+        """static VkResult entry_vkFlushMappedMemoryRanges(
+    VkDevice device,
+    uint32_t memoryRangeCount,
+    const VkMappedMemoryRange* pMemoryRanges)
+{
+    AEMU_SCOPED_TRACE("vkFlushMappedMemoryRanges");
+    auto vkEnc = ResourceTracker::getThreadLocalEncoder();
+    auto resources = ResourceTracker::get();
+    return resources->on_vkFlushMappedMemoryRanges(vkEnc, VK_SUCCESS, device, memoryRangeCount, pMemoryRanges);
 }""",
     )
     patch_file(

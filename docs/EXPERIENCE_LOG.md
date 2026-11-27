@@ -1219,6 +1219,21 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - 覆盖安装重启后 15 秒启动完成：`owner.db` 60ms 无损扩容 `65,536 -> 1,048,576`（保留全部 `56,883` 活记录，占用 5.4%）；6.8 GB 已下载资源瞬时迁入 `userdata14/data/media/0/Android/data/com.neowizgames.game.browndust2`（临时目录归空 `7.5K`）；
     - 重开《棕色尘埃 2》零白屏，精准识别已有 6.8 GB 资源、弹出续传弹窗 **`下载容量 8,933 MB`**（原 15,531 MB）；
     - 点击“下载”进行 65 秒持续下载 + 1280×720 H.264 视频硬/软解码压测（累计解码 **1,836 视频帧 + 3,513 音频帧**）：`hidumper --mem` 实测 `Total Ashmem` 稳态持平 **`80.0 → 81.2 → 81.9 MB`**（对比修复前 3 分钟飙升至 **3,563 MB / 5,629 泄漏 FD**），`hiview/FdLeakDetector` 零报警，`owner.db` 顺利越过旧 `57,344` 死线推进至 `58,726`，持久化目录平稳增长 `6.8G → 7.4G`，下载进度持续推进至 **`7.47%`**。
+- **2026-11-27 修复《棕色尘埃 2》Vulkan 模式锁死 30 FPS（实测稳态 59.5–60.0 FPS · 零洋红贴图瑕疵）**：
+  - **四重叠加根因（`VK_PERF` 全链路逐帧遥测实证）**：
+    1. **Guest `on_vkGetFenceStatus` 12–24 ms 人工节流**：此前为 SkiaVK 设定的轮询节流窗（`fenceAgeNs < 12 ms || recentDeviceSubmit < 3.5 ms || recentPoll < 8 ms`，上限 `24 ms`）使 60 FPS（`16.67 ms`/帧）游戏每帧查询围栏时必然被谎报 `VK_NOT_READY`，迫使 Unity / `SwappyVk` 稳态锁死在 30 FPS（`33.33 ms`/帧）。
+    2. **Host `on_vkQueueSignalReleaseImageANDROID`（QSRI）同步阻塞破坏 CPU/GPU 流水线**：`AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID` 在 Host `RenderThread` 内同步 `waitForQsriFenceTask()` 等 Maleoon 916 画完当前帧，连带卡死 Guest `UnityGfxDeviceWorker` 的 `vkQueuePresentKHR`，丧失双帧并发流水线。
+    3. **Host 暴露全部 `HOST_VISIBLE` 内存为 `HOST_COHERENT` 引发 `7.6 GB / 2s` 全量 `memcmp` 扫描**：Maleoon 916 所有 `HOST_VISIBLE` 内存均含 `HOST_COHERENT_BIT`，非 `GlDirectMem` 下 Guest `ResourceTracker::on_vkQueueSubmit` 每 2 秒对 352 次提交扫描 **`7,610.5 MB`**（仅检出 `4.2 MB` 脏页），白烧 **`819.2 ms / 2s`（~7.0 ms/帧）**。此外首次剥离 `HOST_COHERENT_BIT` 后暴露出 Unity 2022.3 异步 ASTC 纹理上传（`vkCmdCopyBufferToImage`）遗漏显式 `vkFlushMappedMemoryRanges` 的规范陷阱——Host 收到全零 ASTC 块按 Khronos ASTC 规范解码为 `#FF00FF` 纯洋红错误块。
+    4. **Guest `hwcomposer_ranchu.cpp` `vsyncLoop()` 上报抖动时间戳**：以唤醒时刻 `now` 而非锁相 VSync 周期上报，加剧 `SwappyVk` 帧步调抖动。
+  - **修复**：
+    - `gpu/android_guest/apply_guest_patches.py`：`on_vkGetFenceStatus` 改为亚毫秒级防自旋守卫（仅提交后 `< 0.5 ms` 与真实 `VK_NOT_READY` 后单 Fence/FIFO `< 1.0 ms` 冷却）+ `signaledCached`；新增 `on_vkFlushMappedMemoryRanges`（同步 `flushShadowPtr` + 全页 `flushPageSynced` 位图）与 `mMappedCoherentCount` 快速跳过路径；在 `on_vkQueueSubmit`（精确追踪 `CmdBufRef::isCopy` 即 `vkCmdCopyBuffer`/`vkCmdCopyBufferToImage` 源切片）与 `on_vkUnmapMemory` 自动兜底冲刷非 Coherent 暂存缓冲脏页（3D 场景加载期间精准捕获 `41.8 MB` Unity ASTC 纹理上传，彻底消除 `#FF00FF` 洋红块）。
+    - `gpu/ohos_host/apply_host_patches.py`：`on_vkQueueSignalReleaseImageANDROID` 切为上游 `scheduleAsyncWork(...)` + `VkEmulation` 每 ColorBuffer `CancelableFuture` 追踪，并在 `FrameBuffer::{bindColorBufferToTexture,bindColorBufferToTexture2,readColorBuffer}` 与 `VkEmulation::{teardownVkColorBuffer,borrowColorBufferForComposition,borrowColorBufferForDisplay}` 加锁前执行无锁消费端 `waitColorBufferPendingQsri()`（QSRI 重录 `queueState.cb` 前先在 `fb->lock()` 外执行 `latestUse->wait()`）；`VkEmulatedPhysicalDeviceMemory` 在 `__OHOS__`（`!GlDirectMem && !VirtioGpuNext`）下剥离主 `HOST_VISIBLE`/`HOST_CACHED` 类型的 `HOST_COHERENT_BIT` 并在末尾追加 1 个符合 Vulkan 1.0 规范的 `HOST_VISIBLE | HOST_COHERENT` 兜底类型（同步更新 `transformToGuestMemoryRequirements`）；顺带修复 Patch #25 预存的 `NameError: vkco`。
+    - `gpu/android_guest/hwcomposer_ranchu.cpp`：`vsyncLoop()` 上报精确锁相 `nextTick`（钳位 `<= nowNs`，超过 2 周期停顿自动重同步）。
+    - 同步回滚清理临时诊断探针 `svbox/src/payload/logic/integrity.c`，保持 Layer 1 `svbox` 仓库完全干净。
+  - **真机实测（`HAD-W32`，Maleoon 916 · Vulkan · 120Hz）**：
+    - 3D 旅馆实机场景稳定 **`59.5–60.0 FPS`**（持续 40s+ `qsri=119–120 / 2s`）；`on_vkQueueSubmit` 脏页扫描从 **`819.2 ms (7,610.5 MB)` 降至 `1.0–1.8 ms (0.0 MB)`（提速 >500×）**；Guest `vkQueueSignalReleaseImageANDROID` 均值降至 **`0.37–0.55 ms`**；3D 旅馆桌椅/立柱纹理 100% 正常零洋红；连续 3 次全新安装冷启动零崩溃。
+    - **附带观测（鸿蒙 PC 失焦降频）**：`org.svbox.android` 获焦前台运行时 `Cpus_allowed_list=0..19`（含 8 颗大核 `12..19`，单核实测比小核 `cpu0/1` 快 `11.6×`）且 `RenderThread` 获 `RT -10`，稳定满 60 FPS；一旦窗口失焦（如点击终端）或后台静置，鸿蒙 `rss` 会将进程限核至 `0..11` 并降权，`qsri` 均值由 `0.51 ms` 升至 `1.55 ms` 并触发 `[E/SwappyVk] Failed to wait for fence 2`，导致 `SwappyVk` 主动降档至 `30.0 FPS`（切回前台并旋转屏幕重建 `VkSwapchainKHR` 后恢复 60 FPS）。
+
 
 
 

@@ -459,7 +459,15 @@ private:
                 if (fn) {
                     struct timespec now{};
                     clock_gettime(CLOCK_MONOTONIC, &now);
-                    int64_t ts = static_cast<int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+                    int64_t nowNs = static_cast<int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+                    int64_t tickNs = static_cast<int64_t>(nextTick.tv_sec) * 1000000000LL + nextTick.tv_nsec;
+                    // Report the exact phase-locked tick (clamped <= nowNs so Choreographer never
+                    // sees a future timestamp), and resync if the thread fell >2 periods behind.
+                    int64_t ts = (tickNs <= nowNs) ? tickNs : nowNs;
+                    if (nowNs - tickNs > period * 2) {
+                        nextTick = now;
+                        ts = nowNs;
+                    }
                     fn(data, kPrimaryDisplayId, ts);
                 }
             }

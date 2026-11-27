@@ -749,8 +749,20 @@ def main() -> None:
         "#ifdef __OHOS__\n"
         "    struct OH_NativeBuffer* getColorBufferOhosNativeBuffer(uint32_t colorBufferHandle);\n"
         "    void setColorBufferGlExported(uint32_t colorBufferHandle);\n"
+        "    void setColorBufferPendingQsri(uint32_t colorBufferHandle, CancelableFuture readyFuture);\n"
+        "    void waitColorBufferPendingQsri(uint32_t colorBufferHandle);\n"
         "#endif",
         "VkCommonOperations.h getColorBufferOhosNativeBuffer decl",
+    )
+    patch_file(
+        vkops_h,
+        "    std::unordered_map<uint32_t, ColorBufferInfo> mColorBuffers GUARDED_BY(mMutex);",
+        "    std::unordered_map<uint32_t, ColorBufferInfo> mColorBuffers GUARDED_BY(mMutex);\n"
+        "#ifdef __OHOS__\n"
+        "    std::mutex mPendingQsriMutex;\n"
+        "    std::unordered_map<uint32_t, CancelableFuture> mPendingQsri;\n"
+        "#endif",
+        "VkCommonOperations.h mPendingQsri map",
     )
 
     patch_file(
@@ -1016,6 +1028,23 @@ def main() -> None:
         "    auto infoPtr = android::base::find(mColorBuffers, colorBuffer);\n"
         "    if (infoPtr) {\n"
         "        infoPtr->glExported = true;\n"
+        "    }\n"
+        "}\n\n"
+        "void VkEmulation::setColorBufferPendingQsri(uint32_t colorBuffer, CancelableFuture readyFuture) {\n"
+        "    std::lock_guard<std::mutex> lock(mPendingQsriMutex);\n"
+        "    mPendingQsri[colorBuffer] = std::move(readyFuture);\n"
+        "}\n\n"
+        "void VkEmulation::waitColorBufferPendingQsri(uint32_t colorBuffer) {\n"
+        "    CancelableFuture fut;\n"
+        "    {\n"
+        "        std::lock_guard<std::mutex> lock(mPendingQsriMutex);\n"
+        "        auto it = mPendingQsri.find(colorBuffer);\n"
+        "        if (it == mPendingQsri.end()) return;\n"
+        "        fut = it->second;\n"
+        "        mPendingQsri.erase(it);\n"
+        "    }\n"
+        "    if (fut.valid()) {\n"
+        "        fut.wait();\n"
         "    }\n"
         "}\n"
         "#endif  // __OHOS__\n\n"
@@ -1341,26 +1370,23 @@ def main() -> None:
     )
     patch_file(
         vkanb,
-        "    if (mUseVulkanNativeImage) {\n"
-        "        VK_ANB_DEBUG_OBJ(this, \"using native image, so use sync thread to wait\");\n"
-        "        // Queue wait to sync thread with completion callback\n"
-        "        // Pass anbInfo by value to get a ref\n"
-        "        auto waitable = emu->getCallbacks().scheduleAsyncWork(\n"
-        "            [waitForQsriFenceTask = std::move(waitForQsriFenceTask), this]() mutable {\n"
-        "                waitForQsriFenceTask();\n"
-        "                mQsriTimeline->signalNextPresentAndPoll();\n"
-        "            },\n"
-        "            \"wait for the guest Qsri VkFence signaled\");\n\n"
-        "        queueState.latestUse = std::move(waitable);\n"
-        "    } else {",
-        "    if (mUseVulkanNativeImage) {\n"
+        "    auto fb = FrameBuffer::getFB();\n"
+        "    fb->lock();\n",
         "#ifdef __OHOS__\n"
-        "        // Without kernel sync_fd (/dev/goldfish_sync), *pNativeFenceFd == -1 tells\n"
-        "        // SurfaceFlinger the buffer is already ready; wait on qsriFence here (after\n"
-        "        // fb->unlock()) so GLES RenderEngine never samples an incomplete OH_NativeBuffer.\n"
-        "        waitForQsriFenceTask();\n"
-        "        mQsriTimeline->signalNextPresentAndPoll();\n"
-        "#else\n"
+        "    // Ensure any previous async QSRI wait on this exact image's queueState.cb\n"
+        "    // has completed before we re-record queueState.cb (0 ms on triple-buffered swapchains).\n"
+        "    if (queueFamilyIndex < mQueueStates.size() && mQueueStates[queueFamilyIndex].latestUse) {\n"
+        "        mQueueStates[queueFamilyIndex].latestUse->wait();\n"
+        "        mQueueStates[queueFamilyIndex].latestUse.reset();\n"
+        "    }\n"
+        "#endif\n"
+        "    auto fb = FrameBuffer::getFB();\n"
+        "    fb->lock();\n",
+        "VkAndroidNativeBuffer wait previous async QSRI before re-recording cb",
+    )
+    patch_file(
+        vkanb,
+        "    if (mUseVulkanNativeImage) {\n"
         "        VK_ANB_DEBUG_OBJ(this, \"using native image, so use sync thread to wait\");\n"
         "        // Queue wait to sync thread with completion callback\n"
         "        // Pass anbInfo by value to get a ref\n"
@@ -1371,39 +1397,206 @@ def main() -> None:
         "            },\n"
         "            \"wait for the guest Qsri VkFence signaled\");\n\n"
         "        queueState.latestUse = std::move(waitable);\n"
-        "#endif\n"
         "    } else {",
-        "VkAndroidNativeBuffer OHOS sync wait on qsriFence for native image",
+        "    if (mUseVulkanNativeImage) {\n"
+        "        VK_ANB_DEBUG_OBJ(this, \"using native image, so use sync thread to wait\");\n"
+        "        // Queue wait to sync thread with completion callback so the guest Vulkan\n"
+        "        // thread can pipeline CPU frame N+1 with GPU frame N. On __OHOS__, register\n"
+        "        // the future on the ColorBuffer so SurfaceFlinger/DisplayVk consumers wait\n"
+        "        // on their own thread right before sampling the OH_NativeBuffer.\n"
+        "        auto waitable = emu->getCallbacks().scheduleAsyncWork(\n"
+        "            [waitForQsriFenceTask = std::move(waitForQsriFenceTask), this]() mutable {\n"
+        "                waitForQsriFenceTask();\n"
+        "                mQsriTimeline->signalNextPresentAndPoll();\n"
+        "            },\n"
+        "            \"wait for the guest Qsri VkFence signaled\");\n"
+        "#ifdef __OHOS__\n"
+        "        emu->setColorBufferPendingQsri(mColorBufferHandle, waitable);\n"
+        "#endif\n"
+        "        queueState.latestUse = std::move(waitable);\n"
+        "    } else {",
+        "VkAndroidNativeBuffer OHOS async QSRI with consumer-side pending future",
+    )
+    # Consumer-side QSRI waits (called BEFORE locking FrameBuffer::m_lock / VkEmulation::mMutex)
+    patch_file(
+        vkops,
+        "bool VkEmulation::teardownVkColorBuffer(uint32_t colorBufferHandle) {\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    return teardownVkColorBufferLocked(colorBufferHandle);\n"
+        "}",
+        "bool VkEmulation::teardownVkColorBuffer(uint32_t colorBufferHandle) {\n"
+        "#ifdef __OHOS__\n"
+        "    waitColorBufferPendingQsri(colorBufferHandle);\n"
+        "#endif\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);\n"
+        "    return teardownVkColorBufferLocked(colorBufferHandle);\n"
+        "}",
+        "VkEmulation::teardownVkColorBuffer wait pending QSRI",
+    )
+    patch_file(
+        vkops,
+        "std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForComposition(\n"
+        "    uint32_t colorBufferHandle, bool colorBufferIsTarget) {\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);",
+        "std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForComposition(\n"
+        "    uint32_t colorBufferHandle, bool colorBufferIsTarget) {\n"
+        "#ifdef __OHOS__\n"
+        "    waitColorBufferPendingQsri(colorBufferHandle);\n"
+        "#endif\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);",
+        "VkEmulation::borrowColorBufferForComposition wait pending QSRI",
+    )
+    patch_file(
+        vkops,
+        "std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForDisplay(\n"
+        "    uint32_t colorBufferHandle) {\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);",
+        "std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForDisplay(\n"
+        "    uint32_t colorBufferHandle) {\n"
+        "#ifdef __OHOS__\n"
+        "    waitColorBufferPendingQsri(colorBufferHandle);\n"
+        "#endif\n"
+        "    std::lock_guard<std::mutex> lock(mMutex);",
+        "VkEmulation::borrowColorBufferForDisplay wait pending QSRI",
+    )
+    patch_file(
+        fb_cpp,
+        "bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer) {\n"
+        "    AutoLock mutex(m_lock);",
+        "bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer) {\n"
+        "#ifdef __OHOS__\n"
+        "    if (m_emulationVk) m_emulationVk->waitColorBufferPendingQsri(p_colorbuffer);\n"
+        "#endif\n"
+        "    AutoLock mutex(m_lock);",
+        "FrameBuffer::bindColorBufferToTexture wait pending QSRI",
+    )
+    patch_file(
+        fb_cpp,
+        "bool FrameBuffer::bindColorBufferToTexture2(HandleType p_colorbuffer) {\n"
+        "    // This is only called when using multi window display",
+        "bool FrameBuffer::bindColorBufferToTexture2(HandleType p_colorbuffer) {\n"
+        "#ifdef __OHOS__\n"
+        "    if (m_emulationVk) m_emulationVk->waitColorBufferPendingQsri(p_colorbuffer);\n"
+        "#endif\n"
+        "    // This is only called when using multi window display",
+        "FrameBuffer::bindColorBufferToTexture2 wait pending QSRI",
+    )
+    patch_file(
+        fb_cpp,
+        "void FrameBuffer::readColorBuffer(HandleType p_colorbuffer, int x, int y, int width, int height,\n"
+        "                                  GLenum format, GLenum type, void* outPixels, uint64_t outPixelsSize) {\n"
+        "    GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, \"FrameBuffer::readColorBuffer()\",\n"
+        "                          \"ColorBuffer\", p_colorbuffer);\n\n"
+        "    AutoLock mutex(m_lock);",
+        "void FrameBuffer::readColorBuffer(HandleType p_colorbuffer, int x, int y, int width, int height,\n"
+        "                                  GLenum format, GLenum type, void* outPixels, uint64_t outPixelsSize) {\n"
+        "    GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, \"FrameBuffer::readColorBuffer()\",\n"
+        "                          \"ColorBuffer\", p_colorbuffer);\n\n"
+        "#ifdef __OHOS__\n"
+        "    if (m_emulationVk) m_emulationVk->waitColorBufferPendingQsri(p_colorbuffer);\n"
+        "#endif\n"
+        "    AutoLock mutex(m_lock);",
+        "FrameBuffer::readColorBuffer wait pending QSRI",
     )
 
-    # 15. VkEmulatedPhysicalDeviceMemory.cpp: preserve VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-    #     on __OHOS__ (required by Vulkan 1.0 spec & Android 11 SkiaVK GrVkTransferBuffer /
-    #     HardwareBitmapUploader). Our guest ResourceTracker emulates coherency over AF_UNIX
-    #     by flushing mapped coherent shadow buffers on vkUnmapMemory & vkQueueSubmit.
+    # 15. VkEmulatedPhysicalDeviceMemory: over AF_UNIX pipe (!GlDirectMem), strip
+    #     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT from primary HOST_VISIBLE / HOST_CACHED
+    #     memory types so modern Vulkan engines (Unity, Unreal, VMA, ANGLE) use explicit
+    #     vkFlushMappedMemoryRanges for only dirty slices instead of multi-GB per-submit
+    #     software memcmp scans, while appending one Vulkan 1.0 spec-compliant fallback
+    #     HOST_VISIBLE | HOST_COHERENT type for callers that strictly require coherency.
+    vkmem_h = os.path.join(gfx, "host/vulkan/VkEmulatedPhysicalDeviceMemory.h")
     vkmem = os.path.join(gfx, "host/vulkan/VkEmulatedPhysicalDeviceMemory.cpp")
+    patch_file(
+        vkmem_h,
+        "    uint32_t mGuestColorBufferMemoryTypeIndex;",
+        "    uint32_t mGuestColorBufferMemoryTypeIndex;\n"
+        "    bool mHasDedicatedAhbMemoryType = false;",
+        "VkEmulatedPhysicalDeviceMemory.h mHasDedicatedAhbMemoryType",
+    )
     patch_file(
         vkmem,
         "    // Coherent memory in the guest requires one of these features:\n"
-        "    if (!features.GlDirectMem.enabled && !features.VirtioGpuNext.enabled) {",
-        "    // Coherent memory in the guest requires one of these features (or OHOS guest shadow flush):\n"
-        "#ifndef __OHOS__\n"
-        "    if (!features.GlDirectMem.enabled && !features.VirtioGpuNext.enabled) {",
-        "VkEmulatedPhysicalDeviceMemory OHOS preserve HOST_COHERENT start",
-    )
-    patch_file(
-        vkmem,
+        "    if (!features.GlDirectMem.enabled && !features.VirtioGpuNext.enabled) {\n"
+        "        for (uint32_t i = 0; i < mGuestMemoryProperties.memoryTypeCount; i++) {\n"
         "            mGuestMemoryProperties.memoryTypes[i].propertyFlags =\n"
         "                mGuestMemoryProperties.memoryTypes[i].propertyFlags &\n"
         "                ~(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);\n"
         "        }\n"
         "    }",
+        "    // Coherent memory in the guest requires one of these features:\n"
+        "    if (!features.GlDirectMem.enabled && !features.VirtioGpuNext.enabled) {\n"
+        "#ifdef __OHOS__\n"
+        "        uint32_t firstHostCoherent = kInvalidMemoryTypeIndex;\n"
+        "        for (uint32_t i = 0; i < mHostMemoryProperties.memoryTypeCount; i++) {\n"
+        "            auto flags = mHostMemoryProperties.memoryTypes[i].propertyFlags;\n"
+        "            if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |\n"
+        "                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==\n"
+        "                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |\n"
+        "                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {\n"
+        "                if (firstHostCoherent == kInvalidMemoryTypeIndex ||\n"
+        "                    !(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {\n"
+        "                    firstHostCoherent = i;\n"
+        "                    if (!(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) break;\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "#endif\n"
+        "        for (uint32_t i = 0; i < mGuestMemoryProperties.memoryTypeCount; i++) {\n"
         "            mGuestMemoryProperties.memoryTypes[i].propertyFlags =\n"
         "                mGuestMemoryProperties.memoryTypes[i].propertyFlags &\n"
         "                ~(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);\n"
         "        }\n"
-        "    }\n"
-        "#endif",
-        "VkEmulatedPhysicalDeviceMemory OHOS preserve HOST_COHERENT end",
+        "#ifdef __OHOS__\n"
+        "        if (firstHostCoherent != kInvalidMemoryTypeIndex &&\n"
+        "            mGuestMemoryProperties.memoryTypeCount < VK_MAX_MEMORY_TYPES) {\n"
+        "            uint32_t cohIdx = mGuestMemoryProperties.memoryTypeCount++;\n"
+        "            VkMemoryType& cohType = mGuestMemoryProperties.memoryTypes[cohIdx];\n"
+        "            cohType.propertyFlags =\n"
+        "                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;\n"
+        "            cohType.heapIndex = mHostMemoryProperties.memoryTypes[firstHostCoherent].heapIndex;\n"
+        "            mGuestToHostMemoryTypeIndexMap[cohIdx] = firstHostCoherent;\n"
+        "        }\n"
+        "#endif\n"
+        "    }",
+        "VkEmulatedPhysicalDeviceMemory OHOS non-coherent primary + coherent fallback",
+    )
+    patch_file(
+        vkmem,
+        "        mGuestColorBufferMemoryTypeIndex = ahbMemoryTypeIndex;",
+        "        mGuestColorBufferMemoryTypeIndex = ahbMemoryTypeIndex;\n"
+        "        mHasDedicatedAhbMemoryType = true;",
+        "VkEmulatedPhysicalDeviceMemory record mHasDedicatedAhbMemoryType",
+    )
+    patch_file(
+        vkmem,
+        "    const uint32_t hostMemoryTypeBits = memoryRequirements->memoryTypeBits;\n"
+        "    for (uint32_t hostMemoryTypeIndex = 0;\n"
+        "         hostMemoryTypeIndex < mHostMemoryProperties.memoryTypeCount; hostMemoryTypeIndex++) {\n"
+        "        if (!(hostMemoryTypeBits & (1u << hostMemoryTypeIndex))) {\n"
+        "            continue;\n"
+        "        }\n\n"
+        "        uint32_t guestMemoryTypeIndex = mHostToGuestMemoryTypeIndexMap[hostMemoryTypeIndex];\n"
+        "        if (guestMemoryTypeIndex == kInvalidMemoryTypeIndex) {\n"
+        "            continue;\n"
+        "        }\n\n"
+        "        guestMemoryTypeBits |= (1u << guestMemoryTypeIndex);\n"
+        "    }",
+        "    const uint32_t hostMemoryTypeBits = memoryRequirements->memoryTypeBits;\n"
+        "    for (uint32_t guestMemoryTypeIndex = 0;\n"
+        "         guestMemoryTypeIndex < mGuestMemoryProperties.memoryTypeCount; guestMemoryTypeIndex++) {\n"
+        "        if (mHasDedicatedAhbMemoryType &&\n"
+        "            guestMemoryTypeIndex == mGuestColorBufferMemoryTypeIndex) {\n"
+        "            continue;\n"
+        "        }\n"
+        "        uint32_t hostMemoryTypeIndex = mGuestToHostMemoryTypeIndexMap[guestMemoryTypeIndex];\n"
+        "        if (hostMemoryTypeIndex == kInvalidMemoryTypeIndex ||\n"
+        "            !(hostMemoryTypeBits & (1u << hostMemoryTypeIndex))) {\n"
+        "            continue;\n"
+        "        }\n"
+        "        guestMemoryTypeBits |= (1u << guestMemoryTypeIndex);\n"
+        "    }",
+        "VkEmulatedPhysicalDeviceMemory transformToGuestMemoryRequirements support alias types",
     )
 
     # Secondary DisplayVk factory for multi-window zero-copy Vulkan presentation.
@@ -2021,6 +2214,7 @@ def main() -> None:
     #     createVkColorBufferLocked fails (prevents leaking unbound VkImage entries
     #     that can trigger GPU MMU page faults on subsequent copy/import), and guard
     #     readColorBufferToBytesLocked / updateColorBufferFromBytesLocked on initialized.
+    vkco = os.path.join(gfx, "host/vulkan/VkCommonOperations.cpp")
     patch_file(
         vkco,
         "    mColorBuffers[colorBufferHandle] = res;\n"
