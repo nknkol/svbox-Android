@@ -3114,7 +3114,8 @@ void AndroidRuntime::BootWorker(std::string mode, int32_t width, int32_t height)
         memProps +
         "ro.sf.lcd_density=" + std::to_string(targetDpi) + "\n"
         "debug.sf.nobootanimation=0\n"
-        "debug.stagefright.ccodec=0\n"
+        "debug.stagefright.ccodec=4\n"
+        "debug.stagefright.c2-poolmask=917504\n"
         "ro.surface_flinger.use_content_detection_for_refresh_rate=false\n"
         "ro.surface_flinger.set_idle_timer_ms=0\n"
         "ro.surface_flinger.set_touch_timer_ms=0\n"

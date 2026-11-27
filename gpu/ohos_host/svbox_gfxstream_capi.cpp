@@ -801,7 +801,11 @@ int svbox_gfx_init(int32_t width, int32_t height, int mode, const char* sockPath
     features.NoDelayCloseColorBuffer.enabled = true;
     features.HostComposition.enabled = true;
     features.AsyncComposeSupport.enabled = true;
-    features.YuvCache.enabled = true;
+    // GlDma/GlDma2 are disabled, so gralloc_ranchu allocates YUV buffers via
+    // rcCreateColorBuffer (FRAMEWORK_FORMAT_GL_COMPATIBLE, m_yuv_converter == null)
+    // and converts YUV<->RGB888 on the guest. Advertising YuvCache without GlDma
+    // makes gralloc_lock call rcReadColorBufferYUV on a null m_yuv_converter (SIGSEGV).
+    features.YuvCache.enabled = false;
     features.GlPipeChecksum.enabled = false;
     features.GlDirectMem.enabled = false;
     features.GlDma.enabled = false;

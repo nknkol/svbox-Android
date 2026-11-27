@@ -1949,6 +1949,40 @@ def main() -> None:
         "VkDecoder OHOS async client-alias OP_vkCreateSemaphore",
     )
 
+    # 22. ColorBufferGl::readPixelsYUVCached: defensive null guard on m_yuv_converter.
+    #     When a ColorBuffer was created with FRAMEWORK_FORMAT_GL_COMPATIBLE (e.g.
+    #     rcCreateColorBuffer without GlDma), m_yuv_converter is null; dereferencing it
+    #     crashes RenderThread with SIGSEGV.
+    patch_file(
+        cbgl_cpp,
+        "    m_yuv_converter->readPixels((uint8_t*)pixels, pixels_size);\n\n    return true;\n}",
+        "    if (!m_yuv_converter) {\n"
+        "        memset(pixels, 0, pixels_size);\n"
+        "        return false;\n"
+        "    }\n"
+        "    m_yuv_converter->readPixels((uint8_t*)pixels, pixels_size);\n\n    return true;\n}",
+        "ColorBufferGl::readPixelsYUVCached null-guard m_yuv_converter",
+    )
+
+    # 23. ColorBufferGl::readPixels: free temporary 4-bpp buffer on GL_RGB readback
+    #     (prevents multi-MB/frame host memory leak during software Codec2 playback).
+    patch_file(
+        cbgl_cpp,
+        "        if ((p_format == GL_RGB || p_format == GL_RGB8) && p_type == GL_UNSIGNED_BYTE) {\n"
+        "            // GL_RGB reads fail with SwiftShader.\n"
+        "            uint8_t* tmpPixels = new uint8_t[width * height * 4];\n"
+        "            s_gles2.glReadPixels(x, y, width, height, GL_RGBA, p_type, tmpPixels);\n"
+        "            convertRgbaToRgbPixels(pixels, tmpPixels, width, height);\n"
+        "        } else {\n",
+        "        if ((p_format == GL_RGB || p_format == GL_RGB8) && p_type == GL_UNSIGNED_BYTE) {\n"
+        "            // GL_RGB reads fail with SwiftShader.\n"
+        "            std::vector<uint8_t> tmpPixels(static_cast<size_t>(width) * height * 4);\n"
+        "            s_gles2.glReadPixels(x, y, width, height, GL_RGBA, p_type, tmpPixels.data());\n"
+        "            convertRgbaToRgbPixels(pixels, tmpPixels.data(), width, height);\n"
+        "        } else {\n",
+        "ColorBufferGl::readPixels fix GL_RGB tmpPixels leak",
+    )
+
 
 if __name__ == "__main__":
     main()

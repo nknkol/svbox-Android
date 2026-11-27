@@ -1174,6 +1174,21 @@ Step 6 严格遵循“**通用虚拟网络与 TUN 协议栈归属 `svbox` 核心
     - `3. NUMBER`：输入 `987654` + 退格 → `[98765] len=5`；
     - `4. OTP`（6 格自动跳焦验证码）：50ms 快速连打 `123456` → `[123456] len=6`（零丢失、零卡键、零重复）；
     - 手动释放验证：点击键盘释放后再次点击地址栏保持直通，连打 31 字符 `http://127.0.0.1:18999/t.html` 零重复；冷启动 `Fatal signal = 0`，`ImsaKit UnRegisterListener` 错误为 0。
+- **2026-11-27 修复 Android 14 Codec2 音视频软解码链路（解决《棕色尘埃 2》卡死在“正在确认下载容量 100%”）**：
+  - **四层串联根因（逐层排雷实证，既非网络问题也非存储空间问题）**：
+    1. **遗留 Android 11 属性禁用了 Android 14 Codec2**：`hap/entry/src/main/cpp/android_runtime.cpp` 仍保留着 `debug.stagefright.ccodec=0`，而 Android 14 已移除传统 OMX 软解（`OMX.google.h264.decoder`），导致系统内没有任何 `video/avc` 解码器；《棕色尘埃 2》在 `IntroUI::ShowDownloadUI` / `OnCheckDownLoad` 阶段通过 Unity `VideoPlayer`（`AndroidVideoMedia`）播放背景 H.264 PV 视频，因 `Could not create decoder for mime type video/avc` 永久卡死在 100%。
+    2. **Codec2 默认 linear pool 强依赖 ION / DMA-BUF Heap**：开启 `debug.stagefright.ccodec=4` 后，AOSP 14 `C2Store` 默认 `debug.stagefright.c2-poolmask=(1<<16)|(1<<18)`（`ION | BUFFERQUEUE`），鸿蒙沙箱无 `/dev/ion` 与 `/dev/dma_heap/system` 导致 `E/DMABUFHEAPS: No ion heap of name system exists` → `CCodecBufferChannel::start` 报 `NO_MEMORY`。设置 `debug.stagefright.c2-poolmask=917504`（`(1<<17)|(1<<18)|(1<<19)` = `GRALLOC | BUFFERQUEUE | BLOB`）后，linear block pool 切换至 `allocatorID 19`（`C2AllocatorBlob`，经 `gralloc_ranchu` + `/dev/ashmem`），`NO_MEMORY` 归零。
+    3. **Host `YuvCache=true` 与 `GlDma=false` 冲突导致 `org.svbox.android` 空指针 `SIGSEGV`**：`gpu/ohos_host/svbox_gfxstream_capi.cpp` 在 `GlDma/GlDma2=false` 时错误开启 `features.YuvCache.enabled=true`，导致 guest `gralloc_ranchu` 通过 `rcCreateColorBuffer`（`FRAMEWORK_FORMAT_GL_COMPATIBLE`，`m_yuv_converter == nullptr`）创建 YUV ColorBuffer 后，在 `gralloc_lock` 中却调用 `rcReadColorBufferYUV` → Host `ColorBufferGl::readPixelsYUVCached` 直接解引用空 `m_yuv_converter->readPixels()` 导致整个 `org.svbox.android` 宿主进程 `SIGSEGV`（且 `egl2egl` GLES 宿主无桌面 `glGetTexImage`）。
+    4. **Guest `gralloc.ranchu.so`（AOSP `goldfish-opengl-r`）三大 YUV/BLOB 内存越界 Bug 击穿 `mediaswcodec`**：
+       - `gralloc_old.cpp` 中 `HAL_PIXEL_FORMAT_YV12` 将 `glFormat` 设为 `GL_RGBA`（4 bpp），但非 YuvCache 分支 `gralloc_lock` 仅分配 `tmpBuf = new char[w*h*3]`（3 bpp）再以 `GL_RGBA` 读回，首帧 `384×240` 即溢出 92 KB 踩烂堆页导致 `mediaswcodec` 崩溃（`updateHostColorBuffer` 同理以 3 bpp `yv12_to_rgb888` 按 `GL_RGBA` 上传）；
+       - `FormatConversions.cpp` 中 `rgb888_to_yuv420p` 将 `U/V` 色度索引误写为 `yv12_u[i]` / `yv12_v[i]`（应为 `i / 2`），越界写入 ashmem 末尾；
+       - `gralloc_old.cpp` 中 `HAL_PIXEL_FORMAT_BLOB`（`needHostCb=false`）分配 ashmem 时未追加 `GOLDFISH_OFFSET_UNIT*2`（16 字节），但 `getAshmemColorOffset()` 在 `isHidlGralloc=true` 时仍无条件返回 `+16`（且 `gralloc_register_buffer` 无条件覆写 `*getOpenCountPtr = 1`），导致 `C2SoftAacDec` 的 4096 字节对齐 BLOB 缓冲区 `0x7ede4ff010 + 0x1000` 精准越界 16 字节触碰 `0x7ede500000` 触发 `SEGV_ACCERR`。
+  - **修复**：
+    - `hap/entry/src/main/cpp/android_runtime.cpp`：设置 `debug.stagefright.ccodec=4` 与 `debug.stagefright.c2-poolmask=917504`。
+    - `gpu/ohos_host/svbox_gfxstream_capi.cpp` + `gpu/ohos_host/apply_host_patches.py`：关闭 `features.YuvCache.enabled = false`；为 `ColorBufferGl::readPixelsYUVCached` 增加 `if (!m_yuv_converter)` 空指针守卫；修复 `ColorBufferGl::readPixels` 中 `GL_RGB` 临时 4-bpp 缓冲区的每帧堆泄漏（改为 `std::vector<uint8_t>`）。
+    - `gpu/android_guest/apply_guest_patches.py`：修复 `gralloc_old.cpp` 中 `HAL_PIXEL_FORMAT_YV12` 使用 `GL_RGB`（3 bpp）并与 `gralloc_lock` 读回一致；修复 `FormatConversions.cpp` `rgb888_to_yuv420p` 的 `i / 2` 色度索引；修复 `getAshmemColorOffset` 与 `gralloc_register_buffer` 仅在 `cb->hostHandle || cb->canBePosted()` / `cb->hostHandle` 时保留/写入 16 字节头部偏移。
+  - **真机实测（`HAD-W32`）**：启动 **BrownDust II**（`com.neowizgames.game.browndust2`），自动旋横至 `1480×909`，`c2.android.avc.decoder`（1280×720 H.264，`allocatorID 19/18`）与 `c2.android.aac.decoder`（48kHz 双声道 AAC，`allocatorID 19`）全部正常建池、解码并渲染输出，零 `mediaswcodec` / 宿主进程崩溃，顺利越过“正在确认下载容量 100%”并弹出完整 **下载弹窗（下载容量 15,531 MB / 可用空间 100,957 MB / 取消·下载）**。
+
 
 
 

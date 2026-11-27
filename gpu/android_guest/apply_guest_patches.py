@@ -1564,6 +1564,86 @@ VkResult ResourceTracker::on_vkGetFenceStatus(
     // EGL_BAD_ACCESS (leaving subsequent glGenBuffers/glGenTextures returning 0).
     rcEnc->rcMakeCurrent(rcEnc, ctxHandle, drawHandle, readHandle);""",
     )
+    # Fix YV12 glFormat mismatch (GL_RGBA 4bpp vs tmpBuf 3bpp -> 33% heap overflow
+    # crashing mediaswcodec on the first Codec2 YV12 video frame when YuvCache=false,
+    # plus misaligned yv12_to_rgb888 upload) and fix rgb888_to_yuv420p chroma index bug.
+    patch_file(
+        "system/gralloc/gralloc_old.cpp",
+        """        case HAL_PIXEL_FORMAT_YV12:
+            align = 16;
+            bpp = 1; // per-channel bpp
+            yuv_format = true;
+            // We are going to use RGB8888 on the host for Vulkan
+            glFormat = GL_RGBA;
+            glType = GL_UNSIGNED_BYTE;
+            selectedEmuFrameworkFormat = FRAMEWORK_FORMAT_YV12;
+            break;""",
+        """        case HAL_PIXEL_FORMAT_YV12:
+            align = 16;
+            bpp = 1; // per-channel bpp
+            yuv_format = true;
+            // Match YCbCr_420_888 and rgb888_to_yv12/yv12_to_rgb888 (3 bpp RGB888)
+            glFormat = GL_RGB;
+            glType = GL_UNSIGNED_BYTE;
+            selectedEmuFrameworkFormat = FRAMEWORK_FORMAT_YV12;
+            break;""",
+    )
+    patch_file(
+        "system/gralloc/gralloc_old.cpp",
+        """                    // We are using RGB888
+                    tmpBuf = new char[cb->width * cb->height * 3];
+                    rcEnc->rcReadColorBuffer(rcEnc, cb->hostHandle,
+                                              0, 0, cb->width, cb->height, cb->glFormat, cb->glType, tmpBuf);""",
+        """                    // We are using RGB888
+                    tmpBuf = new char[cb->width * cb->height * 3];
+                    rcEnc->rcReadColorBuffer(rcEnc, cb->hostHandle,
+                                              0, 0, cb->width, cb->height, GL_RGB, GL_UNSIGNED_BYTE, tmpBuf);""",
+    )
+    patch_file(
+        "system/OpenglSystemCommon/FormatConversions.cpp",
+        """            bool ieven = (i & 1) == 0;
+            if (jeven && ieven) {
+                yv12_u[i] = clamp_rgb((( -43 * R - 85 * G + 128 * B) >> 8) + 128);
+                yv12_v[i] = clamp_rgb((( 128 * R - 107 * G - 21 * B) >> 8) + 128);
+            }""",
+        """            bool ieven = (i & 1) == 0;
+            if (jeven && ieven) {
+                yv12_u[i / 2] = clamp_rgb((( -43 * R - 85 * G + 128 * B) >> 8) + 128);
+                yv12_v[i / 2] = clamp_rgb((( 128 * R - 107 * G - 21 * B) >> 8) + 128);
+            }""",
+    )
+    # Fix HAL_PIXEL_FORMAT_BLOB 16-byte offset overrun when isHidlGralloc=true:
+    # gralloc_alloc only reserves GOLDFISH_OFFSET_UNIT*2 header bytes when
+    # needHostCb || HW_FB, but getAshmemColorOffset unconditionally added 16
+    # bytes (and gralloc_register_buffer wrote *getOpenCountPtr = 1), pushing
+    # page-sized Codec2 C2AllocatorBlob buffers (4096/8192/2MB) 16 bytes past
+    # the ashmem mapping boundary (SIGSEGV in C2SoftAacDec).
+    patch_file(
+        "system/gralloc/gralloc_old.cpp",
+        """uint32_t getAshmemColorOffset(cb_handle_old_t* cb) {
+    uint32_t res = 0;
+    if (cb->canBePosted()) res = GOLDFISH_OFFSET_UNIT;
+    if (isHidlGralloc) res = GOLDFISH_OFFSET_UNIT * 2;
+    return res;
+}""",
+        """uint32_t getAshmemColorOffset(cb_handle_old_t* cb) {
+    uint32_t res = 0;
+    if (cb->canBePosted()) res = GOLDFISH_OFFSET_UNIT;
+    if (isHidlGralloc && (cb->hostHandle || cb->canBePosted())) res = GOLDFISH_OFFSET_UNIT * 2;
+    return res;
+}""",
+    )
+    patch_file(
+        "system/gralloc/gralloc_old.cpp",
+        """        if (isHidlGralloc) {
+            int32_t* openCountPtr = getOpenCountPtr(cb);
+            if (!*openCountPtr) *openCountPtr = 1;
+        }""",
+        """        if (isHidlGralloc && cb->hostHandle) {
+            int32_t* openCountPtr = getOpenCountPtr(cb);
+            if (!*openCountPtr) *openCountPtr = 1;
+        }""",
+    )
 
 if __name__ == "__main__":
     main()
